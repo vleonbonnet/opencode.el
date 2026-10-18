@@ -50,7 +50,7 @@
       (should (equal mode-line-format '((:eval (opencode-mode-line-format)))))
       (pcase-let ((`((" " ,title " ") ,details) (opencode-mode-line)))
         (should (equal (substring-no-properties title) "\U000F05E0 switch"))
-        (should (string-match-p "\\`  Build  GPT-6 Sol low    .* [0-9]+%% \\'"
+        (should (string-match-p "\\`  Build  GPT-6 Sol low  \uec81  .* [0-9]+%% \\'"
                                 (substring-no-properties details)))))))
 
 (ert-deftest opencode-test-mode-line-segments ()
@@ -63,7 +63,7 @@
         (should (equal (alist-get 'model segments) "GPT-6 Sol"))
         (should (equal (alist-get 'variant segments) "low"))
         (should (eq (get-text-property 0 'face (alist-get 'variant segments)) 'success))
-        (should (equal (alist-get 'provider segments) ""))
+        (should (equal (alist-get 'provider segments) "\uec81"))
         (should (equal (get-text-property 0 'help-echo (alist-get 'provider segments))
                        "Provider: OpenAI (openai)"))
         (should (string-match-p "\\` [0-9]+%\\'"

@@ -59,9 +59,9 @@
   :group 'opencode)
 
 (defcustom opencode-provider-icons
-  '(("\\`github-copilot\\'" . "")  ; nf-oct-copilot
-    ("\\`anthropic\\'" . "")       ; nf-cod-claude
-    ("\\`openai\\'" . ""))         ; nf-cod-openai
+  '(("\\`github-copilot\\'" . "\uf4b8")  ; nf-oct-copilot
+    ("\\`anthropic\\'" . "\uec82")       ; nf-cod-claude
+    ("\\`openai\\'" . "\uec81"))         ; nf-cod-openai
   "Alist of (PROVIDER-ID-REGEXP . ICON) for the mode-line provider segment.
 Providers without a match show a generic icon followed by their name."
   :type '(alist :key-type regexp :value-type string)

@@ -135,19 +135,21 @@ Pending permissions and questions use it to mark the block they belong to.")
 (defun opencode-tool-icon (tool &optional input)
   "Return the Nerd Font icon of TOOL called with INPUT."
   (pcase tool
-    ("read" "")
-    ("write" "")
-    ("edit" "")
-    ("patch" "")
-    ("shell" "")
-    ("grep" "")
-    ("glob" "")
-    ((or "websearch" "webfetch") "")
-    ("question" "")
-    ("skill" "")
-    ("execute" "")
-    ("subagent" (if (equal (alist-get 'agent input) "explore") "" "󰚩"))
-    (_ "")))
+    ("read" "\uf0f6")                          ; nf-fa-file_text_o
+    ("write" "\uf15c")                         ; nf-fa-file_text
+    ("edit" "\uf040")                          ; nf-fa-pencil
+    ("patch" "\uf4d2")                         ; nf-fa-puzzle_piece
+    ("shell" "\ue795")                         ; nf-dev-terminal
+    ("grep" "\uf002")                          ; nf-fa-search
+    ("glob" "\uf0c5")                          ; nf-fa-files_o
+    ((or "websearch" "webfetch") "\uf0ac")     ; nf-fa-globe
+    ("question" "\uf059")                      ; nf-fa-question_circle
+    ("skill" "\uf02d")                         ; nf-fa-book
+    ("execute" "\uf121")                       ; nf-fa-code
+    ("subagent" (if (equal (alist-get 'agent input) "explore")
+                    "\uf14e"                   ; nf-fa-compass
+                  "\U000F06A9"))               ; nf-md-robot
+    (_ "\uf0ad")))                             ; nf-fa-wrench
 
 (defun opencode-tool-short-label (tool)
   "Return the boxed label of TOOL; MCP tools keep their last name segment."
@@ -264,7 +266,7 @@ one: the block must exist for a permission to expand it."
 
 (defun opencode-pending-prompt-icon ()
   "Return the question mark of a block waiting on the user."
-  (propertize "" 'face 'opencode-attention 'font-lock-face 'opencode-attention))
+  (propertize "\U000F02D7" 'face 'opencode-attention 'font-lock-face 'opencode-attention)) ; nf-md-help_circle
 
 (defun opencode-tool-error-info (error)
   "Return (KIND . SOURCE) describing tool ERROR, an alist with `type' and `message'."
@@ -298,7 +300,8 @@ one: the block must exist for a permission to expand it."
   "Return TOOL's summary for INPUT with a status icon for ERROR."
   (let ((icon (propertize (if (memq (car (opencode-tool-error-info error))
                                     '(blocked rejected dismissed))
-                              "" "")
+                              "\uf05e"          ; nf-fa-ban
+                            "\uf057")           ; nf-fa-times_circle
                           'face 'error 'font-lock-face 'error)))
     (opencode-tool-summary tool input 'error icon)))
 

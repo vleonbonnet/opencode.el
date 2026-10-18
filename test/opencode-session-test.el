@@ -97,5 +97,15 @@
     (should (string-match-p "\\`msg_[0-9a-f]\\{12\\}[0-9A-Za-z]\\{14\\}\\'" first))
     (should (string< first second))))
 
+(ert-deftest opencode-test-icons-are-glyphs ()
+  "Every tool and status icon is one Nerd Font glyph."
+  (dolist (tool '("read" "write" "edit" "patch" "shell" "grep" "glob" "websearch" "webfetch"
+                  "question" "skill" "execute" "subagent" "slack_send_message"))
+    (should (= (length (opencode-tool-icon tool)) 1)))
+  (should (= (length (opencode-tool-icon "subagent" '((agent . "explore")))) 1))
+  (should (= (length (opencode-pending-prompt-icon)) 1))
+  (dolist (entry opencode-provider-icons)
+    (should (= (length (cdr entry)) 1))))
+
 (provide 'opencode-session-test)
 ;;; opencode-session-test.el ends here
