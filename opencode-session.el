@@ -271,6 +271,7 @@ Callers run at redisplay, so the request starts from a timer."
 
 (defvar-keymap opencode-session-mode-map
   :parent comint-mode-map
+  "RET" #'opencode-send-input
   "TAB" #'opencode-tab-dwim
   "<backtab>" #'backward-button
   "C-c TAB" #'opencode-cycle-agent
@@ -1114,12 +1115,18 @@ once delivered: that is where the transcript places them."
                                  `((name . ,name))))
                              (reverse opencode--attachments)))))
 
-(cl-defun opencode-session-send (text &key files agents delivery metadata then else)
+(cl-defun opencode-session-send (text &key files agents delivery metadata accept-thinking-loss
+                                         then else)
   "Send TEXT as a prompt of this session.
 FILES and AGENTS are vectors of attachments; DELIVERY overrides
 `opencode-prompt-delivery'; METADATA is an alist attached to the
-prompt.  THEN runs with the admitted inbox item, ELSE with the error."
-  (let ((id (opencode-generate-id "msg_")))
+prompt.  ACCEPT-THINKING-LOSS lets the server replace earlier thinking
+that no longer matches the conversation, which it otherwise refuses to
+send.  THEN runs with the admitted inbox item, ELSE with the error."
+  (let ((id (opencode-generate-id "msg_"))
+        (metadata (if accept-thinking-loss
+                      (cons '(acceptThinkingLoss . t) metadata)
+                    metadata)))
     (puthash id t opencode--own-inputs)
     (when opencode-session-model
       (setq opencode-last-model opencode-session-model))
@@ -1150,39 +1157,90 @@ METADATA is attached to the command; THEN and ELSE as for `opencode-session-send
            (if else (funcall else error)
              (opencode-output-notice (opencode-error-describe error) 'error)))))
 
+(defvar opencode-send-checks nil
+  "Functions checking input before it is sent, in order.
+Each is called in the session buffer with the plist `opencode-input-request'
+returns and returns nil to send it, `cancel' to keep it in the prompt, or
+an alist of metadata to attach to it.")
+
+(defvar opencode--send-decision nil
+  "Outcome of the checks of the input being sent: t, or metadata to attach.")
+
+(defun opencode-input-request (string)
+  "Return what sending input STRING requests, as a plist.
+:kind is `prompt', `command' or `shell'; :text is STRING; a command also
+has :name and :arguments."
+  (let ((string (string-trim-right string)))
+    (cond
+     ((string-prefix-p "/" string)
+      (let ((space (string-search " " string)))
+        (list :kind 'command :text string :name (substring string 1 space)
+              :arguments (if space (substring string (1+ space)) ""))))
+     ((string-prefix-p "!" string) (list :kind 'shell :text string))
+     (t (list :kind 'prompt :text string)))))
+
+(defun opencode-check-send (request)
+  "Run the send checks on REQUEST; return `cancel', or the metadata to attach.
+`opencode-before-send-functions' run first."
+  (if (eq 'cancel (run-hook-with-args-until-success 'opencode-before-send-functions
+                                                    (list :kind (plist-get request :kind)
+                                                          :text (plist-get request :text)
+                                                          :name (plist-get request :name))))
+      'cancel
+    (let ((metadata nil)
+          (checks opencode-send-checks))
+      (while (and checks (not (eq metadata 'cancel)))
+        (let ((result (funcall (pop checks) request)))
+          (setq metadata (if (eq result 'cancel) 'cancel (append metadata result)))))
+      metadata)))
+
+(defun opencode-send-input ()
+  "Send the input at the prompt, unless a check keeps it there.
+Checks run before Comint takes the input, so declining leaves it as typed."
+  (interactive)
+  (if (not (and opencode-session-id (get-buffer-process (current-buffer))))
+      (comint-send-input)
+    (let* ((input (if (>= (point) (opencode-pmark))
+                      (buffer-substring-no-properties (opencode-pmark) (point-max))
+                    (funcall comint-get-old-input)))
+           (decision (if (string-blank-p input) t
+                       (opencode-check-send (opencode-input-request input)))))
+      (if (eq decision 'cancel)
+          (message "Not sent")
+        (let ((opencode--send-decision (or decision t)))
+          (comint-send-input))))))
+
 (defun opencode--restore-input (text)
   "Put TEXT back at the prompt after a send was cancelled."
   (goto-char (point-max))
   (insert text))
 
 (defun opencode--send-input (_process string)
-  "Send STRING typed at the prompt: a prompt, a /command or a !shell command."
+  "Send STRING typed at the prompt: a prompt, a /command or a !shell command.
+Input that did not go through `opencode-send-input' is checked here."
   (opencode-highlight-input)
   (opencode-output "\n")
-  (let* ((string (string-trim-right string))
-         (command (and (string-prefix-p "/" string)
-                       (let ((space (string-search " " string)))
-                         (list (substring string 1 space)
-                               (if space (substring string (1+ space)) "")))))
-         (kind (cond (command 'command) ((string-prefix-p "!" string) 'shell) (t 'prompt)))
+  (let* ((request (opencode-input-request string))
+         (string (plist-get request :text))
+         (decision (or opencode--send-decision (opencode-check-send request)))
+         (metadata (and (consp decision) decision))
          (files (opencode--prompt-files))
          (agents (opencode--prompt-agents))
          (temp-files opencode--temp-files))
-    (if (eq 'cancel (run-hook-with-args-until-success
-                     'opencode-before-send-functions
-                     (list :kind kind :text string :name (car command))))
+    (if (eq decision 'cancel)
         (opencode--restore-input string)
       (setq opencode--attachments nil
             opencode--temp-files nil)
-      (pcase kind
+      (pcase (plist-get request :kind)
         ('command
-         (opencode-session-command (car command) (cadr command)
+         (opencode-session-command (plist-get request :name) (plist-get request :arguments)
+                                   :metadata metadata
                                    :then (lambda (_) (mapc #'delete-file temp-files))))
         ('shell
          (opencode-request 'post (format "/api/session/%s/shell" opencode-session-id)
                            :body `((command . ,(substring string 1)))))
         ('prompt
-         (opencode-session-send string :files files :agents agents
+         (opencode-session-send string :files files :agents agents :metadata metadata
                                 :then (lambda (_) (mapc (lambda (file) (ignore-errors (delete-file file)))
                                                         temp-files))))))))
 

@@ -54,6 +54,7 @@
 (require 'opencode-edits)
 (require 'opencode-desktop)
 (require 'opencode-convert)
+(require 'opencode-cache)
 
 ;; Entry points load this file, so that every module is in place.
 

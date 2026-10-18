@@ -197,12 +197,17 @@ RETRIED is internal."
 
 (defun opencode-request-sync (method path &rest arguments)
   "Send METHOD on PATH synchronously and return the decoded response.
-ARGUMENTS are `opencode-request' keywords except THEN, ELSE and BUFFER.
-Signal `user-error' on failure.  Use only for requests a command must
-wait for, with a short :timeout."
-  (let ((result :pending)
-        (failure nil)
-        (deadline (+ (float-time) (or (plist-get arguments :timeout) opencode-request-timeout) 5)))
+ARGUMENTS are `opencode-request' keywords except THEN and BUFFER.  On
+failure, return what ELSE returns for the `opencode-error', or signal
+`user-error' without ELSE.  Use only for requests a command must wait
+for, with a short :timeout."
+  (let* ((else (plist-get arguments :else))
+         (arguments (cl-loop for (key value) on arguments by #'cddr
+                             unless (eq key :else) append (list key value)))
+         (result :pending)
+         (failure nil)
+         (timeout (or (plist-get arguments :timeout) opencode-request-timeout))
+         (deadline (+ (float-time) timeout 5)))
     (apply #'opencode-request method path
            :then (lambda (value) (setq result value))
            :else (lambda (error) (setq failure error result nil))
@@ -210,9 +215,12 @@ wait for, with a short :timeout."
            arguments)
     (while (and (eq result :pending) (< (float-time) deadline))
       (accept-process-output nil 0.05))
+    (when (and (eq result :pending) (not failure))
+      (setq failure (opencode-error--make :method method :path path
+                                          :message (format "no answer after %ss" timeout))))
     (cond
+     ((and failure else) (funcall else failure))
      (failure (user-error "%s" (opencode-error-describe failure)))
-     ((eq result :pending) (user-error "OpenCode request %s timed out" path))
      (t result))))
 
 (defun opencode-request-data (response)
