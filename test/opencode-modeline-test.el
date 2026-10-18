@@ -71,7 +71,7 @@
       ;; An unselected variant shows dim, as the provider default or the configured one.
       (setf (alist-get 'variant opencode-session-model) nil)
       (should (equal (alist-get 'variant (opencode-mode-line-segments)) "default"))
-      (let ((opencode-default-variant-function (lambda (_provider _model) "medium")))
+      (let ((opencode-default-variant-function (lambda (_provider _model) (quote medium))))
         (let ((variant (alist-get 'variant (opencode-mode-line-segments))))
           (should (equal variant "medium"))
           (should (eq (get-text-property 0 'face variant) 'shadow))))

@@ -81,7 +81,8 @@ Providers without a match show a generic icon followed by their name."
 (defcustom opencode-default-variant-function nil
   "Function naming the variant a model runs with when none is selected.
 Called with the provider and model catalog entries; returns a variant ID,
-or nil when the provider decides.  nil shows a dim \"default\"."
+a string or symbol, or nil when the provider decides.  nil shows a dim
+\"default\"."
   :type '(choice (const :tag "Provider default" nil) function)
   :group 'opencode)
 
@@ -213,8 +214,9 @@ NAME defaults to the current buffer's name; a uniquifying <N> suffix stays."
    ((and variant (not (equal variant "default")))
     (propertize variant 'face 'success 'help-echo (format "Variant: %s (selected)" variant)))
    ((alist-get 'variants model)
-    (let ((default (and opencode-default-variant-function
-                        (funcall opencode-default-variant-function provider model))))
+    (let ((default (when-let* ((variant (and opencode-default-variant-function
+                                             (funcall opencode-default-variant-function provider model))))
+                     (format "%s" variant))))
       (propertize (or default "default")
                   'face 'shadow
                   'help-echo (if default
