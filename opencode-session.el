@@ -397,14 +397,16 @@ INFO once the transcript is loaded; ELSE runs there instead with the
            else))
         (opencode--display buffer no-display other-window)))))
 
-(defun opencode-session-fetch (id callback &optional directory)
-  "Call CALLBACK with the info of session ID; DIRECTORY scopes the request."
+(defun opencode-session-fetch (id callback &optional directory else)
+  "Call CALLBACK with the info of session ID; DIRECTORY scopes the request.
+ELSE, when given, receives the `opencode-error' of a failed request."
   (opencode-request 'get (concat "/api/session/" id)
-                    :directory directory :buffer nil
+                    :directory directory :buffer nil :else else
                     :then (lambda (response) (funcall callback (opencode-request-data response)))))
 
-(cl-defun opencode-session-open-by-id (id &key no-display (other-window t) callback)
-  "Open session ID like `opencode-session-open' with NO-DISPLAY, OTHER-WINDOW, CALLBACK."
+(cl-defun opencode-session-open-by-id (id &key no-display (other-window t) callback else)
+  "Open session ID like `opencode-session-open' with NO-DISPLAY, OTHER-WINDOW, CALLBACK.
+ELSE receives the `opencode-error' of a failed request."
   (if-let* ((buffer (gethash id opencode-session-buffers))
             ((buffer-live-p buffer)))
       (progn
@@ -413,7 +415,8 @@ INFO once the transcript is loaded; ELSE runs there instead with the
     (opencode-session-fetch
      id (lambda (info)
           (opencode-session-open info :no-display no-display :other-window other-window
-                                 :callback callback)))))
+                                 :callback callback :else else))
+     nil else)))
 
 (defun opencode--default-model ()
   "Return the model reference new sessions start with."
@@ -1119,18 +1122,21 @@ once delivered: that is where the transcript places them."
                              (reverse opencode--attachments)))))
 
 (cl-defun opencode-session-send (text &key files agents delivery metadata accept-thinking-loss
-                                         then else)
+                                         show then else)
   "Send TEXT as a prompt of this session.
 FILES and AGENTS are vectors of attachments; DELIVERY overrides
 `opencode-prompt-delivery'; METADATA is an alist attached to the
 prompt.  ACCEPT-THINKING-LOSS lets the server replace earlier thinking
 that no longer matches the conversation, which it otherwise refuses to
-send.  THEN runs with the admitted inbox item, ELSE with the error."
+send.  SHOW renders the prompt once the server delivers it, like one
+from another client; otherwise the caller rendered it.  THEN runs with
+the admitted inbox item, ELSE with the error."
   (let ((id (opencode-generate-id "msg_"))
         (metadata (if accept-thinking-loss
                       (cons '(acceptThinkingLoss . t) metadata)
                     metadata)))
-    (puthash id t opencode--own-inputs)
+    (unless show
+      (puthash id t opencode--own-inputs))
     (when opencode-session-model
       (setq opencode-last-model opencode-session-model))
     (opencode-request

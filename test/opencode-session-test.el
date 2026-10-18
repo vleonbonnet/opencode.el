@@ -90,6 +90,31 @@
        `(((type . "session.inbox.delivered") (data (sessionID . ,id) (inboxID . "msg_foreign")))))
       (should (string-match-p "from the TUI" (opencode-test-text buffer))))))
 
+(ert-deftest opencode-test-shown-prompt-rendered-on-delivery ()
+  "A prompt sent with :show appears once the server delivers it, consenting if asked."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "text"))
+           (buffer (opencode-test-open-empty id)))
+      (with-current-buffer buffer
+        (let ((inbox (opencode-session-send "scheduled check" :show t :accept-thinking-loss t)))
+          (should (equal (alist-get 'metadata (plist-get (car opencode-test-requests) :body))
+                         '((acceptThinkingLoss . t))))
+          (opencode-test-dispatch
+           `(((type . "session.inbox.enqueued")
+              (data (sessionID . ,id) (inboxID . ,inbox)
+                    (item (type . "user") (delivery . "steer") (payload (text . "scheduled check")))))
+             ((type . "session.inbox.delivered") (data (sessionID . ,id) (inboxID . ,inbox)))))
+          (should (string-match-p "scheduled check" (opencode-test-text buffer))))))))
+
+(ert-deftest opencode-test-open-missing-session ()
+  "Opening a session the server does not know reaches the error callback."
+  (opencode-test-with-server
+    (let (failure)
+      (opencode-session-open-by-id "ses_missing" :no-display t
+                                   :callback (lambda (_) (ert-fail "Opened"))
+                                   :else (lambda (error) (setq failure error)))
+      (should (eql (opencode-error-status failure) 404)))))
+
 (ert-deftest opencode-test-generated-ids-ascend ()
   "Generated message IDs have the server's layout and sort by creation."
   (let ((first (opencode-generate-id "msg_"))
