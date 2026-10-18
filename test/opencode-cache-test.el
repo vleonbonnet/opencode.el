@@ -127,6 +127,21 @@ The fake service answers preflights with `opencode-test-reports'."
       (opencode-test-type-and-send "/review")
       (should (equal (alist-get 'metadata (opencode-test-sent-body "/command")) '((acceptThinkingLoss . t)))))))
 
+(ert-deftest opencode-test-cache-unsupported-service ()
+  "A service without the preflight route is never asked again, nor the user."
+  (let ((opencode-test-reports '((:error 404 nil)))
+        (opencode-cache--unsupported nil)
+        (opencode-service-connection '(:id "svc_stock")))
+    (opencode-test-with-guard nil
+      (setq opencode-session-tokens 500000)
+      (opencode-test-type-and-send "one")
+      (opencode-test-type-and-send "two")
+      (should-not opencode-test-questions)
+      (should (equal opencode-cache--unsupported '("svc_stock")))
+      (should (= (seq-count (lambda (request) (string-suffix-p "/preflight" (plist-get request :path)))
+                            opencode-test-requests)
+                 1)))))
+
 (ert-deftest opencode-test-cache-busy-not-checked ()
   "Input steering a running turn, and shell commands, skip the check."
   (let ((opencode-test-reports nil))

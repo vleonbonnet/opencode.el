@@ -87,28 +87,38 @@ REQUEST is the plist of `opencode-input-request'."
     ('command `((command (name . ,(plist-get request :name))
                          (arguments . ,(plist-get request :arguments)))))))
 
+(defvar opencode-cache--unsupported nil
+  "IDs of services without the preflight route, which only my fork has.")
+
 (defun opencode-cache-preflight (body)
   "Return the server's prompt-cache report for sending BODY now.
-A failed check is reported as an unknown reuse, giving its reason."
+A failed check is reported as an unknown reuse, giving its reason.  A
+service without the route, which answers an untagged 404, is reported
+as `unsupported' and not asked again."
   (opencode-request-data
    (opencode-request-sync
     'post (format "/api/experimental/session/%s/preflight" opencode-session-id)
     :body body :timeout opencode-cache-guard-timeout
     :else (lambda (error)
-            `((data (status . "unknown")
-                    (lostTokens . 0)
-                    (reasons ,(concat "cache check failed: "
-                                      (or (opencode-error-message error) "unknown error")
-                                      (if-let* ((status (opencode-error-status error)))
-                                          (format " (HTTP %s)" status)
-                                        "")))))))))
+            (if (and (eql (opencode-error-status error) 404) (null (opencode-error-tag error)))
+                (progn
+                  (push (plist-get opencode-service-connection :id) opencode-cache--unsupported)
+                  (message "OpenCode: this service cannot preflight the prompt cache; the cache guard is off for it")
+                  '((data (status . "unsupported"))))
+              `((data (status . "unknown")
+                      (lostTokens . 0)
+                      (reasons ,(concat "cache check failed: "
+                                        (or (opencode-error-message error) "unknown error")
+                                        (if-let* ((status (opencode-error-status error)))
+                                            (format " (HTTP %s)" status)
+                                          ""))))))))))
 
 (defun opencode-cache-loss (report)
   "Return the previously cached tokens REPORT would re-send, or nil.
 A turn the server cannot predict may lose the whole context."
   (let-alist report
     (pcase .status
-      ("hit" nil)
+      ((or "hit" "unsupported") nil)
       ("unknown" (max (or .lostTokens 0)
                       (if (numberp opencode-session-tokens) opencode-session-tokens 0)))
       (_ .lostTokens))))
@@ -157,6 +167,7 @@ A turn the server cannot predict may lose the whole context."
   "Check the prompt cache before input REQUEST starts a turn.
 Return nil to send, `cancel' to keep the input, or the consent metadata."
   (when-let* (((and opencode-cache-guard (eq opencode-session-status 'idle)))
+              ((not (member (plist-get opencode-service-connection :id) opencode-cache--unsupported)))
               (body (opencode-cache-preflight-body request)))
     (let* ((report (opencode-cache-preflight body))
            (loss (opencode-cache-loss report)))
