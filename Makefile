@@ -26,7 +26,7 @@ test-gui:
 	  --eval '(ert-run-tests-batch-and-exit (quote (tag gui)))'
 
 lint:
-	$(BATCH) --eval '(checkdoc-file "opencode.el")' $(addprefix --eval '(checkdoc-file "',$(addsuffix '")',$(SOURCES)))
+	$(BATCH) --eval '(dolist (file (list $(patsubst %,"%",$(SOURCES)))) (checkdoc-file file))'
 
 clean:
 	rm -f *.elc test/*.elc

@@ -810,7 +810,8 @@ INPUT and STATUS default to an empty input still streaming."
 ;;;; Notice blocks
 
 (defun opencode-notice-block (summary text &optional key)
-  "Write a collapsed notice showing SUMMARY that expands to TEXT."
+  "Write a collapsed notice showing SUMMARY that expands to TEXT.
+KEY, when given, identifies the block."
   (opencode-blocks-ensure)
   (let ((overlay (opencode-insert-collapsed
                   (opencode-fontify-as (propertize summary 'font-lock-face 'opencode-notice) 'verbatim)

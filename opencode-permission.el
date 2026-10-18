@@ -468,7 +468,7 @@ A transient suspended from this buffer is resumed instead."
       (setq opencode--active-permission (list :buffer (current-buffer) :id (plist-get permission :id))
             opencode--permission-transient-state (list :buffer (current-buffer) :permission permission))
       (add-hook 'transient-exit-hook #'opencode--permission-on-exit)
-      (opencode-permission-transient)))))
+      (call-interactively #'opencode-permission-transient)))))
 
 (defun opencode--permission-at-point ()
   "Return the queued permission of the tool block at point, if any."

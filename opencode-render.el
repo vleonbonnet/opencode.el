@@ -152,7 +152,7 @@ blank line.  Spacing is measured at the process mark and only added."
   (setq opencode--last-block-kind kind))
 
 (defun opencode-margin (face)
-  "Return the left-margin display string drawn in FACE."
+  "Return the `left-margin' display string drawn in FACE."
   (propertize ">" 'display `((margin left-margin) ,(propertize "▎" 'face face))))
 
 (defun opencode-add-margin (start end face)

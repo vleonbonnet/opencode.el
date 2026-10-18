@@ -331,8 +331,9 @@ Callers run at redisplay, so the request starts from a timer."
 
 (defun opencode--make-process (buffer)
   "Create BUFFER's pipe process.
-Input goes over HTTP, so neither a PTY nor window-size notifications are
-needed; on Windows a PTY would run a synchronous helper on every resize."
+Input goes over HTTP, so neither a PTY nor notifications of the window
+size are needed; on Windows a PTY would run a synchronous helper on every
+resize."
   (let ((process (make-pipe-process :name "opencode-session" :buffer buffer :noquery t)))
     (process-put process 'adjust-window-size-function #'ignore)
     process))
@@ -907,7 +908,7 @@ once delivered: that is where the transcript places them."
            (opencode-output-notice "A queued prompt was cancelled")))))))
 
 (defun opencode--event-notice (event)
-  "Handle transcript notices: synthetic messages, instruction updates, skills."
+  "Render the notice EVENT reports: a synthetic message, new instructions or a skill."
   (opencode--on-session-event event
     (let ((id (alist-get 'id event)))
       (opencode-before-prompt

@@ -53,6 +53,7 @@
 (require 'opencode-sessions)
 (require 'opencode-edits)
 (require 'opencode-desktop)
+(require 'opencode-convert)
 
 ;; Entry points load this file, so that every module is in place.
 

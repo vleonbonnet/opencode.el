@@ -293,13 +293,21 @@ shows typed answers in place of the option keys."
         ((< index 35) (string (+ ?a (- index 9))))
         (t (format "M-%d" (- index 35)))))
 
-(defun opencode--active-entry () (plist-get opencode--active-form :entry))
+(defun opencode--active-entry ()
+  "Return the form entry the question transient answers."
+  (plist-get opencode--active-form :entry))
 
-(defun opencode--question-count () (length (opencode-form-fields (plist-get (opencode--active-entry) :form))))
+(defun opencode--question-count ()
+  "Return the number of questions of the active form."
+  (length (opencode-form-fields (plist-get (opencode--active-entry) :form))))
 
-(defun opencode--question-index () (plist-get (opencode--active-entry) :index))
+(defun opencode--question-index ()
+  "Return the index of the question shown."
+  (plist-get (opencode--active-entry) :index))
 
-(defun opencode--question-final-p () (= (1+ (opencode--question-index)) (opencode--question-count)))
+(defun opencode--question-final-p ()
+  "Return non-nil when the question shown is the last one."
+  (= (1+ (opencode--question-index)) (opencode--question-count)))
 
 (defun opencode--question-selection ()
   "Return the selected labels and custom answer of the shown question."
