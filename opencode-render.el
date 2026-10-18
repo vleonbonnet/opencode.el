@@ -56,8 +56,9 @@ or builds grammars lets the first session on a fresh machine set them up."
 (defcustom opencode-render-table-function #'opencode-align-markdown-table
   "Function rendering the completed Markdown table between BEG and END.
 It replaces the region in the session buffer and must keep the Comint
-output properties on whatever it inserts.  The default aligns the
-table's pipes with markdown-ts and keeps its markup."
+output properties, as `opencode-output-properties' returns them, on
+whatever it inserts.  The default aligns the table's pipes with
+markdown-ts and keeps its markup."
   :type 'function
   :group 'opencode)
 
