@@ -126,13 +126,24 @@ server spells it: it keys locations by the exact string it receives."
        (string= (directory-file-name (opencode-normalize-directory a))
                 (directory-file-name (opencode-normalize-directory b)))))
 
+(defvar-local opencode--project-cache nil
+  "Hash table of project roots by directory, for this buffer.
+File references are resolved on every streamed chunk; walking the
+parents of a directory each time to find its project was measurable.")
+
 (defun opencode-project-directory (&optional directory)
   "Return the project root of DIRECTORY, else DIRECTORY itself."
-  (let ((default-directory (or directory default-directory)))
-    (opencode-normalize-directory
-     (if-let* ((project (project-current)))
-         (project-root project)
-       default-directory))))
+  (let* ((directory (or directory default-directory))
+         (cache (or opencode--project-cache
+                    (setq opencode--project-cache (make-hash-table :test #'equal)))))
+    (or (gethash directory cache)
+        (puthash directory
+                 (let ((default-directory directory))
+                   (opencode-normalize-directory
+                    (if-let* ((project (project-current)))
+                        (project-root project)
+                      default-directory)))
+                 cache))))
 
 (defun opencode-time-seconds (milliseconds)
   "Return epoch MILLISECONDS as a float number of seconds, or nil."
@@ -244,7 +255,8 @@ own prompts on the event stream."
             opencode--id-counter 1))
     (let ((chars "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"))
       (concat prefix
-              (format "%012x" (+ (* now 4096) opencode--id-counter))
+              ;; The server keeps the low 48 bits.
+              (format "%012x" (logand (+ (* now 4096) opencode--id-counter) #xFFFFFFFFFFFF))
               (apply #'string
                      (cl-loop repeat 14 collect (aref chars (random 62))))))))
 
