@@ -1519,17 +1519,6 @@ The files changed since are restored; the next prompt commits the revert."
                     :then (lambda (response)
                             (opencode--select-session "Subagent: " (opencode-request-data response)))))
 
-(defun opencode-select-session ()
-  "Open a session of the current project."
-  (interactive)
-  (opencode-events-connect)
-  (opencode-request 'get "/api/session"
-                    :query `((directory . ,(directory-file-name (opencode-project-directory)))
-                             (parentID . "null") (order . "desc") (limit . 200))
-                    :buffer nil
-                    :then (lambda (response)
-                            (opencode--select-session "Session: " (opencode-request-data response)))))
-
 (defun opencode-scroll-to-last-response-start ()
   "Scroll to the start of the latest assistant text."
   (interactive)
