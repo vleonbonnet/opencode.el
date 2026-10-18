@@ -253,8 +253,9 @@ The result is cached per executable modification time."
           (length (alist-get 'data response)))
       (error nil))))
 
-(defun opencode-service-restart (&optional callback)
+(defun opencode-service-restart (&optional callback errback)
   "Restart the shared service, then call CALLBACK with the new connection.
+ERRBACK, when given, receives an error message instead on failure.
 Every client reconnects by itself; running turns resume after the
 restart, though their current step starts over, so interactively this
 asks first while any runs."
@@ -268,15 +269,18 @@ asks first while any runs."
                                  running (if (= running 1) " is" "s are")))
       (user-error "Restart cancelled")))
   (setq opencode-service-connection nil)
-  (opencode-service--run-cli
-   '("service" "restart")
-   (lambda (status output)
-     (if (zerop status)
-         (opencode-service-ensure
-          (lambda (connection)
-            (message "OpenCode service restarted (%s)" (plist-get connection :version))
-            (when callback (funcall callback connection))))
-       (message "opencode service restart failed: %s" output)))))
+  (cl-flet ((fail (text)
+              (if errback (funcall errback text) (message "OpenCode: %s" text))))
+    (opencode-service--run-cli
+     '("service" "restart")
+     (lambda (status output)
+       (if (zerop status)
+           (opencode-service-ensure
+            (lambda (connection)
+              (message "OpenCode service restarted (%s)" (plist-get connection :version))
+              (when callback (funcall callback connection)))
+            #'fail)
+         (fail (format "opencode service restart failed: %s" output)))))))
 
 (provide 'opencode-service)
 ;;; opencode-service.el ends here

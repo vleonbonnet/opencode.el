@@ -304,6 +304,11 @@ line is redrawn on every streamed chunk."
 (defvar opencode--mode-line-width-cache (make-hash-table :test #'equal)
   "Pixel widths of rendered mode-line strings, keyed by text and properties.")
 
+(defun opencode-mode-line-flush ()
+  "Forget the measured widths of mode-line text, after fonts changed."
+  (clrhash opencode--mode-line-width-cache)
+  (force-mode-line-update t))
+
 (defun opencode-mode-line-escape (string)
   "Return STRING with each % doubled, keeping its text properties."
   (let ((start 0) parts pos)

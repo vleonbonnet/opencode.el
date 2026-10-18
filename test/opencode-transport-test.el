@@ -104,6 +104,17 @@
         (should (equal cli '("service" "start")))
         (should (equal failure "opencode service start failed: no luck"))))))
 
+(ert-deftest opencode-test-service-restart-failure ()
+  "A failed restart reaches the error callback."
+  (opencode-test-with-service
+    (let ((failure nil))
+      (cl-letf (((symbol-function 'opencode-service--run-cli)
+                 (lambda (arguments on-exit)
+                   (should (equal arguments '("service" "restart")))
+                   (funcall on-exit 1 "service is locked"))))
+        (opencode-service-restart #'ignore (lambda (text) (setq failure text)))
+        (should (equal failure "opencode service restart failed: service is locked"))))))
+
 (ert-deftest opencode-test-running-sessions ()
   "Running sessions are counted from the service; an absent service counts as none known."
   (opencode-test-with-service
