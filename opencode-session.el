@@ -540,7 +540,9 @@ Input still being typed is lifted out and put back afterwards."
            (apply #'opencode-block-update overlay :message id
                   (opencode-tool-data-from-content item))))))
     (opencode--note-tokens (alist-get 'tokens message))
-    (when-let* ((error (alist-get 'error message)))
+    (when-let* ((error (alist-get 'error message))
+                ;; The turn's idle marker says it was interrupted.
+                ((not (equal (alist-get 'type error) "aborted"))))
       (opencode--output-error error))))
 
 (defun opencode--output-message (text message-id)
@@ -755,10 +757,13 @@ reasoning encrypted stream empty blocks, which replay omits too."
          (opencode-tool-update id :input (alist-get 'input data) :status "running" :message message))
         ("session.tool.progress"
          (when-let* ((overlay (opencode-block id)))
-           (let ((metadata (alist-get 'metadata data)))
-             (opencode-block-update overlay :metadata metadata
-                                    :session-id (or (alist-get 'sessionID metadata)
-                                                    (plist-get (opencode-block-data overlay) :session-id))))))
+           (let* ((metadata (alist-get 'metadata data))
+                  (known (plist-get (opencode-block-data overlay) :session-id))
+                  (session (or (alist-get 'sessionID metadata) known)))
+             (opencode-block-update overlay :metadata metadata :session-id session)
+             ;; A subagent's session is first known here.
+             (unless (equal session known)
+               (run-hook-with-args 'opencode-blocks-attach-functions overlay)))))
         ("session.tool.success"
          (let ((metadata (alist-get 'metadata data)))
            (opencode-tool-update id :status "completed"
@@ -796,6 +801,8 @@ reasoning encrypted stream empty blocks, which replay omits too."
       ("session.execution.started"
        (setq opencode-session-status 'busy
              opencode--turn-errors nil)
+       ;; A turn another client started follows the idle prompt.
+       (opencode-lift-prompt)
        (force-mode-line-update))
       (type
        (let ((outcome (pcase type
@@ -864,23 +871,24 @@ once delivered: that is where the transcript places them."
   "Handle transcript notices: synthetic messages, instruction updates, skills."
   (opencode--on-session-event event
     (let ((id (alist-get 'id event)))
-      (pcase (alist-get 'type event)
-        ("session.synthetic"
-         (opencode-open-block 'tool)
-         (opencode-notice-block (or (alist-get 'description data) "synthetic message")
-                                (alist-get 'text data) id))
-        ("session.instructions.updated"
-         (when-let* ((text (alist-get 'text data)))
+      (opencode-before-prompt
+        (pcase (alist-get 'type event)
+          ("session.synthetic"
            (opencode-open-block 'tool)
-           (opencode-notice-block
-            (format "Instructions updated: %s"
-                    (mapconcat (lambda (entry) (symbol-name (car entry)))
-                               (alist-get 'delta data) ", "))
-            text id)))
-        ("session.skill.activated"
-         (opencode-open-block 'tool)
-         (opencode-notice-block (format "Skill %s activated" (alist-get 'name data))
-                                (alist-get 'text data) id))))))
+           (opencode-notice-block (or (alist-get 'description data) "synthetic message")
+                                  (alist-get 'text data) id))
+          ("session.instructions.updated"
+           (when-let* ((text (alist-get 'text data)))
+             (opencode-open-block 'tool)
+             (opencode-notice-block
+              (format "Instructions updated: %s"
+                      (mapconcat (lambda (entry) (symbol-name (car entry)))
+                                 (alist-get 'delta data) ", "))
+              text id)))
+          ("session.skill.activated"
+           (opencode-open-block 'tool)
+           (opencode-notice-block (format "Skill %s activated" (alist-get 'name data))
+                                  (alist-get 'text data) id)))))))
 
 (defun opencode--event-shell (event)
   "Handle `session.shell.started' and `session.shell.ended' EVENT."
@@ -889,8 +897,9 @@ once delivered: that is where the transcript places them."
            (id (alist-get 'id shell)))
       (pcase (alist-get 'type event)
         ("session.shell.started"
-         (opencode-open-block 'tool)
-         (opencode-tool-start id "shell" `((command . ,(alist-get 'command shell))) "running"))
+         (opencode-before-prompt
+           (opencode-open-block 'tool)
+           (opencode-tool-start id "shell" `((command . ,(alist-get 'command shell))) "running")))
         ("session.shell.ended"
          (opencode-tool-update id :status "completed"
                                :output (opencode--shell-output (alist-get 'output data))))))))
@@ -901,9 +910,10 @@ once delivered: that is where the transcript places them."
     (let ((key (concat (alist-get 'sessionID data) "/compaction")))
       (pcase (alist-get 'type event)
         ("session.compaction.started"
-         (opencode-open-block 'tool)
-         (when-let* ((old (opencode-block key))) (remhash key opencode--blocks) (ignore old))
-         (opencode-notice-block "Compacting…" "" key))
+         (when (opencode-block key) (remhash key opencode--blocks))
+         (opencode-before-prompt
+           (opencode-open-block 'tool)
+           (opencode-notice-block "Compacting…" "" key)))
         ("session.compaction.delta"
          (when-let* ((overlay (opencode-block key)))
            (opencode-block-update overlay :text (concat (plist-get (opencode-block-data overlay) :text)

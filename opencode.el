@@ -45,6 +45,9 @@
 (require 'opencode-links)
 (require 'opencode-blocks)
 (require 'opencode-session)
+(require 'opencode-requests)
+(require 'opencode-permission)
+(require 'opencode-form)
 
 (provide 'opencode)
 ;;; opencode.el ends here

@@ -5,7 +5,7 @@
 
 EMACS ?= emacs
 DEPS ?= $(HOME)/.emacs.d/elpaca/builds
-LOAD_PATH = -L . -L test -L $(DEPS)/plz -L $(DEPS)/transient -L $(DEPS)/cond-let -L $(DEPS)/compat
+LOAD_PATH = -L . -L test -L $(DEPS)/plz -L $(DEPS)/transient -L $(DEPS)/cond-let -L $(DEPS)/compat -L $(DEPS)/llama
 BATCH = $(EMACS) -Q --batch $(LOAD_PATH)
 
 SOURCES = $(filter-out %-pkg.el %-autoloads.el,$(wildcard opencode*.el))
