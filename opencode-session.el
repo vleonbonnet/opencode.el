@@ -48,6 +48,7 @@
 (require 'opencode-events)
 (require 'opencode-http)
 (require 'opencode-links)
+(require 'opencode-notify)
 (require 'opencode-render)
 (require 'savehist)
 (require 'yank-media)
@@ -157,9 +158,12 @@ Each is a plist (:file URI-ALIST) or (:agent NAME).")
 (defvar opencode--catalog-waiters (make-hash-table :test #'equal)
   "Callbacks waiting for a catalog fetch in flight, keyed like `opencode--catalogs'.")
 
+(defvar opencode-catalog-generation 0
+  "Count of catalog changes, for caches of values derived from catalogs.")
+
 (defconst opencode--catalog-paths
-  '((agent . "/api/agent") (model . "/api/model") (command . "/api/command")
-    (skill . "/api/skill") (mcp . "/api/mcp"))
+  '((agent . "/api/agent") (model . "/api/model") (provider . "/api/provider")
+    (command . "/api/command") (skill . "/api/skill") (mcp . "/api/mcp"))
   "Catalog kinds and their routes.")
 
 (defun opencode-catalog (kind &optional directory)
@@ -187,6 +191,7 @@ empty answer is fetched again once before being cached."
                                  (if (and (null data) (> retries 0))
                                      (run-at-time 0.5 nil #'fetch (1- retries))
                                    (puthash key data opencode--catalogs)
+                                   (cl-incf opencode-catalog-generation)
                                    (let ((waiters (gethash key opencode--catalog-waiters)))
                                      (remhash key opencode--catalog-waiters)
                                      (dolist (waiter (nreverse waiters))
@@ -196,21 +201,37 @@ empty answer is fetched again once before being cached."
                                (opencode-report-error (opencode-error-describe error))))))
           (fetch 2))))))
 
+(defun opencode-catalog-ensure (kind &optional directory)
+  "Return the cached KIND catalog of DIRECTORY, else fetch it in the background.
+Return nil while fetching; mode lines are redisplayed once it arrives.
+Callers run at redisplay, so the request starts from a timer."
+  (let* ((directory (opencode-normalize-directory (or directory default-directory)))
+         (cached (gethash (cons directory kind) opencode--catalogs 'missing)))
+    (if (not (eq cached 'missing))
+        cached
+      (unless (gethash (cons directory kind) opencode--catalog-waiters)
+        (run-at-time 0 nil #'opencode-catalog-fetch kind
+                     (lambda (_) (force-mode-line-update t))
+                     directory))
+      nil)))
+
 (defun opencode--invalidate-catalog (event)
   "Forget the catalog EVENT says changed in its location."
   (when-let* ((directory (opencode-event-directory event))
               (kind (pcase (alist-get 'type event)
                       ("agent.updated" '(agent))
-                      ((or "model.updated" "provider.updated" "integration.updated") '(model))
+                      ((or "model.updated" "provider.updated" "integration.updated") '(model provider))
                       ("command.updated" '(command))
                       ("skill.updated" '(skill))
                       ("mcp.updated" '(mcp)))))
     (dolist (one kind)
-      (remhash (cons directory one) opencode--catalogs))))
+      (remhash (cons directory one) opencode--catalogs))
+    (cl-incf opencode-catalog-generation)))
 
 (defun opencode--clear-catalogs (_event)
   "Forget every catalog when a stream opens: the service may have changed."
-  (clrhash opencode--catalogs))
+  (clrhash opencode--catalogs)
+  (cl-incf opencode-catalog-generation))
 
 (dolist (type '("agent.updated" "model.updated" "provider.updated" "integration.updated"
                 "command.updated" "skill.updated" "mcp.updated"))
@@ -229,6 +250,11 @@ empty answer is fetched again once before being cached."
                 (and (equal (alist-get 'id entry) .id)
                      (equal (alist-get 'providerID entry) .providerID)))
               (opencode-catalog 'model directory))))
+
+(defun opencode-provider-info (provider &optional directory)
+  "Return the catalog entry of PROVIDER, a provider ID, in DIRECTORY, if fetched."
+  (seq-find (lambda (entry) (equal (alist-get 'id entry) provider))
+            (opencode-catalog 'provider directory)))
 
 (defun opencode-primary-agents (&optional directory)
   "Return the selectable primary agents of DIRECTORY's catalog."
@@ -826,6 +852,7 @@ reasoning encrypted stream empty blocks, which replay omits too."
               (opencode-open-block 'user)
               (opencode-show-prompt)))
            (force-mode-line-update)
+           (opencode-notify-turn-ended outcome)
            (run-hook-with-args 'opencode-session-idle-functions outcome)))))))
 
 (defvar-local opencode--pending-inbox nil
@@ -957,7 +984,8 @@ once delivered: that is where the transcript places them."
             (setf (alist-get 'cost opencode-session-info) (alist-get 'cost data)
                   (alist-get 'tokens opencode-session-info) (alist-get 'tokens data)))
            ("session.retry.scheduled"
-            (setq opencode-session-retry data))
+            (setq opencode-session-retry data)
+            (opencode-notify-retry data))
            ("session.revert.staged"
             (setq opencode-session-revert (alist-get 'revert data))
             (opencode-output-notice

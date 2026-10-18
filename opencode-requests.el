@@ -39,6 +39,7 @@
 
 (require 'opencode-blocks)
 (require 'opencode-common)
+(require 'opencode-notify)
 (require 'opencode-session)
 (require 'transient)
 
@@ -109,16 +110,6 @@ request), tried in order.")
   (or opencode--pending-children
       (seq-some (lambda (provider) (plist-get (funcall provider) :pending))
                 opencode-request-providers)))
-
-(defun opencode-notify-session (title text)
-  "Show TEXT under TITLE: in the echo area when this buffer is shown, else as a notification."
-  (if (opencode-buffer-active-p (current-buffer))
-      (message "%s: %s" title text)
-    (run-hook-with-args 'opencode-notify-functions
-                        `((title . ,title) (message . ,text) (variant . "info")))))
-
-(defvar opencode-notify-functions nil
-  "Functions receiving notification alists (title, message, variant).")
 
 (defun opencode-respond ()
   "Answer the request at point, a suspended one, or the oldest pending one.

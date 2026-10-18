@@ -274,8 +274,9 @@ The transient shows the full command, so the block stays collapsed."
         (if (opencode-buffer-active-p (current-buffer))
             (message (substitute-command-keys
                       "OpenCode permission pending; \\[opencode-respond] answers it"))
-          (opencode-notify-session "OpenCode permission request" (plist-get permission :title))
-          (push opencode-session-info opencode-alerted-sessions))))))
+          (opencode-notify-session "OpenCode permission request" (plist-get permission :title)
+                                   'permission)
+          (opencode-alert-session))))))
 
 (defun opencode--permission-attach (overlay)
   "Attach a queued permission to newly inserted tool block OVERLAY."

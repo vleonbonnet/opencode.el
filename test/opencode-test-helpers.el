@@ -108,6 +108,7 @@ and returns the decoded response, or (:error STATUS MESSAGE).")
    (list 'get "\\`/api/session/active\\'" (lambda (_) '((data))))
    (list 'get "\\`/api/agent\\'" (lambda (_) (opencode-test-fixture "agent.json")))
    (list 'get "\\`/api/model\\'" (lambda (_) (opencode-test-fixture "model.json")))
+   (list 'get "\\`/api/provider\\'" (lambda (_) (opencode-test-fixture "provider.json")))
    (list 'get "\\`/api/command\\'" (lambda (_) (opencode-test-fixture "command.json")))
    (list t "" (lambda (_) '((data))))))
 
@@ -139,8 +140,12 @@ and returns the decoded response, or (:error STATUS MESSAGE).")
                 (if else (deliver else error) (error "%s" (opencode-error-describe error))))
             (deliver then response)))))))
 
+(defvar opencode-test-notifications nil
+  "Notifications shown under `opencode-test-with-server', newest first.")
+
 (defmacro opencode-test-with-server (&rest body)
-  "Run BODY with requests answered by `opencode-test-routes' and no display."
+  "Run BODY with requests answered by `opencode-test-routes' and no display.
+Notifications reach `opencode-test-notifications' instead of the OS."
   (declare (indent 0) (debug t))
   `(let ((opencode-test-requests nil)
          (opencode-test-routes (opencode-test-default-routes))
@@ -148,7 +153,12 @@ and returns the decoded response, or (:error STATUS MESSAGE).")
          (opencode--catalogs (make-hash-table :test #'equal))
          (opencode--catalog-waiters (make-hash-table :test #'equal))
          (opencode-last-session-buffer nil)
-         (opencode-alerted-sessions nil))
+         (opencode-alerted-sessions nil)
+         (opencode-test-notifications nil)
+         (opencode-notification-messages-filter nil)
+         (opencode-notification-os-filter t)
+         (opencode-notify-os-function (lambda (notification)
+                                        (push notification opencode-test-notifications))))
      (cl-letf (((symbol-function 'opencode-request) #'opencode-test--request)
                ((symbol-function 'opencode-events-connected-p) (lambda () t))
                ((symbol-function 'opencode-events-connect) #'ignore)
@@ -175,6 +185,15 @@ and returns the decoded response, or (:error STATUS MESSAGE).")
   "Run the handlers of EVENTS in order."
   (dolist (event events)
     (opencode-events--handle event)))
+
+(defun opencode-test-dispatch-until (events type)
+  "Dispatch EVENTS up to and including the first of TYPE; return the rest."
+  (let ((done nil))
+    (while (and events (not done))
+      (let ((event (pop events)))
+        (opencode-events--handle event)
+        (setq done (equal (alist-get 'type event) type))))
+    events))
 
 (defun opencode-test-text (buffer)
   "Return BUFFER's text without properties and trailing whitespace."

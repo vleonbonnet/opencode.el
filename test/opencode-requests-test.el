@@ -11,15 +11,6 @@
 
 (require 'opencode-test-helpers)
 
-(defun opencode-test-dispatch-until (events type)
-  "Dispatch EVENTS up to and including the first of TYPE; return the rest."
-  (let ((done nil))
-    (while (and events (not done))
-      (let ((event (pop events)))
-        (opencode-events--handle event)
-        (setq done (equal (alist-get 'type event) type))))
-    events))
-
 (ert-deftest opencode-test-permission-marks-its-tool ()
   "A permission request marks the block of the call that asked, expanded."
   (opencode-test-with-server

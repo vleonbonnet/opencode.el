@@ -231,8 +231,9 @@ shows typed answers in place of the option keys."
             (message (substitute-command-keys "OpenCode question pending; \\[opencode-respond] answers it"))
           (opencode-notify-session
            "OpenCode question"
-           (or (alist-get 'description (car (opencode-form-fields form))) (alist-get 'title form) ""))
-          (push opencode-session-info opencode-alerted-sessions))
+           (or (alist-get 'description (car (opencode-form-fields form))) (alist-get 'title form) "")
+           'question)
+          (opencode-alert-session))
         entry))))
 
 (defun opencode--form-resolved (id)

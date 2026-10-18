@@ -44,10 +44,12 @@
 (require 'opencode-render)
 (require 'opencode-links)
 (require 'opencode-blocks)
+(require 'opencode-notify)
 (require 'opencode-session)
 (require 'opencode-requests)
 (require 'opencode-permission)
 (require 'opencode-form)
+(require 'opencode-modeline)
 
 (provide 'opencode)
 ;;; opencode.el ends here
