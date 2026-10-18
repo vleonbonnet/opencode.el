@@ -51,6 +51,7 @@
 (require 'opencode-form)
 (require 'opencode-modeline)
 (require 'opencode-sessions)
+(require 'opencode-edits)
 
 (provide 'opencode)
 ;;; opencode.el ends here

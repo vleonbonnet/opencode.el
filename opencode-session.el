@@ -89,6 +89,10 @@ Each function receives a plist (:kind :text :name) and may return
 (defvar opencode-step-ended-functions nil
   "Functions called in the session buffer with each `session.step.ended' data.")
 
+(defvar opencode-turn-ended-functions nil
+  "Functions called in the session buffer with the outcome of each turn that ends.
+They run before `opencode-session-idle-functions'.")
+
 (defvar opencode-step-failed-functions nil
   "Functions called with `session.step.failed' data; non-nil handles its display.")
 
@@ -852,6 +856,7 @@ reasoning encrypted stream empty blocks, which replay omits too."
               (opencode-open-block 'user)
               (opencode-show-prompt)))
            (force-mode-line-update)
+           (run-hook-with-args 'opencode-turn-ended-functions outcome)
            (opencode-notify-turn-ended outcome)
            (run-hook-with-args 'opencode-session-idle-functions outcome)))))))
 

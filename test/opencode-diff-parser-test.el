@@ -7,14 +7,7 @@
 
 ;;; Commentary:
 
-;; ERT tests for `opencode-diff-parser.el'.
-;;
-;; Run from the project root with:
-;;
-;;   emacs -Q -L . -batch \
-;;     -l opencode-diff-parser.el \
-;;     -l opencode-diff-parser-test.el \
-;;     -f ert-run-tests-batch-and-exit
+;; ERT tests for `opencode-diff-parser.el', run by `make test'.
 
 ;;; Code:
 
