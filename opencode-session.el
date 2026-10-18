@@ -361,12 +361,13 @@ needed; on Windows a PTY would run a synchronous helper on every resize."
         opencode-session-revert (alist-get 'revert info))
   (force-mode-line-update))
 
-(cl-defun opencode-session-open (info &key buffer no-display (other-window t) callback)
+(cl-defun opencode-session-open (info &key buffer no-display (other-window t) callback else)
   "Show the buffer of session INFO, creating and filling it when needed.
 INFO is a session info alist.  BUFFER reuses an existing placeholder
 buffer.  NO-DISPLAY leaves every window alone.  OTHER-WINDOW pops the
 buffer instead of switching to it.  CALLBACK runs in the buffer with
-INFO once the transcript is loaded.  Return the buffer."
+INFO once the transcript is loaded; ELSE runs there instead with the
+`opencode-error' of a failed request.  Return the buffer."
   (let* ((id (alist-get 'id info))
          (existing (gethash id opencode-session-buffers)))
     (if (buffer-live-p existing)
@@ -387,7 +388,8 @@ INFO once the transcript is loaded.  Return the buffer."
           (opencode--make-process buffer)
           (opencode-session-load
            (lambda ()
-             (when callback (funcall callback info)))))
+             (when callback (funcall callback info)))
+           else))
         (opencode--display buffer no-display other-window)))))
 
 (defun opencode-session-fetch (id callback &optional directory)
@@ -438,21 +440,24 @@ NO-DISPLAY leaves every window alone."
 
 ;;;; Loading the transcript
 
-(defun opencode--fetch-messages (id callback &optional cursor accumulated)
+(defun opencode--fetch-messages (id callback &optional else cursor accumulated)
   "Call CALLBACK with every projected message of session ID, oldest first.
+ELSE, when given, receives the `opencode-error' of a failed request.
 CURSOR and ACCUMULATED page through the list."
   (opencode-request
    'get (format "/api/session/%s/message" id)
    :query `((order . "asc") (limit . 200) (cursor . ,cursor))
+   :else else
    :then (lambda (response)
            (let ((data (opencode-request-data response))
                  (next (alist-get 'next (alist-get 'cursor response))))
              (if (and data next)
-                 (opencode--fetch-messages id callback next (nconc accumulated data))
+                 (opencode--fetch-messages id callback else next (nconc accumulated data))
                (funcall callback (nconc accumulated data)))))))
 
-(defun opencode-session-load (&optional callback)
-  "Replay this session's transcript, then adopt its status and run CALLBACK."
+(defun opencode-session-load (&optional callback else)
+  "Replay this session's transcript, then adopt its status and run CALLBACK.
+ELSE, when given, receives the `opencode-error' of a failed request."
   (let ((id opencode-session-id))
     (opencode--fetch-messages
      id
@@ -460,6 +465,7 @@ CURSOR and ACCUMULATED page through the list."
        (opencode-replay-messages messages)
        (opencode-request
         'get "/api/session/active"
+        :else else
         :then (lambda (response)
                 (let ((active (assq (intern id) (opencode-request-data response))))
                   (setq opencode-session-status (if active 'busy 'idle))
@@ -468,7 +474,8 @@ CURSOR and ACCUMULATED page through the list."
                     (opencode-show-prompt))
                   (force-mode-line-update)
                   (run-hooks 'opencode-session-replayed-hook)
-                  (when callback (funcall callback)))))))))
+                  (when callback (funcall callback))))))
+     else)))
 
 (defun opencode-session-reload ()
   "Render this session's transcript again from the server.

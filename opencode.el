@@ -52,6 +52,38 @@
 (require 'opencode-modeline)
 (require 'opencode-sessions)
 (require 'opencode-edits)
+(require 'opencode-desktop)
+
+;; Entry points load this file, so that every module is in place.
+
+;;;###autoload
+(autoload 'opencode "opencode" "List the sessions of the current project." t)
+;;;###autoload
+(autoload 'opencode-list-all-sessions "opencode" "List the sessions of every project." t)
+;;;###autoload
+(autoload 'opencode-select-project "opencode" "List the sessions of a project." t)
+;;;###autoload
+(autoload 'opencode-select-session "opencode" "Open a session of the current project." t)
+;;;###autoload
+(autoload 'opencode-new-session "opencode" "Create a session in the current project." t)
+;;;###autoload
+(autoload 'opencode-new-worktree "opencode" "Create a worktree and a session in it." t)
+;;;###autoload
+(autoload 'opencode-select-open-session "opencode" "Switch to an open session buffer." t)
+;;;###autoload
+(autoload 'opencode-visit-last-idle "opencode" "Open the session that last finished unseen." t)
+;;;###autoload
+(autoload 'opencode-select-idle "opencode" "Open a session that finished unseen." t)
+;;;###autoload
+(autoload 'opencode-consult-sessions "opencode" "Search every open session buffer." t)
+;;;###autoload
+(autoload 'opencode-desktop-restore "opencode")
+
+;;;###autoload
+(with-eval-after-load 'desktop
+  (defvar desktop-buffer-mode-handlers)
+  (dolist (mode '(opencode-session-mode opencode-desktop-pending-mode))
+    (setf (alist-get mode desktop-buffer-mode-handlers) #'opencode-desktop-restore)))
 
 (provide 'opencode)
 ;;; opencode.el ends here

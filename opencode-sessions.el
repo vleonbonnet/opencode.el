@@ -265,7 +265,6 @@ A sortable number, never nil: vtable would propertize the name of nil."
               default-directory (if (consp scope) (car scope) (expand-file-name "~/")))
         (opencode-session-list-refresh (lambda () (opencode--session-list-show buffer)))))))
 
-;;;###autoload
 (defun opencode (&optional directory)
   "List the sessions of DIRECTORY's project, the current one by default."
   (interactive)
@@ -277,13 +276,11 @@ A sortable number, never nil: vtable would propertize the name of nil."
           (format "*OpenCode Sessions in %s*" (abbreviate-file-name directory))
           (cons directory (alist-get 'id project))))))))
 
-;;;###autoload
 (defun opencode-list-all-sessions ()
   "List the sessions of every project."
   (interactive)
   (opencode--session-list-open-buffer "*OpenCode All Sessions*" 'all))
 
-;;;###autoload
 (defun opencode-select-project ()
   "List the sessions of a project the service knows, most recently active first."
   (interactive)

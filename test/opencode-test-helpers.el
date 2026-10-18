@@ -101,9 +101,13 @@ and returns the decoded response, or (:error STATUS MESSAGE).")
                (opencode-test-fixture file)))))
    (list 'get "\\`/api/session/\\(ses_[A-Za-z0-9]+\\)\\'"
          (lambda (request)
-           (let ((file (format "session-%s.json" (plist-get request :match))))
-             (if (file-exists-p (expand-file-name (concat "fixtures/v2/" file) opencode-test-directory))
-                 (opencode-test-fixture file)
+           (let* ((file (format "session-%s.json" (plist-get request :match)))
+                  (fixture (and (file-exists-p (expand-file-name (concat "fixtures/v2/" file)
+                                                                 opencode-test-directory))
+                                (opencode-test-fixture file))))
+             ;; A recorded error body, such as a deleted session's, was a 404.
+             (if (and fixture (not (alist-get '_tag fixture)))
+                 fixture
                `(:error 404 ,(format "Session not found: %s" (plist-get request :match)))))))
    (list 'get "\\`/api/session/active\\'" (lambda (_) '((data))))
    (list 'get "\\`/api/agent\\'" (lambda (_) (opencode-test-fixture "agent.json")))
