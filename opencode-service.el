@@ -241,12 +241,32 @@ The result is cached per executable modification time."
                         (plist-get connection :version)
                         (opencode-service-installed-version))))
 
+(defun opencode-service-running-sessions ()
+  "Return the number of sessions running a turn, or nil when the service is unreachable."
+  (when-let* ((connection (or opencode-service-connection (opencode-service-read-registration))))
+    (condition-case nil
+        (let ((response (plz 'get (concat (plist-get connection :url) "/api/session/active")
+                          :headers `(("Authorization" . ,(opencode-service-authorization connection)))
+                          :as (lambda () (json-parse-buffer :object-type 'alist :null-object nil
+                                                            :false-object nil))
+                          :connect-timeout 2 :timeout 5 :noquery t)))
+          (length (alist-get 'data response)))
+      (error nil))))
+
 (defun opencode-service-restart (&optional callback)
   "Restart the shared service, then call CALLBACK with the new connection.
-Every client reconnects by itself; running turns resume after the restart."
+Every client reconnects by itself; running turns resume after the
+restart, though their current step starts over, so interactively this
+asks first while any runs."
   (interactive)
   (when (process-live-p opencode-service--starter)
     (user-error "An OpenCode service start or restart is already running"))
+  (when-let* (((called-interactively-p 'any))
+              (running (opencode-service-running-sessions))
+              ((> running 0)))
+    (unless (yes-or-no-p (format "%d OpenCode session%s running a turn; restart the service anyway? "
+                                 running (if (= running 1) " is" "s are")))
+      (user-error "Restart cancelled")))
   (setq opencode-service-connection nil)
   (opencode-service--run-cli
    '("service" "restart")
