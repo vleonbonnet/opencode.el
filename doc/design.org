@@ -1,0 +1,67 @@
+#+TITLE: opencode.el design notes
+#+OPTIONS: toc:nil
+
+* Modules
+
+| Module                   | Responsibility                                                                                   |
+|--------------------------+--------------------------------------------------------------------------------------------------|
+| =opencode.el=            | Entry point: loads every module, autoloads the commands and the desktop handler                  |
+| =opencode-common.el=     | Groups, faces, shared state, directory normalization, identifiers, small helpers                 |
+| =opencode-service.el=    | Service discovery from =service.json=, probing, =opencode service start/restart=, version checks |
+| =opencode-http.el=       | =opencode-request=: authentication, location header, JSON, retries, error reporting              |
+| =opencode-events.el=     | The one SSE stream: frame scanning, queued dispatch, heartbeat watchdog, reconnection            |
+| =opencode-render.el=     | Output and prompt management, fontification that survives Markdown, tables, prompt-only undo     |
+| =opencode-links.el=      | File, Org and Markdown links in the transcript                                                   |
+| =opencode-blocks.el=     | Collapsible reasoning, tool and notice blocks, their summaries, fitting to the window             |
+| =opencode-session.el=    | Session buffers: opening, replay, live events, sending, attachments, agent and model, navigation |
+| =opencode-requests.el=   | What permissions and questions share: providers, subagent propagation, transient helpers         |
+| =opencode-permission.el= | Permission requests, their transient and the hand-off to another agent                           |
+| =opencode-form.el=       | Question forms and other forms                                                                   |
+| =opencode-notify.el=     | Notification log, filters and operating-system backends                                          |
+| =opencode-modeline.el=   | The session mode line and long-context pricing tiers                                             |
+| =opencode-sessions.el=   | Session lists, projects, worktrees, MCP servers                                                  |
+| =opencode-edits.el=      | Post-edit hooks, safe visiting and saving, indentation, Prettier, Flycheck                       |
+| =opencode-desktop.el=    | Desktop saving and in-place restoring                                                            |
+| =opencode-convert.el=    | Markdown transcripts                                                                             |
+| =opencode-cache.el=      | Prompt-cache preflight guard, stale-thinking consent, refused turns                              |
+| =opencode-diff-parser.el= | Line ranges of unified diffs                                                                    |
+
+* The server is authoritative
+
+Buffers render what the service reports and keep only interface state: which blocks are expanded, the prompt being typed, pending answers. Agent, model, variant, status and transcript come from the service, so another client's actions show up in Emacs and nothing needs reconciling beyond what reconnection does.
+
+* One service, one stream
+
+OpenCode 2 runs one background service per user. Emacs never starts a server of its own and never stops the service: the TUI and the desktop app share it, and it resumes running turns after a restart. Every location's events arrive on a single =GET /api/event= stream. The process filter only splits frames and queues them, and a zero-delay timer dispatches them in time-bounded batches, because the service drops a subscriber that falls 4096 frames behind and a slow handler must not stall the socket. Frame scanning resumes where the previous chunk ended, so a multi-megabyte tool result costs linear time. Nothing is replayed after a reconnect: =server.connected= makes every buffer compare its session with the service and reload the transcript when it changed.
+
+Locations are keyed by the exact directory string the service receives, so every directory is normalized the same way: truename, trailing slash, and an uppercase drive letter on Windows.
+
+* Live rendering equals replay
+
+Opening a session renders its projected messages; afterwards the event stream drives the buffer. Both paths must produce the same text, which the tests check for every recorded scenario. That rule settled several choices:
+
+- Text and reasoning fragments are keyed by assistant message and per-type ordinal (=MSG/t/N=, =MSG/r/N=), tool calls by call ID, so a late event finds its block wherever the stream left the cursor.
+- Reasoning blocks are created on their first text, since encrypted reasoning arrives empty.
+- A prompt sent from Emacs carries an ID generated locally, in the service's ID layout, so its echo on the stream is recognized and not rendered twice; prompts of other clients render when the inbox delivers them, where replay places them.
+- The package tracks its own prompt start marker: =comint-last-prompt= would count the last line of output as the prompt.
+- Notices are inserted before the idle prompt, and a turn started elsewhere lifts the prompt first.
+
+* Fontification that survives
+
+Markdown is fontified by =markdown-ts-mode= as text streams in. Regions that must keep their own faces (verbatim output, tool summaries, buttons) are marked with properties the Markdown fontifier skips, and buttons are made after fontification from registered buttonizers. Half-typed Markdown never turns the transcript red: the parser's error feature is off.
+
+* Requests that wait
+
+Permission requests and questions mark the block of the tool call that raised them and never take focus. A request whose block has not been inserted yet prints a fallback line that the block replaces. Requests of a subagent mark its block in the parent session. Answers from any client resolve them through =permission.replied= and =form.replied= or =form.cancelled=.
+
+* Edits only from live turns
+
+Post-edit hooks run from =session.tool.success= of live turns only. A reloaded transcript or a fork is built from projected messages and never reruns them, so files edited long ago are never reformatted. The diff an edit or patch reports gives the line ranges; a write reports none and counts as the whole file. Processing never asks anything: the service writes files behind Emacs, and a stale buffer would otherwise prompt whether to reread it.
+
+* The prompt cache
+
+The cache guard's report comes from the service, which dry-runs the request the turn would send and compares it with what the provider confirmed it cached. The check runs from =RET=, before Comint takes the input, so declining leaves the prompt untouched. Consent to drop stale thinking travels as prompt metadata on that one send. A service without the route answers an untagged 404, and the guard then stays off for it.
+
+* Tests
+
+Tests run only in a separate =emacs -Q=: they never evaluate anything in a running session or talk to a real service. Fixtures under =test/fixtures/v2= were recorded from a service driving scripted sessions in a scratch repository and sanitized of paths and account identifiers. Session tests answer requests synchronously from route handlers. Transport tests talk HTTP through curl to a local server registered in a temporary =service.json=. One listening process serves the whole run, because on Windows a server created after earlier ones were deleted stops accepting connections after a few. Batch Emacs formats every mode line as an empty string, so the one rendering test is tagged =gui= and runs under =make test-gui=.

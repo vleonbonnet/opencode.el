@@ -1,268 +1,112 @@
-#+TITLE: Emacs OpenCode UI
+#+TITLE: opencode.el
 #+OPTIONS: toc:nil
 
-An emacs UI to [[https://opencode.ai/][opencode]] - an open source AI coding agent. This provides two sets
-of advantages over the official TUI:
+An Emacs client for [[https://opencode.ai/][OpenCode]] 2, the open source coding agent. Each session is a Comint buffer with Markdown rendering, collapsible reasoning and tool blocks, and permission requests and questions that wait for you without taking focus. It connects to the shared background service the OpenCode TUI and desktop app use, starting it when needed, and never stops it.
 
-1) A better TUI and GUI
+This package started as [[https://codeberg.org/sczi/opencode.el][sczi's opencode.el]] for OpenCode 1. It was rewritten for OpenCode 2's API and event model, keeping its Comint foundation, its session tables and its post-edit hooks.
 
-   #+begin_verse
-   Emacs is a mature TUI and GUI framework, that while janky in its own way, is
-   far less janky than the TUIs the new agentic coding tools have written from
-   scratch. This package builds on a solid foundation of [[https://www.emacswiki.org/emacs/ComintMode][comint]], [[https://www.gnu.org/software/emacs/manual/html_mono/vtable.html][vtable]],
-   [[https://www.gnu.org/software/emacs/manual/html_node/emacs/Diff-Mode.html][diff-mode]], =markdown-ts-mode=, emacs' completion system, and more, to offer a
-   (IMO) nicer UI. Also if you're an emacs user, the UI is more consistent: goto
-   next or previous prompt, =comint-kill-output-to-kill-ring=, and everything else
-   works the same as in any other repl or shell based on comint mode, completion
-   and filtering works the same as everywhere else in emacs, and everything is
-   just a text buffer where all your usual editing and other commands work as
-   expected.
-   #+end_verse
+* Requirements
 
-2) Emacs integration
-
-   - runs =opencode-file-edited-functions= after edit tool calls. The default
-     hooks will:
-     + fix parentheses with parinfer if =parinfer-rust-mode= is installed after
-       edits to emacs lisp and common lisp files
-     + reload file after edits to emacs lisp files
-   - calls =opencode-files-finished-editing-functions= with a list of all files
-     edited in the last assistant turn. The default hook will fix indentation
-     with =indent-region= and run flycheck and report all errors and warnings in
-     the edited files to the LLM if you have flycheck setup.
-
-     You can set project specific hooks in
-     =opencode-project-files-finished-editing-functions=. We include
-     =opencode-uv-pytest= and =opencode-emacs-ert= which will run all tests from
-     pytest and ERT and report errors to the LLM. They are defined using
-     =opencode-run-command-diagnostic= which you can use to run any shell command
-     and report errors to the LLM. To set up a python project to run pytest
-     after LLM edits add your project directory to
-     =safe-local-variable-directories= and then create a =.dir-locals.el= in the
-     project directory with:
-     #+begin_src elisp
-((nil . ((opencode-project-files-finished-editing-functions . (opencode-uv-pytest)))))
-     #+end_src
-   - add any emacs buffer to chat context with =opencode-add-buffer-dwim=
-   - add files from dired to context with =opencode-add-file-dwim=
-   - add selected region to context with =opencode-add-region=
-   - integration with magit is possible, =opencode-new-worktree= will create a new
-     git branch and worktree for the current project, and start an opencode session in it
-   - =`file`= and file:line references in LLM output are turned into clickable buttons
-   - use =dabbrev-expand= in the chat window to complete long variable or function
-     names from your code buffers
-   - configure how your custom MCP and tools are displayed with =opencode-tool-formatters=
-   - I use with [[https://codeberg.org/sczi/eval-elisp-mcp][eval-elisp-mcp]] when developing in elisp.
-   - For python development integrated with opencode.el, with features like AI
-     autodebugging exceptions, check out [[https://codeberg.org/sczi/swanky-python/][Swanky Python]]
-
-* Demo
-A brief demo showing starting opencode, viewing a past session, sharing it,
-toggling an MCP, selecting the agent, model, and variant, performing some edits,
-receiving a notification when the response is finished if the session buffer
-isn't focused, reverting edits, and forking the session.
-#+HTML: <video src="/sczi/opencode.el/media/branch/main/screenshots/demo.webm" controls></video>
+- Emacs 31.1 with the =markdown= and =markdown-inline= tree-sitter grammars (=M-x markdown-ts-mode-install-parsers=, or set =opencode-ensure-grammar-function=).
+- [[https://github.com/alphapapa/plz.el][plz]] and [[https://github.com/magit/transient][transient]], and =curl= on the =PATH=.
+- OpenCode 2. The prompt-cache guard and stale-thinking consent need routes only [[https://github.com/vleonbonnet/opencode][my fork]] has; with stock OpenCode the guard switches itself off.
 
 * Installation
-When this package is a bit more stable I'll package it on MELPA, for now install
-from git. This package requires Emacs 31.1 with the =markdown= and
-=markdown-inline= Tree-sitter grammars (install with
-=M-x markdown-ts-mode-install-parsers=), plus [[https://github.com/magit/magit][magit]], [[https://github.com/alphapapa/plz.el][plz]], [[https://github.com/r0man/plz-media-type][plz-media-type]],
-and a bugfix branch of [[https://github.com/sczi/plz-event-source/tree/long-lines-fix][plz-event-source]].
-** Manual
 
-Clone this repository and add it to your load path.
+With elpaca or straight:
 
-#+BEGIN_SRC emacs-lisp
-(add-to-list 'load-path "/path/to/opencode.el")
-(require 'opencode)
-#+END_SRC
-** With straight.el
 #+begin_src emacs-lisp
 (use-package opencode
-  :straight (opencode :type git :host codeberg :repo "sczi/opencode.el"))
+  :ensure (:host github :repo "vleonbonnet/opencode.el"))
 #+end_src
-** Emacs use-package
+
+With =package-vc=:
+
 #+begin_src emacs-lisp
-(use-package opencode 
-  :vc (:url "https://codeberg.org/sczi/opencode.el.git" :rev :newest))
-#+end_src
-** In Doom Emacs
-add to =packages.el= and run =doom sync=
-#+begin_src emacs-lisp
-(package! opencode
-  :recipe (:host codeberg :repo "sczi/opencode.el"))
+(use-package opencode
+  :vc (:url "https://github.com/vleonbonnet/opencode.el" :rev :newest))
 #+end_src
 
-* Connecting
-** Automatic
-=M-x opencode= will try to connect to an opencode server at
-=opencode-host:opencode-port= or will start a headless opencode server if one
-isn't already running. Then it opens a [[#6679896c-5b9d-4e87-9e03-6ed060dec278][Session Management]] buffer for the current
-project.
-** Manual
-=M-x opencode-connect= will prompt for the host and port of an opencode server to
-connect to.
+* The service
 
-* Project Management
-In opencode, sessions are grouped by project, where each git repository is a
-different project. Different git worktrees for the same repository will be
-grouped in the same project. Sessions started in directories outside of any git
-repository will go in the global =/= project. =opencode-select-project= will fuzzy
-complete on all projects and open the [[#6679896c-5b9d-4e87-9e03-6ed060dec278][Session Management]] buffer for the project
-you select.
+OpenCode 2 runs one background service per user. It registers its URL, process ID, version and password in =~/.local/state/opencode/service.json= (=$XDG_STATE_HOME/opencode/service.json= when set). Emacs reads that file, checks that the registered process answers, and runs =opencode service start= when none does. A restarted service is found again from the file, and running turns resume. =M-x opencode-service-restart= restarts it, for instance after installing a new build; =opencode-service-stale-functions= run when the service is older than the installed CLI.
 
-* Session Management
-:PROPERTIES:
-:CUSTOM_ID: 6679896c-5b9d-4e87-9e03-6ed060dec278
-:END:
-[[file:screenshots/session_management.png]]
+* Sessions
 
-Here you see a table view with information on all sessions for a given project.
+=M-x opencode= lists the sessions of the current project, including those of its worktrees, with their branch. =M-x opencode-list-all-sessions= lists every project's. In a list:
 
-Shortcuts to act on the session at point:
+| Key        | Action                              |
+|------------+-------------------------------------|
+| =RET=, =o= | open the session                    |
+| =x=        | delete the session                  |
+| =R=        | rename the session                  |
+| =n=        | new session in this directory       |
+| =v=        | show or hide subagent sessions      |
+| =M=        | connect or disconnect an MCP server |
+| =g=, =r=   | refresh                             |
 
-|   Key    | Description                                                                                 |
-|----------+---------------------------------------------------------------------------------------------|
-|   <c>    |                                                                                             |
-|    =x=     | kill session                                                                                |
-|    =R=     | rename session                                                                              |
-|    =s=     | share session, copies a URL to the clipboard that will give a read-only view of the session |
-|    =u=     | unshare session                                                                             |
-| =RET= or =o= | open the session                                                                            |
+Other entry points: =opencode-select-project=, =opencode-select-session=, =opencode-new-session=, =opencode-new-worktree= (a new branch in a worktree under =opencode-worktree-directory=, with a session in it), =opencode-select-open-session=, =opencode-consult-sessions=, and =opencode-visit-last-idle= or =opencode-select-idle= for sessions that finished or started waiting while not displayed.
 
-Buffer-wide shortcuts:
+* Session buffers
 
-| Key | Description                                        |
-|-----+----------------------------------------------------|
-| <c> |                                                    |
-|  =n=  | new session                                        |
-|  =M=  | toggle MCP - fuzzy completes on all available MCPs |
-|  =U=  | unshare all shared sessions for this project       |
-|  =v=  | toggle verbose - whether to show subagent sessions |
+Prompts are typed at the bottom. A prompt sent while a turn runs steers it (=opencode-prompt-delivery=); =C-c RET= queues it for after the turn instead. =/= at the start of the prompt picks a slash command, =!= runs a shell command, and =@= mentions a subagent.
 
-* Chat Sessions
-[[file:screenshots/session.png]]
-[[file:screenshots/session_with_diff.png]]
+| Key                         | Action                                                             |
+|-----------------------------+--------------------------------------------------------------------|
+| =RET=                       | send                                                               |
+| =C-c RET=                   | send after the running turn                                        |
+| =M-p=, =M-n=                | previous or next input at the prompt, else previous or next button |
+| =TAB=                       | expand or collapse the block at point, else next button            |
+| =C-c TAB=                   | next primary agent                                                 |
+| =C-c C-a=, =C-c m=, =C-c v= | choose the agent, model or variant                                 |
+| =C-c C-q=                   | answer the pending permission request or question                  |
+| =C-c C-c=                   | interrupt the turn                                                 |
+| =C-c f=, =C-c b=            | attach a file, or a buffer or region                               |
+| =C-c F=                     | fork the session at point                                          |
+| =C-c R=, =C-c U=            | stage a revert after point, cancel it                              |
+| =C-c C=                     | compact the conversation                                           |
+| =C-c c=, =C-c p=            | open a subagent session, the parent session                        |
+| =C-c C-o=                   | open the link or file reference at point                           |
+| =C-c C-y=, =C-c Y=          | copy the code block at point, the whole conversation as Markdown   |
+| =C-c t=                     | go to the start of the last answer                                 |
+| =C-c r=, =C-c x=, =C-c n=   | rename, delete, new session                                        |
+| =C-c g=                     | reload the transcript                                              |
 
-This is what session buffers look like. In the modeline at the bottom right we
-see the current agent, current model, model variant if one is selected (like
-low/medium/high thinking level), the percent of context used up so far, and an
-indicator for if the session is idle or busy. User prompts are shown with a blue
-margin highlight, information about tool calls in green, and reasoning in brown.
-These colors can be configured through the =opencode-*-margin-highlight= faces.
+Images pasted with =yank-media= are attached to the next prompt.
 
-|      Key       | Description                                                                                                                                                                                                     |
-|----------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|      <c>       |                                                                                                                                                                                                                 |
-|    =C-c C-y=     | yank code block at point                                                                                                                                                                                        |
-|     =C-c Y=      | Copy the full conversation as a Markdown transcript, including reasoning and tool outputs. @@html:<br>@@ Useful to gather context in OpenCode, and then iterate on a plan in webchat if webchat has separate usage limits.   |
-|    =C-c C-c=     | cancel the current request                                                                                                                                                                                      |
-|    =C-c C-p=     | respond to a permission request                                                                                                                                                                                 |
-|     =C-c x=      | delete this session                                                                                                                                                                                             |
-|      =TAB=       | cycle through available primary agents                                                                                                                                                                          |
-|     =C-c r=      | rename this session                                                                                                                                                                                             |
-|     =C-c n=      | start a new session in the same project                                                                                                                                                                         |
-|     =C-c l=      | list and select from all sessions in the same project                                                                                                                                                           |
-|     =C-c c=      | fuzzy select a child session to open - children are all subagent  sessions spawned by this session                                                                                                              |
-|     =C-c C=      | compact session                                                                                                                                                                                                 |
-|     =C-c t=      | scroll to the top of the text part of the last assistant response                                                                                                                                               |
-|     =C-c p=      | open parent session - when in a subagent session, open the session that spawned it                                                                                                                              |
-|     =C-c f=      | select a file to add to context, if called with a prefix argument then select a directory                                                                                                                       |
-|     =C-c b=      | select a buffer to add to context                                                                                                                                                                               |
-| =M-x yank-media= | add an image from clipboard to context                                                                                                                                                                          |
-|     =C-c s=      | share session - copy a URL to the clipboard with a read-only view of the session                                                                                                                                |
-|     =C-c u=      | unshare session                                                                                                                                                                                                 |
-|     =C-c U=      | unshare all sessions                                                                                                                                                                                            |
-|     =C-c m=      | select model                                                                                                                                                                                                    |
-|     =C-c v=      | select model variant                                                                                                                                                                                            |
-|     =C-c M=      | select an MCP to toggle                                                                                                                                                                                         |
-|     =C-c F=      | fork session from message at point - use this when a model responds badly to avoid polluting context with the bad response                                                                                      |
-|     =C-c D=      | delete a message (user prompt and assistant response) from context                                                                                                                                              |
-|     =C-c R=      | revert all edits done by this session after the message at point                                                                                                                                                |
-|       =/=        | when at the start of a user prompt, select a slash command to run                                                                                                                                               |
-|       =@=        | reference a sub-agent                                                                                                                                                                                           |
+The mode line shows the session's status, title, agent, model, variant, provider and context use, fitted to the window. A model billed more past some context size, from its catalog pricing or =opencode-long-context-tiers=, is flagged as the context approaches it.
+
+* Permissions and questions
+
+A permission request marks the tool call that asked and waits; it never takes focus. =C-c C-q= opens it: accept once, always, reject, or hand the task off to another primary agent. Questions from the question tool open as a form, one question at a time, with your own answer always possible. Requests of a subagent show on the parent session's block. An answer given in another client clears the request in Emacs.
+
+* Edits
+
+After each edit, write or patch tool call of a live turn, =opencode-file-edited-functions= run with the file and the line ranges the edit left. By default, Lisp files with unbalanced parentheses are fixed with parinfer when installed, Node projects with a local Prettier configuration are formatted by that Prettier, and other files are reindented where the edit touched them. Org files are only reindented by =opencode-org-indent-function=. When the turn ends, =opencode-files-finished-editing-functions= run with every file it edited; by default Flycheck checks them and its errors and warnings are sent back to the agent. Files with unsaved Emacs edits are never touched, and nothing ever asks whether to reread a file.
+
+* Prompt cache and thinking
+
+With my fork, before an idle session sends a turn, the service reports how much of the cached prompt it would re-send uncached and why; above =opencode-cache-guard-threshold= tokens, Emacs asks first. When earlier thinking no longer matches the conversation, Emacs asks whether to replace it with its text, which the service otherwise refuses. Declining keeps the input in the prompt.
 
 * Notifications
-If a session buffer and frame is not active, emacs will show a notification when that session's response has finished, so that you can go work on other stuff and be notified when the agent has finished.
 
-* Commands
-#+begin_src emacs-lisp :results table :colnames '("Command" "Description") :exports results
-(cl-loop for command in '(opencode opencode-connect opencode-disconnect
-                          opencode-select-project opencode-select-open-session
-                          opencode-new-worktree opencode-new-session
-                          opencode-select-idle opencode-visit-last-idle
-                          opencode-add-file-dwim opencode-add-region opencode-add-buffer-dwim)
-         collect (list command
-                       (string-join (string-lines (documentation command)) " ")))
-#+end_src
+A turn that ends, a retry, and a permission request or question of a session that is not displayed are logged in the hidden buffer =*OpenCode Notifications*=. =opencode-notification-messages-filter= and =opencode-notification-os-filter= decide what also reaches =*Messages*= and the operating system, through =opencode-notify-os-function=: D-Bus, macOS notifications, Windows tray notifications, or =opencode-notify-os-alert= for the alert package.
 
-#+RESULTS:
-| Command                      | Description                                                                                                                                                                                                                                          |
-|------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| opencode                     | Open opencode sessions control buffer for the current project directory. Connects to an existing server if one is running, otherwise starts a new one if ‘opencode-auto-start-server’ is non-nil.                                                    |
-| opencode-connect             | Connect to opencode server, prompting for HOST and PORT.                                                                                                                                                                                             |
-| opencode-disconnect          | Disconnect from opencode server, optionally log EVENT.                                                                                                                                                                                               |
-| opencode-select-project      | Completing read to prompt which project to select.                                                                                                                                                                                                   |
-| opencode-select-open-session | Select among open session buffers.                                                                                                                                                                                                                   |
-| opencode-new-worktree        | Create a new git branch, and worktree prompting for a name. Then open an opencode session in it.                                                                                                                                                     |
-| opencode-new-session         | Create a new session. With a prefix argument it will ask for TITLE. Without it will use a default title and then automatically generate one. If CALLBACK is given, it will be called with the session after it is created.  (fn &key TITLE CALLBACK) |
-| opencode-select-idle         | Select a session that hasn’t been visited since it went idle.                                                                                                                                                                                        |
-| opencode-visit-last-idle     | Open the most recent session to notify as idle.                                                                                                                                                                                                      |
-| opencode-add-file-dwim       | If in Dired, add all marked files, or file at point if none marked. Otherwise add the current buffer’s file. Otherwise prompt for file in current project.                                                                                           |
-| opencode-add-region          | Add the active region to context.                                                                                                                                                                                                                    |
-| opencode-add-buffer-dwim     | Add current buffer or prompt for one to add.                                                                                                                                                                                                         |
+* Desktop
 
-* Question Tool
-#+CAPTION: Single choice question
-[[file:screenshots/single_choice_question.png]]
-#+CAPTION: Multiple choice question
-[[file:screenshots/multiple_choice_question.png]]
+Session buffers are saved with the desktop by session ID, directory and point, and restored in place in the background. A restore that fails, because the service is unavailable or the session was deleted, leaves a placeholder that is still saved; =g= in it retries.
 
-OpenCode includes a question tool that models can use to ask clarifying
-questions of the user. If the session buffer is active when the questions are
-raised, it will immediately prompt each question with options for responses. The
-options the model provides are suggestions, feel free to type your own answer.
-If the session buffer or frame is not active at the time, then emacs will notify
-that a question is awaiting response. You can switch to the session buffer that
-most recently raised a notification with =opencode-visit-last-idle=, and as soon
-as you visit the buffer it will prompt the questions. For single choice
-questions, selecting an option will immediately submit that response. For
-multiple choice questions, select the options you want and then press =C-c C-c= to
-submit.
+* Development
 
-* Security
-Opencode's permission system, especially for bash, is not nearly as fine-grained
-as claude's. However, I don't think this really matters. Any coding agent with
-the ability to write and execute code can execute potentially malicious code by
-design and should be untrusted. One approach I'd recommend is to develop inside
-virtual machines or at least unprivileged containers managed by [[https://linuxcontainers.org/incus/][incus]]. If you
-use btrfs or ZFS for your incus storage pool, then =incus copy= is almost instant.
-So you can have a VM with emacs and opencode and your project, but without
-secrets or sensitive data, and spawn a copy to do agent-assisted development in.
-When you finish, push the changes to a git repo in a shared folder, and delete
-the VM. If you only need one copy at a time, you can just snapshot and restore
-rather than creating and deleting copies. Then from your somewhat more secure
-and non AI-infected development environment, review and then pull the changes
-from the shared folder.
+| Command         | Runs                                                            |
+|-----------------+-----------------------------------------------------------------|
+| =make test=     | every ERT test in a batch =emacs -Q=                            |
+| =make test-gui= | the tests that need a graphical frame, in a separate =emacs -Q= |
+| =make compile=  | byte compilation with warnings as errors                        |
+| =make lint=     | checkdoc                                                        |
 
-* Performance
-Make sure you are using my branch of [[https://github.com/sczi/plz-event-source/tree/long-lines-fix][plz-event-source]] with a major performance
-fix, and set both =comint-scroll-show-maximum-output= and
-=comint-move-point-for-output= to nil.
+=DEPS= names the directory holding the dependencies, one subdirectory each, elpaca's builds directory by default. Tests replay events and messages recorded from a real service (=test/fixtures/v2=) and talk HTTP to a local fake service; they never touch a running Emacs session or OpenCode service. See =doc/design.org= for the module map and the main design choices.
 
-* Configuration
-- =opencode-command= and =opencode-serve-command= can be used to configure how to
-  run a headless opencode server
-- =opencode-host= and =opencode-port= are the default host and port to use with =M-x opencode-connect=
-- =opencode-server-username= and =opencode-server-password= configure how to authenticate to the opencode server
-- the =opencode-faces= group configures faces used when displaying sessions
-- =opencode-toast-function= is used to show toast notifications
-- =opencode-file-edited-functions= is a hook run after edit tool calls
-- =opencode-files-finished-editing-functions= is a hook run after the assistant
-  response finishes, with all files that it edited
-- =opencode-project-files-finished-editing-functions= is a buffer local hook run
-  after the assistant response finishes, that you can use for example to run
-  your test suite and report errors back the to the LLM
-- =opencode-session-deleted-functions= is a hook run when a session is deleted
-- =opencode-tool-formatters= can be used to control how tools are displayed
+* License
+
+GPL-3.0-or-later. Copyright Scott Zimmermann and Valentin Leon.

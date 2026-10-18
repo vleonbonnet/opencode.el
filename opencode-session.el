@@ -272,6 +272,9 @@ Callers run at redisplay, so the request starts from a timer."
 (defvar-keymap opencode-session-mode-map
   :parent comint-mode-map
   "RET" #'opencode-send-input
+  "C-c RET" #'opencode-queue-input
+  "M-p" #'opencode-previous-input-or-button
+  "M-n" #'opencode-next-input-or-button
   "TAB" #'opencode-tab-dwim
   "<backtab>" #'backward-button
   "C-c TAB" #'opencode-cycle-agent
@@ -1209,6 +1212,26 @@ Checks run before Comint takes the input, so declining leaves it as typed."
           (message "Not sent")
         (let ((opencode--send-decision (or decision t)))
           (comint-send-input))))))
+
+(defun opencode-queue-input ()
+  "Send the input at the prompt to start after the running turn, not steer it."
+  (interactive)
+  (let ((opencode-prompt-delivery 'queue))
+    (opencode-send-input)))
+
+(defun opencode-previous-input-or-button (&optional count)
+  "Recall the COUNTth previous input at the prompt, else move to a previous button."
+  (interactive "p")
+  (if (comint-after-pmark-p)
+      (comint-previous-input count)
+    (backward-button count)))
+
+(defun opencode-next-input-or-button (&optional count)
+  "Recall the COUNTth next input at the prompt, else move to a next button."
+  (interactive "p")
+  (if (comint-after-pmark-p)
+      (comint-next-input count)
+    (forward-button count)))
 
 (defun opencode--restore-input (text)
   "Put TEXT back at the prompt after a send was cancelled."
