@@ -1,38 +1,14 @@
 # AGENTS.md - opencode.el
 
-Emacs frontend for OpenCode LLM coding assistant server.
+Emacs client for the OpenCode 2 server (`/api/*`, shared background service).
 
-# Tool use
+## Rules
 
-Interact with the user's emacs process to perform introspection, find
-information about functions, values of variables etc. Use it to run and verify
-that code you write is working correctly.
+- Never evaluate code in the user's running Emacs to test this package. Every test runs in a separate `emacs -Q --batch` process (`make test`); pixel-width fitting tests run in a separate GUI `emacs -Q` (`make test-gui`).
+- Never start, stop or restart the user's OpenCode service from a test. Tests replay recorded events from `test/fixtures/v2/` or talk to the fake service in `test/opencode-test-server.el`.
+- `make compile` must stay free of warnings, and `make lint` (checkdoc, package-lint) clean.
+- The server is authoritative: buffers render what the server reports and keep only UI state locally.
 
-## Verification Commands
+## Layout
 
-DO NOT byte-compile to check for warnings. After you are finished you will be
-presented all warnings and errors from emacs' flycheck, including byte compiler
-warnings.
-DO NOT run all tests, they will also be automatically run after you are finished
-and you will be notified if any failed.
-
-DO use emacs_eval_elisp to perform runtime verification that the code you edited
-works as expected.
-
-### Async HTTP Pattern
-
-This codebase uses macro-generated async API calls:
-
-```elisp
-;; The macro opencode-api-session expands to async plz call
-(opencode-api-session (session-id)
-    result-var
-  ;; This body runs in callback with result-var bound
-  (do-something-with result-var))
-```
-
-### Error Handling
-
-- Use `error` for fatal conditions
-- Log warnings to dedicated buffer: `*opencode-event-log*`
-  use `(opencode--log-event "WARNING TYPE" "msg")`
+See `doc/design.org` for the module map and the reasons behind the main design choices.
