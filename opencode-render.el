@@ -501,7 +501,7 @@ overlays."
 
 ;;;; Tables
 
-(defun opencode--output-properties (position)
+(defun opencode-output-properties (position)
   "Return the Comint output properties at POSITION as a plist."
   (cl-loop for property in '(field read-only insert-in-front-hooks
                                    inhibit-line-move-field-capture front-sticky)
@@ -514,7 +514,7 @@ markdown-ts aligns it in an isolated buffer and only the changed text is
 applied back, so properties and markers on unchanged text survive."
   (let ((source (current-buffer))
         (text (buffer-substring-no-properties beg end))
-        (output-properties (opencode--output-properties beg))
+        (output-properties (opencode-output-properties beg))
         (inhibit-read-only t))
     (save-excursion
       (with-temp-buffer
