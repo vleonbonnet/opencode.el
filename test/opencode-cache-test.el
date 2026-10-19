@@ -124,6 +124,16 @@ The fake service answers preflights with `opencode-test-reports'."
       (opencode-test-type-and-send "retry")
       (should (string-match-p "also re-sends ~180k cached tokens" (car opencode-test-questions))))))
 
+(ert-deftest opencode-test-cache-running-turn-not-asked ()
+  "A report made while a turn runs asks nothing: the input joins that turn."
+  (let ((opencode-test-reports
+         '(((status . "unknown") (running . t) (lostTokens . 0) (reasons "a turn is running")))))
+    (opencode-test-with-guard nil
+      (setq opencode-session-tokens 900000)
+      (opencode-test-type-and-send "more")
+      (should-not opencode-test-questions)
+      (should (equal (alist-get 'text (opencode-test-sent-body "/prompt")) "more")))))
+
 (ert-deftest opencode-test-cache-unknown-binding-not-asked ()
   "Thinking the server holds no binding for is sent without a consent question."
   (let ((opencode-test-reports

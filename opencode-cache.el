@@ -199,6 +199,8 @@ Return nil to send, `cancel' to keep the input, or the consent metadata."
     (let* ((report (opencode-cache-preflight body))
            (loss (opencode-cache-loss report)))
       (cond
+       ;; A turn Emacs has not yet seen start takes the input as steering.
+       ((alist-get 'running report) nil)
        ((opencode-cache-stale-thinking-p report)
         (if (y-or-n-p (opencode-cache-thinking-question report loss))
             '((thinkingLoss . "accept"))
