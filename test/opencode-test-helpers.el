@@ -88,17 +88,27 @@ Each is a plist (:method :path :query :body).")
 Each is (METHOD REGEXP FUNCTION); FUNCTION receives the request plist
 and returns the decoded response, or (:error STATUS MESSAGE).")
 
+(defun opencode-test-cursor-with-order-p (request)
+  "Return non-nil when REQUEST's query has both a cursor and an order.
+The service refuses message pages asked for so."
+  (let ((query (plist-get request :query)))
+    (and (alist-get 'cursor query) (assq 'order query))))
+
 (defun opencode-test-default-routes ()
   "Return routes serving the recorded sessions and catalogs."
   (list
    (list 'get "\\`/api/session/\\(ses_[A-Za-z0-9]+\\)/message\\'"
          (lambda (request)
            (let ((file (format "messages-%s.json" (plist-get request :match))))
-             (if (or (plist-get request :cursor-seen)
-                     (not (file-exists-p (expand-file-name (concat "fixtures/v2/" file)
-                                                           opencode-test-directory))))
-                 '((data) (cursor))
-               (opencode-test-fixture file)))))
+             (cond
+              ;; As the service does: a cursor carries its order.
+              ((opencode-test-cursor-with-order-p request)
+               '(:error 400 "Cursor cannot be combined with order"))
+              ((or (plist-get request :cursor-seen)
+                   (not (file-exists-p (expand-file-name (concat "fixtures/v2/" file)
+                                                         opencode-test-directory))))
+               '((data) (cursor)))
+              (t (opencode-test-fixture file))))))
    (list 'get "\\`/api/session/\\(ses_[A-Za-z0-9]+\\)\\'"
          (lambda (request)
            (let* ((file (format "session-%s.json" (plist-get request :match)))

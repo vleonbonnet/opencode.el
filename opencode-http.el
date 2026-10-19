@@ -65,9 +65,15 @@
 (defun opencode-report-error (text)
   "Report TEXT like a `user-error' raised by a command, outside the command loop.
 Asynchronous callbacks run from process sentinels, where a signaled
-error would only print \"error in process sentinel\"."
-  (if command-error-function
-      (funcall command-error-function (list 'user-error text) nil nil)
+error would only print \"error in process sentinel\".  Without a frame
+to show it in, in batch or on a daemon's initial frame, the default
+`command-error-function' would print TEXT and exit Emacs, so TEXT then
+goes to `message'."
+  (if (and command-error-function
+           (not noninteractive)
+           (not (frame-initial-p (selected-frame))))
+      ;; The context argument must be a string.
+      (funcall command-error-function (list 'user-error text) "" nil)
     (message "%s" text)))
 
 (defun opencode-request--log (format-string &rest arguments)

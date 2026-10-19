@@ -489,10 +489,11 @@ is otherwise reported.  NO-DISPLAY leaves every window alone."
 (defun opencode--fetch-messages (id callback &optional else cursor accumulated)
   "Call CALLBACK with every projected message of session ID, oldest first.
 ELSE, when given, receives the `opencode-error' of a failed request.
-CURSOR and ACCUMULATED page through the list."
+CURSOR and ACCUMULATED page through the list; a cursor carries the
+order of the first page, and the service refuses both together."
   (opencode-request
    'get (format "/api/session/%s/message" id)
-   :query `((order . "asc") (limit . 200) (cursor . ,cursor))
+   :query `((limit . 200) ,@(if cursor `((cursor . ,cursor)) '((order . "asc"))))
    :else else
    :then (lambda (response)
            (let ((data (opencode-request-data response))

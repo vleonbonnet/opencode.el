@@ -260,6 +260,46 @@ an agent of mode `all'."
       (should (equal (alist-get 'metadata (plist-get (car opencode-test-requests) :body))
                      '((thinkingLoss . "accept")))))))
 
+(ert-deftest opencode-test-transcript-pages ()
+  "A transcript spread over pages replays whole; later pages ask by cursor alone."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "shell"))
+           (whole (opencode-test-text (opencode-test-open id)))
+           (messages (alist-get 'data (opencode-test-fixture (format "messages-%s.json" id))))
+           (half (/ (length messages) 2))
+           (opencode-test-routes
+            (cons (list 'get "/message\\'"
+                        (lambda (request)
+                          (pcase (alist-get 'cursor (plist-get request :query))
+                            ('nil `((data . ,(seq-take messages half)) (cursor (next . "c1"))))
+                            ("c1" `((data . ,(seq-drop messages half)) (cursor (next . "c2"))))
+                            (_ '((data) (cursor (next . "c3")))))))
+                  opencode-test-routes)))
+      (should (> half 0))
+      (kill-buffer (gethash id opencode-session-buffers))
+      (setq opencode-test-requests nil)
+      (should (equal (opencode-test-text (opencode-test-open id)) whole))
+      (let ((pages (seq-filter (lambda (request) (string-suffix-p "/message" (plist-get request :path)))
+                               (reverse opencode-test-requests))))
+        (should (= (length pages) 3))
+        (should (assq 'order (plist-get (car pages) :query)))
+        (dolist (page (cdr pages))
+          (should-not (opencode-test-cursor-with-order-p page)))))))
+
+(ert-deftest opencode-test-report-error ()
+  "Errors of asynchronous callbacks are reported like a command's, never exiting Emacs."
+  (let ((calls nil))
+    (let ((command-error-function (lambda (&rest arguments) (push arguments calls))))
+      ;; Batch Emacs has no frame to show it in.
+      (opencode-report-error "first")
+      (should-not calls)
+      (with-current-buffer "*Messages*"
+        (should (string-match-p "^first$" (buffer-string))))
+      (let ((noninteractive nil))
+        (cl-letf (((symbol-function 'frame-initial-p) #'ignore))
+          (opencode-report-error "second")))
+      (should (equal calls '(((user-error "second") "" nil)))))))
+
 (ert-deftest opencode-test-open-missing-session ()
   "Opening a session the server does not know reaches the error callback."
   (opencode-test-with-server
