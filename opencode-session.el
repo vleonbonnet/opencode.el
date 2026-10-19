@@ -1637,25 +1637,51 @@ A missing variant is the model's default, as the service compares them."
   (opencode-request 'post (format "/api/session/%s/compact" opencode-session-id)
                     :body (opencode-empty-object)))
 
+(defun opencode--block-message (overlay)
+  "Return the ID of the message block OVERLAY belongs to, or nil.
+Tool blocks record it; reasoning keys and notice keys name it."
+  (let ((data (opencode-block-data overlay)))
+    (or (plist-get data :message)
+        (let ((key (plist-get data :key)))
+          (and (stringp key) (string-match "\\`\\(msg_[^/]+\\)" key) (match-string 1 key))))))
+
 (defun opencode-message-at (position)
   "Return the ID of the message rendered at POSITION, or nil."
-  (get-text-property position 'opencode-message))
+  (or (get-text-property position 'opencode-message)
+      (when-let* ((overlay (opencode-block-at position)))
+        (opencode--block-message overlay))))
+
+(defun opencode--message-parts ()
+  "Return (POSITION . MESSAGE-ID) of every rendered message part, in order.
+Text carries its message as a property, blocks in their data."
+  (let ((parts nil)
+        (position (point-min))
+        (end (opencode-pmark)))
+    (while (< position end)
+      (when-let* ((message (get-text-property position 'opencode-message)))
+        (push (cons position message) parts))
+      (setq position (next-single-property-change position 'opencode-message nil end)))
+    (when (hash-table-p opencode--blocks)
+      (maphash (lambda (_key overlay)
+                 (when-let* (((overlay-buffer overlay))
+                             (message (opencode--block-message overlay)))
+                   (push (cons (overlay-start overlay) message) parts)))
+               opencode--blocks))
+    (sort parts :key #'car)))
 
 (defun opencode--message-boundary (position)
   "Return the message after which a fork or revert at POSITION cuts, or nil.
-In a prompt the cut keeps the prompt and drops its answer; in an answer
-it keeps the answer; at the live prompt it keeps everything."
-  (let ((here (opencode-message-at position))
+In a prompt the cut keeps the prompt and drops its answer, tool calls
+included; in an answer it keeps the answer; at the live prompt it keeps
+everything."
+  (let ((here (get-text-property position 'opencode-message))
         (prompt (get-text-property position 'opencode-prompt)))
     (cond
      ((>= position (opencode-pmark)) nil)
      ((and here prompt)
       ;; The first message rendered after the prompt starts its answer.
-      (let ((next (next-single-property-change position 'opencode-message nil (opencode-pmark))))
-        (while (and next (< next (opencode-pmark))
-                    (or (null (opencode-message-at next)) (equal (opencode-message-at next) here)))
-          (setq next (next-single-property-change next 'opencode-message nil (opencode-pmark))))
-        (and next (< next (opencode-pmark)) (opencode-message-at next))))
+      (cdr (seq-find (lambda (part) (and (> (car part) position) (not (equal (cdr part) here))))
+                     (opencode--message-parts))))
      (t
       ;; The next prompt after point starts the part to drop.
       (let ((pos position) found)

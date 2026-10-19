@@ -329,6 +329,22 @@ an agent of mode `all'."
                                                           opencode-test-requests)
                                                 :body))))))))
 
+(ert-deftest opencode-test-boundary-drops-tool-steps ()
+  "A fork or revert at a prompt cuts before its answer's first step, tool calls included."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "read-tools"))
+           (messages (alist-get 'data (opencode-test-fixture (format "messages-%s.json" id))))
+           (user (seq-position messages "user" (lambda (message type) (equal (alist-get 'type message) type))))
+           (answer (alist-get 'id (nth (1+ user) messages))))
+      (with-current-buffer (opencode-test-open id)
+        (should (equal (alist-get 'type (nth (1+ user) messages)) "assistant"))
+        (should (opencode-tool-blocks))
+        (let ((prompt (text-property-any (point-min) (opencode-pmark) 'opencode-prompt t)))
+          (should (equal (opencode--message-boundary prompt) answer)))
+        ;; Within the answer, the cut keeps it: the next prompt starts what is dropped.
+        (let ((block (car (sort (opencode-tool-blocks) :key #'overlay-start))))
+          (should (equal (opencode-message-at (overlay-start block)) answer)))))))
+
 (ert-deftest opencode-test-pickers-wait-for-catalogs ()
   "Commands that prompt with a catalog fetch it first, then ask."
   (opencode-test-with-server
