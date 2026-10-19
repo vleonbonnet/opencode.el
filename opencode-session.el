@@ -175,18 +175,23 @@ Each is a plist (:file URI-ALIST) or (:agent NAME).")
   (gethash (cons (opencode-normalize-directory (or directory default-directory)) kind)
            opencode--catalogs))
 
-(defun opencode-catalog-fetch (kind callback &optional directory)
+(defun opencode-catalog-fetch (kind callback &optional directory else)
   "Call CALLBACK with the KIND catalog of DIRECTORY, fetching it when needed.
-A location's catalogs fill in shortly after its first request, so an
-empty answer is fetched again once before being cached."
+ELSE, when given, receives the `opencode-error' of a failed fetch, which
+is otherwise reported.  A location's catalogs fill in shortly after its
+first request, so an empty answer is fetched again before being cached."
   (let* ((directory (opencode-normalize-directory (or directory default-directory)))
          (key (cons directory kind))
          (cached (gethash key opencode--catalogs 'missing)))
     (if (not (eq cached 'missing))
         (funcall callback cached)
-      (push callback (gethash key opencode--catalog-waiters))
+      (push (cons callback else) (gethash key opencode--catalog-waiters))
       (when (null (cdr (gethash key opencode--catalog-waiters)))
-        (cl-labels ((fetch (retries)
+        (cl-labels ((finish (function value)
+                      (let ((waiters (nreverse (gethash key opencode--catalog-waiters))))
+                        (remhash key opencode--catalog-waiters)
+                        (funcall function waiters value)))
+                    (fetch (retries)
                       (opencode-request
                        'get (alist-get kind opencode--catalog-paths)
                        :directory directory :buffer nil
@@ -196,13 +201,17 @@ empty answer is fetched again once before being cached."
                                      (run-at-time 0.5 nil #'fetch (1- retries))
                                    (puthash key data opencode--catalogs)
                                    (cl-incf opencode-catalog-generation)
-                                   (let ((waiters (gethash key opencode--catalog-waiters)))
-                                     (remhash key opencode--catalog-waiters)
-                                     (dolist (waiter (nreverse waiters))
-                                       (funcall waiter data))))))
+                                   (finish (lambda (waiters data)
+                                             (dolist (waiter waiters)
+                                               (funcall (car waiter) data)))
+                                           data))))
                        :else (lambda (error)
-                               (remhash key opencode--catalog-waiters)
-                               (opencode-report-error (opencode-error-describe error))))))
+                               (finish (lambda (waiters error)
+                                         (when (seq-some (lambda (waiter) (null (cdr waiter))) waiters)
+                                           (opencode-report-error (opencode-error-describe error)))
+                                         (dolist (waiter waiters)
+                                           (when (cdr waiter) (funcall (cdr waiter) error))))
+                                       error)))))
           (fetch 2))))))
 
 (defun opencode-catalog-ensure (kind &optional directory)
@@ -260,12 +269,23 @@ Callers run at redisplay, so the request starts from a timer."
   (seq-find (lambda (entry) (equal (alist-get 'id entry) provider))
             (opencode-catalog 'provider directory)))
 
+(defun opencode-agent-selectable-p (agent)
+  "Return non-nil when catalog entry AGENT can run a session.
+The service lets a session run any agent that is neither hidden nor
+only a subagent, so agents of mode `all' qualify."
+  (and (not (equal (alist-get 'mode agent) "subagent"))
+       (not (alist-get 'hidden agent))))
+
 (defun opencode-primary-agents (&optional directory)
-  "Return the selectable primary agents of DIRECTORY's catalog."
-  (seq-filter (lambda (agent)
-                (and (equal (alist-get 'mode agent) "primary")
-                     (not (alist-get 'hidden agent))))
-              (opencode-catalog 'agent directory)))
+  "Return the agents of DIRECTORY's cached catalog a session can run."
+  (seq-filter #'opencode-agent-selectable-p (opencode-catalog 'agent directory)))
+
+(defun opencode-default-agent (&optional directory)
+  "Return the agent DIRECTORY's sessions run when none is chosen, or nil.
+The service lists that agent first, having resolved the configured
+`default_agent' as it does for a session without one, so this is the
+first selectable entry of the cached catalog."
+  (alist-get 'id (car (opencode-primary-agents directory))))
 
 ;;;; Mode
 
@@ -372,7 +392,10 @@ INFO is a session info alist.  BUFFER reuses an existing placeholder
 buffer.  NO-DISPLAY leaves every window alone.  OTHER-WINDOW pops the
 buffer instead of switching to it.  CALLBACK runs in the buffer with
 INFO once the transcript is loaded; ELSE runs there instead with the
-`opencode-error' of a failed request.  Return the buffer."
+`opencode-error' of a failed request.  The event stream is opened if it
+is not, since a session buffer follows its session through it.  Return
+the buffer."
+  (opencode-events-connect)
   (let* ((id (alist-get 'id info))
          (existing (gethash id opencode-session-buffers)))
     (if (buffer-live-p existing)
@@ -418,32 +441,47 @@ ELSE receives the `opencode-error' of a failed request."
                                  :callback callback :else else))
      nil else)))
 
-(defun opencode--default-model ()
-  "Return the model reference new sessions start with."
-  opencode-last-model)
+(defun opencode-new-session-model (agent &optional directory)
+  "Return the model reference a new session of AGENT in DIRECTORY starts on.
+AGENT nil stands for DIRECTORY's default agent.  The model the agent
+pins comes first, as switching to that agent would select it, then
+`opencode-last-model'; nil leaves the choice to the service.  Agents
+are read from the cached catalog."
+  (or (alist-get 'model (opencode-agent-info (or agent (opencode-default-agent directory))
+                                             directory))
+      opencode-last-model))
 
 (cl-defun opencode-session-create (&key (directory default-directory) title agent model
-                                        callback no-display)
+                                        callback else no-display)
   "Create a session in DIRECTORY and open it.
 TITLE, AGENT and MODEL (a model reference) are optional; MODEL defaults
-to `opencode-last-model'.  CALLBACK runs in the new buffer with its info;
-NO-DISPLAY leaves every window alone."
+to `opencode-new-session-model'.  CALLBACK runs in the new buffer with
+its info; ELSE receives the `opencode-error' of a failed request, which
+is otherwise reported.  NO-DISPLAY leaves every window alone."
   (let ((directory (opencode-normalize-directory directory))
-        (model (or model (opencode--default-model))))
-    (opencode-request
-     'post "/api/session" :directory directory :buffer nil
-     :body `((location . ((directory . ,(directory-file-name directory))))
-             ,@(when title `((title . ,title)))
-             ,@(when agent `((agent . ,agent)))
-             ,@(when model `((model . ,model))))
-     :then (lambda (response)
-             (opencode-session-open (opencode-request-data response)
-                                    :no-display no-display :callback callback)))))
+        (else (or else (lambda (error) (opencode-report-error (opencode-error-describe error))))))
+    (cl-flet ((create ()
+                (let ((model (or model (opencode-new-session-model agent directory))))
+                  (opencode-request
+                   'post "/api/session" :directory directory :buffer nil
+                   :body `((location . ((directory . ,(directory-file-name directory))))
+                           ,@(when title `((title . ,title)))
+                           ,@(when agent `((agent . ,agent)))
+                           ,@(when model `((model . ,model))))
+                   :then (lambda (response)
+                           (opencode-session-open (opencode-request-data response)
+                                                  :no-display no-display
+                                                  :callback callback :else else))
+                   :else else))))
+      (if model
+          (create)
+        ;; The pins live in the agent catalog; without it, the last model still applies.
+        (opencode-catalog-fetch 'agent (lambda (_) (create)) directory
+                                (lambda (_) (create)))))))
 
 (defun opencode-new-session (&optional title)
   "Create a session in the current project, prompting for TITLE with a prefix."
   (interactive (list (when current-prefix-arg (read-string "Title: "))))
-  (opencode-events-connect)
   (opencode-session-create :directory (opencode-project-directory) :title title))
 
 ;;;; Loading the transcript
@@ -1121,6 +1159,17 @@ once delivered: that is where the transcript places them."
                                  `((name . ,name))))
                              (reverse opencode--attachments)))))
 
+(defun opencode-thinking-metadata (metadata &optional accept)
+  "Return prompt METADATA with its stale-thinking choice.
+Thinking from earlier turns goes stale when what preceded it changed.
+Unless METADATA already chooses, ask the server to refuse a turn that
+would replay stale thinking, so Emacs can ask before it is lost, rather
+than let the provider drop it unseen; with ACCEPT, consent to replacing
+those blocks with their text.  Services without my fork ignore the key."
+  (if (assq 'thinkingLoss metadata)
+      metadata
+    (cons `(thinkingLoss . ,(if accept "accept" "ask")) metadata)))
+
 (cl-defun opencode-session-send (text &key files agents delivery metadata accept-thinking-loss
                                          show then else)
   "Send TEXT as a prompt of this session.
@@ -1128,13 +1177,12 @@ FILES and AGENTS are vectors of attachments; DELIVERY overrides
 `opencode-prompt-delivery'; METADATA is an alist attached to the
 prompt.  ACCEPT-THINKING-LOSS lets the server replace earlier thinking
 that no longer matches the conversation, which it otherwise refuses to
-send.  SHOW renders the prompt once the server delivers it, like one
-from another client; otherwise the caller rendered it.  THEN runs with
-the admitted inbox item, ELSE with the error."
+send (see `opencode-thinking-metadata').  SHOW renders the prompt once
+the server delivers it, like one from another client; otherwise the
+caller rendered it.  THEN runs with the admitted inbox item, ELSE with
+the error."
   (let ((id (opencode-generate-id "msg_"))
-        (metadata (if accept-thinking-loss
-                      (cons '(acceptThinkingLoss . t) metadata)
-                    metadata)))
+        (metadata (opencode-thinking-metadata metadata accept-thinking-loss)))
     (unless show
       (puthash id t opencode--own-inputs))
     (when opencode-session-model
@@ -1153,13 +1201,14 @@ the admitted inbox item, ELSE with the error."
                (opencode-output-notice (opencode-error-describe error) 'error))))
     id))
 
-(cl-defun opencode-session-command (name arguments &key metadata then else)
+(cl-defun opencode-session-command (name arguments &key metadata accept-thinking-loss then else)
   "Run slash command NAME with ARGUMENTS text in this session.
-METADATA is attached to the command; THEN and ELSE as for `opencode-session-send'."
+METADATA and ACCEPT-THINKING-LOSS are attached to the command's prompt,
+THEN and ELSE run, as for `opencode-session-send'."
   (opencode-request
    'post (format "/api/session/%s/command" opencode-session-id)
    :body `((name . ,name) (text . ,arguments)
-           ,@(when metadata `((metadata . ,metadata)))
+           (metadata . ,(opencode-thinking-metadata metadata accept-thinking-loss))
            (delivery . ,(symbol-name opencode-prompt-delivery)))
    :then (lambda (_) (when then (funcall then nil)))
    :else (lambda (error)
@@ -1178,7 +1227,9 @@ an alist of metadata to attach to it.")
 (defun opencode-input-request (string)
   "Return what sending input STRING requests, as a plist.
 :kind is `prompt', `command' or `shell'; :text is STRING; a command also
-has :name and :arguments."
+has :name and :arguments.  A caller that switches the agent or model
+before sending adds :agent and :model, a model reference, so the checks
+consider the turn the switch leads to."
   (let ((string (string-trim-right string)))
     (cond
      ((string-prefix-p "/" string)
@@ -1190,7 +1241,9 @@ has :name and :arguments."
 
 (defun opencode-check-send (request)
   "Run the send checks on REQUEST; return `cancel', or the metadata to attach.
-`opencode-before-send-functions' run first."
+REQUEST is a plist like the one `opencode-input-request' returns.  The
+checks may ask questions, so callers run them from a command, before
+any asynchronous step.  `opencode-before-send-functions' run first."
   (if (eq 'cancel (run-hook-with-args-until-success 'opencode-before-send-functions
                                                     (list :kind (plist-get request :kind)
                                                           :text (plist-get request :text)
@@ -1414,31 +1467,87 @@ From a session buffer prompt for the buffer, elsewhere attach the current one."
   "Signal an error outside a session buffer."
   (unless opencode-session-id (user-error "Not in an OpenCode session")))
 
-(defun opencode-switch-agent (agent)
-  "Switch this session to AGENT.
-The session keeps its model unless AGENT pins one, as the TUI does."
-  (opencode--require-session)
-  (opencode-request 'post (format "/api/session/%s/agent" opencode-session-id)
-                    :body `((agent . ,agent)))
-  (when-let* ((pinned (alist-get 'model (opencode-agent-info agent))))
-    (opencode-switch-model pinned)))
+(defun opencode--switch-failed (else)
+  "Return the failure handler of a switch: ELSE, else one reporting the error."
+  (or else (lambda (error) (opencode-report-error (opencode-error-describe error)))))
 
-(defun opencode-switch-model (model)
-  "Switch this session to MODEL, a model reference."
+(cl-defun opencode-switch-agent (agent &key then else)
+  "Switch this session to AGENT, an agent its directory can run.
+The session keeps its model unless AGENT pins one, which it then
+switches to, as the TUI does.  THEN runs in the buffer once the service
+took every switch; ELSE receives the `opencode-error' of a refused one,
+or a message when AGENT is not an agent the session can run, since the
+service would select any name.  Without ELSE, failures are reported."
+  (opencode--require-session)
+  (let ((buffer (current-buffer))
+        (else (opencode--switch-failed else)))
+    (opencode-catalog-fetch
+     'agent
+     (lambda (_)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (let ((info (seq-find (lambda (entry) (equal (alist-get 'id entry) agent))
+                                 (opencode-primary-agents))))
+             (cond
+              ((null info)
+               (funcall else (format "%s cannot run as agent %s" (buffer-name) agent)))
+              ((equal agent opencode-session-agent)
+               (if-let* ((pinned (alist-get 'model info)))
+                   (opencode-switch-model pinned :then then :else else)
+                 (when then (funcall then))))
+              (t
+               (opencode-request
+                'post (format "/api/session/%s/agent" opencode-session-id)
+                :body `((agent . ,agent))
+                :else else
+                :then (lambda (_)
+                        (setq opencode-session-agent agent)
+                        (force-mode-line-update)
+                        (if-let* ((pinned (alist-get 'model info)))
+                            (opencode-switch-model pinned :then then :else else)
+                          (when then (funcall then)))))))))))
+     nil else)))
+
+(cl-defun opencode-switch-model (model &key then else)
+  "Switch this session to MODEL, a model reference, and make it the last pick.
+THEN runs in the buffer once the service took the switch; ELSE receives
+the `opencode-error' of a refused one, which is otherwise reported.  The
+buffer records MODEL at once, as the selection event may trail the reply."
   (opencode--require-session)
   (setq opencode-last-model model)
-  (opencode-request 'post (format "/api/session/%s/model" opencode-session-id)
-                    :body `((model . ,model))))
+  (if (opencode-same-model-p model opencode-session-model)
+      (when then (funcall then))
+    (opencode-request 'post (format "/api/session/%s/model" opencode-session-id)
+                      :body `((model . ,model))
+                      :else (opencode--switch-failed else)
+                      :then (lambda (_)
+                              (setq opencode-session-model model)
+                              (force-mode-line-update)
+                              (when then (funcall then))))))
+
+(defun opencode-same-model-p (a b)
+  "Return non-nil when model references A and B select the same model and variant.
+A missing variant is the model's default, as the service compares them."
+  (and a b
+       (equal (alist-get 'providerID a) (alist-get 'providerID b))
+       (equal (alist-get 'id a) (alist-get 'id b))
+       (equal (or (alist-get 'variant a) "default") (or (alist-get 'variant b) "default"))))
 
 (defun opencode-cycle-agent ()
   "Switch this session to the next primary agent."
   (interactive)
   (opencode--require-session)
-  (let* ((agents (mapcar (lambda (agent) (alist-get 'id agent)) (opencode-primary-agents)))
-         (next (or (cadr (member opencode-session-agent agents)) (car agents))))
-    (if next
-        (opencode-switch-agent next)
-      (opencode-catalog-fetch 'agent (lambda (_) (message "Agents loaded; try again"))))))
+  (let ((buffer (current-buffer)))
+    (opencode-catalog-fetch
+     'agent
+     (lambda (_)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (let* ((agents (mapcar (lambda (agent) (alist-get 'id agent)) (opencode-primary-agents)))
+                  (next (or (cadr (member opencode-session-agent agents)) (car agents))))
+             (if next
+                 (opencode-switch-agent next)
+               (message "No agent to switch to")))))))))
 
 (defun opencode-select-agent ()
   "Choose this session's primary agent."

@@ -347,10 +347,10 @@ The transient shows the full command, so the block stays collapsed."
                   (opencode--permission-mark-block permission)
                   (message "Hand-off failed (%s); the permission is still pending"
                            (opencode-error-describe error)))))
-      (opencode-request
-       'post (format "/api/session/%s/agent" session) :body `((agent . ,agent))
+      (opencode-switch-agent
+       agent
        :else #'fail
-       :then (lambda (_)
+       :then (lambda ()
                (opencode-request
                 'post (format "/api/session/%s/synthetic" session)
                 :body `((text . ,(format "The user approved handing off the current task to the %s agent.  Continue the task from the preceding research and complete the requested work." agent))

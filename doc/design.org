@@ -60,7 +60,7 @@ Post-edit hooks run from =session.tool.success= of live turns only. A reloaded t
 
 * The prompt cache
 
-The cache guard's report comes from the service, which dry-runs the request the turn would send and compares it with what the provider confirmed it cached. The check runs from =RET=, before Comint takes the input, so declining leaves the prompt untouched. Consent to drop stale thinking travels as prompt metadata on that one send. A service without the route answers an untagged 404, and the guard then stays off for it.
+The cache guard's report comes from the service, which dry-runs the request the turn would send and compares it with what the provider confirmed it cached. The check runs from =RET=, before Comint takes the input, so declining leaves the prompt untouched; a caller that switches agent or model before sending passes them to the check, so no question appears from an asynchronous callback. Every prompt and command carries =thinkingLoss: "ask"= in its metadata, so the service refuses a turn that would replay stale thinking instead of letting the provider drop it, and consent sends =thinkingLoss: "accept"= on that one prompt. A service without the route answers an untagged 404, and the guard then stays off for it.
 
 * Tests
 

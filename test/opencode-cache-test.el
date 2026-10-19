@@ -109,9 +109,39 @@ The fake service answers preflights with `opencode-test-reports'."
       (should (string-match-p "12 thinking blocks from earlier turns no longer match the conversation"
                               (car opencode-test-questions)))
       (should (string-match-p "also re-sends ~142k cached tokens" (car opencode-test-questions)))
-      (should (equal (alist-get 'metadata (opencode-test-sent-body "/prompt")) '((acceptThinkingLoss . t))))
+      (should (equal (alist-get 'metadata (opencode-test-sent-body "/prompt")) '((thinkingLoss . "accept"))))
+      ;; Later prompts ask the server to refuse stale thinking again.
       (opencode-test-type-and-send "next")
-      (should-not (alist-get 'metadata (opencode-test-sent-body "/prompt"))))))
+      (should (equal (alist-get 'metadata (opencode-test-sent-body "/prompt")) '((thinkingLoss . "ask")))))))
+
+(ert-deftest opencode-test-cache-consent-loss ()
+  "The consent question counts the cache the consented turn re-sends."
+  (let ((opencode-test-reports
+         '(((status . "hit") (lostTokens . 0)
+            (staleThinking (count . 3) (reason . "the provider rejected a block")
+                           (consent (reusableTokens . 2000) (lostTokens . 180000)))))))
+    (opencode-test-with-guard t
+      (opencode-test-type-and-send "retry")
+      (should (string-match-p "also re-sends ~180k cached tokens" (car opencode-test-questions))))))
+
+(ert-deftest opencode-test-cache-unknown-binding-not-asked ()
+  "Thinking the server holds no binding for is sent without a consent question."
+  (let ((opencode-test-reports
+         '(((status . "hit") (lostTokens . 0)
+            (staleThinking (count . 4) (reason . "unknown binding"))))))
+    (opencode-test-with-guard nil
+      (opencode-test-type-and-send "go on")
+      (should-not opencode-test-questions)
+      (should (equal (alist-get 'metadata (opencode-test-sent-body "/prompt")) '((thinkingLoss . "ask")))))))
+
+(ert-deftest opencode-test-preflight-target-agent-and-model ()
+  "A check of a turn after a switch preflights that agent and model."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open (opencode-test-scenario "text"))
+      (let ((model '((id . "gpt-6-luna") (providerID . "openai"))))
+        (should (equal (opencode-cache-preflight-body
+                        (append (opencode-input-request "fix it") (list :agent "build" :model model)))
+                       `((text . "fix it") (agent . "build") (model . ,model))))))))
 
 (ert-deftest opencode-test-cache-stale-thinking-declined ()
   "Declining to drop thinking keeps the input; a command carries the consent too."
@@ -125,7 +155,7 @@ The fake service answers preflights with `opencode-test-reports'."
          '(((status . "hit") (staleThinking (count . 1) (reason . "earlier messages changed"))))))
     (opencode-test-with-guard t
       (opencode-test-type-and-send "/review")
-      (should (equal (alist-get 'metadata (opencode-test-sent-body "/command")) '((acceptThinkingLoss . t)))))))
+      (should (equal (alist-get 'metadata (opencode-test-sent-body "/command")) '((thinkingLoss . "accept")))))))
 
 (ert-deftest opencode-test-cache-unsupported-service ()
   "A service without the preflight route is never asked again, nor the user."

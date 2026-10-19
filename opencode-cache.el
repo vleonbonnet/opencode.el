@@ -37,12 +37,16 @@
 ;; its cached conversation, so neither is checked.
 ;;
 ;; Thinking signatures are bound to everything before them.  When the
-;; report counts stale thinking, because the system prompt, the tool list
-;; or earlier messages changed, or the provider already rejected a block,
-;; the server refuses the turn unless the prompt consents to replacing
-;; those blocks with their text, tagged as earlier reasoning.  Emacs asks
-;; for that consent.  Blocks replaced so, or dropped by the provider, are
-;; relabelled in the transcript, with one notice per batch.
+;; system prompt, the tool list or earlier messages changed, or the
+;; provider already rejected a block, earlier thinking is stale.  Other
+;; clients let the provider drop it silently; Emacs marks each prompt
+;; and command `thinkingLoss: "ask"', so the server refuses such a turn
+;; instead, and when the report counts stale thinking Emacs asks whether
+;; to send with `thinkingLoss: "accept"', replacing those blocks with
+;; their text, tagged as earlier reasoning.  Blocks without a binding,
+;; from before the server's ledger, are sent as they are.  Blocks
+;; replaced or dropped are relabelled in the transcript, with one notice
+;; per batch.
 ;;
 ;; A turn refused for stale thinking anyway, sent by another client or
 ;; rejected by the provider for blocks nobody could vouch for, is undone
@@ -79,13 +83,19 @@ nil never asks about the cache; stale thinking is still asked about."
 
 (defun opencode-cache-preflight-body (request)
   "Return the preflight body for input REQUEST, or nil when it starts no turn.
-REQUEST is the plist of `opencode-input-request'."
-  (pcase (plist-get request :kind)
-    ('prompt (let ((files (opencode--prompt-files)))
-               `((text . ,(plist-get request :text))
-                 ,@(when (> (length files) 0) `((files . ,files))))))
-    ('command `((command (name . ,(plist-get request :name))
-                         (arguments . ,(plist-get request :arguments)))))))
+REQUEST is the plist of `opencode-input-request', where :agent and
+:model, a model reference, name the agent and model the turn will run,
+when they differ from the session's: a caller switching before sending
+checks the turn the switch leads to."
+  (when-let* ((body (pcase (plist-get request :kind)
+                      ('prompt (let ((files (opencode--prompt-files)))
+                                 `((text . ,(plist-get request :text))
+                                   ,@(when (> (length files) 0) `((files . ,files))))))
+                      ('command `((command (name . ,(plist-get request :name))
+                                           (arguments . ,(plist-get request :arguments))))))))
+    `(,@body
+      ,@(when-let* ((agent (plist-get request :agent))) `((agent . ,agent)))
+      ,@(when-let* ((model (plist-get request :model))) `((model . ,model))))))
 
 (defvar opencode-cache--unsupported nil
   "IDs of services without the preflight route, which only my fork has.")
@@ -148,20 +158,37 @@ A turn the server cannot predict may lose the whole context."
        (opencode-cache--line (format "first difference: %s" .divergence.unit)))
      "Send anyway? ")))
 
+(defconst opencode-cache-unknown-binding "unknown binding"
+  "The stale-thinking reason for blocks the server holds no binding for.
+They predate its ledger, so they are sent and may well still match;
+only a refusal by the provider fails the turn.")
+
+(defun opencode-cache-consent-loss (report loss)
+  "Return the cached tokens sending with consent would re-send, per REPORT.
+The server predicts the turn that replays the stale blocks as text when
+it can; else LOSS, the turn as it stands, is the closest estimate."
+  (or (map-nested-elt report '(staleThinking consent lostTokens)) loss))
+
 (defun opencode-cache-thinking-question (report loss)
   "Return the question for REPORT's stale thinking, mentioning a LOSS of cache."
   (let-alist report
-    (let ((count .staleThinking.count))
+    (let ((count .staleThinking.count)
+          (loss (opencode-cache-consent-loss report loss)))
       (concat
        (format "OpenCode: %d thinking block%s from earlier turns no longer match%s the conversation:\n"
                count (if (= count 1) "" "s") (if (= count 1) "es" ""))
        (opencode-cache--line (or .staleThinking.reason "unknown reason"))
        (when (and loss opencode-cache-guard-threshold (> loss opencode-cache-guard-threshold))
-         (format (if (equal .status "unknown")
+         (format (if (and (equal .status "unknown") (not .staleThinking.consent))
                      "The turn could also re-send up to ~%s context tokens uncached.\n"
                    "The turn also re-sends ~%s cached tokens uncached.\n")
                  (opencode-cache--tokens loss)))
        "Replace them with their text and send? "))))
+
+(defun opencode-cache-stale-thinking-p (report)
+  "Return non-nil when REPORT counts thinking the turn would be refused for."
+  (and (> (or (map-nested-elt report '(staleThinking count)) 0) 0)
+       (not (equal (map-nested-elt report '(staleThinking reason)) opencode-cache-unknown-binding))))
 
 (defun opencode-cache-check (request)
   "Check the prompt cache before input REQUEST starts a turn.
@@ -172,9 +199,9 @@ Return nil to send, `cancel' to keep the input, or the consent metadata."
     (let* ((report (opencode-cache-preflight body))
            (loss (opencode-cache-loss report)))
       (cond
-       ((> (or (map-nested-elt report '(staleThinking count)) 0) 0)
+       ((opencode-cache-stale-thinking-p report)
         (if (y-or-n-p (opencode-cache-thinking-question report loss))
-            '((acceptThinkingLoss . t))
+            '((thinkingLoss . "accept"))
           'cancel))
        ((or (null loss) (null opencode-cache-guard-threshold)
             (<= loss opencode-cache-guard-threshold))

@@ -86,7 +86,7 @@ After each edit, write or patch tool call of a live turn, =opencode-file-edited-
 
 * Prompt cache and thinking
 
-With my fork, before an idle session sends a turn, the service reports how much of the cached prompt it would re-send uncached and why; above =opencode-cache-guard-threshold= tokens, Emacs asks first. When earlier thinking no longer matches the conversation, Emacs asks whether to replace it with its text, which the service otherwise refuses. Declining keeps the input in the prompt.
+With my fork, before an idle session sends a turn, the service reports how much of the cached prompt it would re-send uncached and why; above =opencode-cache-guard-threshold= tokens, Emacs asks first. When earlier thinking no longer matches the conversation, other clients let the provider drop it unseen; Emacs has the service refuse such turns and asks whether to replace that thinking with its text. Declining keeps the input in the prompt.
 
 * Notifications
 
