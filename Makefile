@@ -13,7 +13,12 @@ BATCH = $(EMACS) -Q --batch $(LOAD_PATH) $(PREFER_NEWER)
 SOURCES = $(filter-out %-pkg.el %-autoloads.el,$(wildcard opencode*.el))
 TESTS = $(wildcard test/*-test.el)
 
-.PHONY: all compile test test-gui lint clean
+.PHONY: all compile test test-gui lint contract clean
+
+# OpenCode checkout whose API document `contract' checks requests against;
+# its dependencies must be installed (bun install), as ajv comes from there.
+OPENCODE ?= $(HOME)/local/source/opencode
+CONTRACT_LOG ?= $(or $(TMPDIR),$(TEMP),/tmp)/opencode-el-requests.jsonl
 
 all: compile test
 
@@ -26,6 +31,11 @@ test:
 test-gui:
 	$(EMACS) -Q $(LOAD_PATH) $(PREFER_NEWER) -l test/opencode-test-helpers.el $(addprefix -l ,$(TESTS)) \
 	  --eval '(ert-run-tests-batch-and-exit (quote (tag gui)))'
+
+contract:
+	$(BATCH) -l dev/contract/record-requests.el "$(CONTRACT_LOG)"
+	NODE_PATH="$$(ls -d "$(OPENCODE)"/node_modules/.bun/ajv@8*/node_modules | head -1)" \
+	  bun dev/contract/validate.ts "$(OPENCODE)/packages/protocol/openapi.json" "$(CONTRACT_LOG)"
 
 lint:
 	$(BATCH) --eval '(dolist (file (list $(patsubst %,"%",$(SOURCES)))) (checkdoc-file file))'
