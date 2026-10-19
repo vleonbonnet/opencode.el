@@ -128,17 +128,23 @@ Nil means its title already shows everything."
                  (string-trim (buffer-substring (line-beginning-position) (line-end-position)))
                  120 nil nil "…"))))))
 
-(defun opencode--reason-resource (resource rule)
+(defun opencode--reason-resource (resource rule &optional spelling)
   "Return the lines showing RESOURCE, which RULE asks for.
-When the longest literal part of RULE's wildcard pattern lies past the
-first line, the line holding it is shown with its number, which locates
-the match inside a long script."
-  (let* ((summary (opencode-permission-command-summary resource))
+SPELLING is the other spelling of RESOURCE that RULE matched, such as
+the command without its directory or the script a runner runs; it is
+shown under RESOURCE.  When the longest literal part of RULE's wildcard
+pattern lies past the first line of what RULE matched, the line holding
+it is shown with its number, which locates the match inside a long
+script."
+  (let* ((matched (or spelling resource))
+         (summary (opencode-permission-command-summary resource))
+         (as (when spelling (opencode-permission-command-summary spelling)))
          (needle (car (seq-sort-by #'length #'>
                                    (split-string (or (alist-get 'resource rule) "") "[*?]" t))))
-         (line (and needle (not (string-search needle summary))
-                    (opencode--reason-line resource needle))))
+         (line (and needle (not (string-search needle (or as summary)))
+                    (opencode--reason-line matched needle))))
     (concat "\n    " summary
+            (when as (concat "\n      " (propertize (concat "as: " as) 'face 'shadow)))
             (when line (concat "\n      " (propertize line 'face 'shadow))))))
 
 (defun opencode-permission-reasons-summary (reasons)
@@ -163,26 +169,29 @@ left out."
   (when reasons
     (let (groups)
       (dolist (reason reasons)
-        (push (alist-get 'resource reason)
-              (alist-get (alist-get 'rule reason) groups nil nil #'equal)))
+        (push reason (alist-get (alist-get 'rule reason) groups nil nil #'equal)))
       (concat
        "\n\nAsked because:"
        (mapconcat
         (lambda (group)
           (let* ((rule (car group))
-                 (resources (reverse (cdr group)))
-                 (shown (seq-remove (lambda (resource)
-                                      (seq-some (lambda (other)
-                                                  (and (not (equal other resource))
-                                                       (string-search resource other)))
-                                                resources))
-                                    resources)))
+                 (members (reverse (cdr group)))
+                 (resources (mapcar (lambda (reason) (alist-get 'resource reason)) members))
+                 (shown (seq-remove (lambda (reason)
+                                      (let ((resource (alist-get 'resource reason)))
+                                        (seq-some (lambda (other)
+                                                    (and (not (equal other resource))
+                                                         (string-search resource other)))
+                                                  resources)))
+                                    members)))
             (concat "\n  "
                     (if rule
                         (format "%s rule \"%s\" asks for:"
                                 (alist-get 'action rule) (alist-get 'resource rule))
                       "no rule allows:")
-                    (mapconcat (lambda (resource) (opencode--reason-resource resource rule))
+                    (mapconcat (lambda (reason)
+                                 (opencode--reason-resource (alist-get 'resource reason) rule
+                                                            (alist-get 'spelling reason)))
                                shown ""))))
         (reverse groups) "")))))
 

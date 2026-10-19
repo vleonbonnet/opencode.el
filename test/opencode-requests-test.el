@@ -71,6 +71,25 @@
                     `(((resource . "a") (rule . ,dynamic)) ((resource . "c"))))
                    "asked by rule \"\"$*\"; no rule allows the rest"))))
 
+(ert-deftest opencode-test-permission-reasons-spelling ()
+  "A rule matching another spelling of a command shows that spelling, and locates its match there."
+  (let ((push '((action . "shell") (resource . "git push *") (effect . "ask")))
+        (oidc '((action . "shell") (resource . "*kanopy-oidc*") (effect . "ask"))))
+    (should (equal (substring-no-properties
+                    (opencode-permission-reasons-text
+                     (list `((resource . "/usr/bin/git push origin") (spelling . "git push origin") (rule . ,push))
+                           `((resource . "bash -c \"$S\"")
+                             (spelling . "set -e\ncd src\nmode=kanopy-oidc")
+                             (rule . ,oidc)))))
+                   (concat "\n\nAsked because:"
+                           "\n  shell rule \"git push *\" asks for:"
+                           "\n    /usr/bin/git push origin"
+                           "\n      as: git push origin"
+                           "\n  shell rule \"*kanopy-oidc*\" asks for:"
+                           "\n    bash -c \"$S\""
+                           "\n      as: set -e …"
+                           "\n      line 3: mode=kanopy-oidc")))))
+
 (ert-deftest opencode-test-question-form-on-its-block ()
   "A question form marks its tool block and is answered with option values per field."
   (opencode-test-with-server
