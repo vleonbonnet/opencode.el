@@ -1471,12 +1471,13 @@ From a session buffer prompt for the buffer, elsewhere attach the current one."
   "Return the failure handler of a switch: ELSE, else one reporting the error."
   (or else (lambda (error) (opencode-report-error (opencode-error-describe error)))))
 
-(cl-defun opencode-switch-agent (agent &key then else)
+(cl-defun opencode-switch-agent (agent &key model then else)
   "Switch this session to AGENT, an agent its directory can run.
 The session keeps its model unless AGENT pins one, which it then
-switches to, as the TUI does.  THEN runs in the buffer once the service
-took every switch; ELSE receives the `opencode-error' of a refused one,
-or a message when AGENT is not an agent the session can run, since the
+switches to, as the TUI does; MODEL, a model reference, is selected
+instead when given.  THEN runs in the buffer once the service took
+every switch; ELSE receives the `opencode-error' of a refused one, or a
+message when AGENT is not an agent the session can run, since the
 service would select any name.  Without ELSE, failures are reported."
   (opencode--require-session)
   (let ((buffer (current-buffer))
@@ -1486,26 +1487,26 @@ service would select any name.  Without ELSE, failures are reported."
      (lambda (_)
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
-           (let ((info (seq-find (lambda (entry) (equal (alist-get 'id entry) agent))
-                                 (opencode-primary-agents))))
-             (cond
-              ((null info)
-               (funcall else (format "%s cannot run as agent %s" (buffer-name) agent)))
-              ((equal agent opencode-session-agent)
-               (if-let* ((pinned (alist-get 'model info)))
-                   (opencode-switch-model pinned :then then :else else)
-                 (when then (funcall then))))
-              (t
-               (opencode-request
-                'post (format "/api/session/%s/agent" opencode-session-id)
-                :body `((agent . ,agent))
-                :else else
-                :then (lambda (_)
-                        (setq opencode-session-agent agent)
-                        (force-mode-line-update)
-                        (if-let* ((pinned (alist-get 'model info)))
-                            (opencode-switch-model pinned :then then :else else)
-                          (when then (funcall then)))))))))))
+           (let* ((info (seq-find (lambda (entry) (equal (alist-get 'id entry) agent))
+                                  (opencode-primary-agents)))
+                  (model (or model (alist-get 'model info))))
+             (cl-flet ((follow ()
+                         (if model
+                             (opencode-switch-model model :then then :else else)
+                           (when then (funcall then)))))
+               (cond
+                ((null info)
+                 (funcall else (format "%s cannot run as agent %s" (buffer-name) agent)))
+                ((equal agent opencode-session-agent) (follow))
+                (t
+                 (opencode-request
+                  'post (format "/api/session/%s/agent" opencode-session-id)
+                  :body `((agent . ,agent))
+                  :else else
+                  :then (lambda (_)
+                          (setq opencode-session-agent agent)
+                          (force-mode-line-update)
+                          (follow))))))))))
      nil else)))
 
 (cl-defun opencode-switch-model (model &key then else)

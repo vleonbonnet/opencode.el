@@ -203,7 +203,13 @@ an agent of mode `all'."
         (setq opencode-test-requests nil done nil)
         (opencode-switch-agent "review" :then (lambda () (setq done t)))
         (should done)
-        (should-not (opencode-test-requests-to 'post "/model"))))))
+        (should-not (opencode-test-requests-to 'post "/model"))
+        ;; An explicit model replaces the pin rather than following it.
+        (let ((explicit '((id . "gpt-6-sol") (providerID . "openai"))))
+          (setq opencode-test-requests nil)
+          (opencode-switch-agent "plan" :model explicit)
+          (should (equal (opencode-test-requests-to 'post "/model") `(((model . ,explicit)))))
+          (should (equal opencode-session-model explicit)))))))
 
 (ert-deftest opencode-test-switch-agent-refuses-unknown ()
   "An agent the session cannot run is refused before the service, which would select it."
