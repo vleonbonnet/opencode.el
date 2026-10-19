@@ -229,6 +229,26 @@ for, with a short :timeout."
      (failure (user-error "%s" (opencode-error-describe failure)))
      (t result))))
 
+(defun opencode-wait (fetch)
+  "Return what FETCH delivers, waiting for it.
+FETCH is called with two functions: one taking the result, the other
+the `opencode-error' of a failure.  Commands that prompt with fetched
+data wait here, so their questions come from the command and never from
+a network callback.  The wait lasts at most `opencode-request-timeout'
+seconds, which \\[keyboard-quit] cuts short; a failure signals a
+`user-error'."
+  (let ((result 'opencode--pending)
+        (failure nil)
+        (deadline (+ (float-time) opencode-request-timeout)))
+    (funcall fetch (lambda (value) (setq result value)) (lambda (error) (setq failure error)))
+    (while (and (eq result 'opencode--pending) (not failure) (< (float-time) deadline))
+      (accept-process-output nil 0.05))
+    (cond
+     (failure (user-error "%s" (opencode-error-describe failure)))
+     ((eq result 'opencode--pending)
+      (user-error "OpenCode did not answer within %s seconds" opencode-request-timeout))
+     (t result))))
+
 (defun opencode-request-data (response)
   "Return the `data' member of RESPONSE."
   (alist-get 'data response))

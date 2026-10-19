@@ -167,7 +167,7 @@ Each is a plist (:file URI-ALIST) or (:agent NAME).")
 
 (defconst opencode--catalog-paths
   '((agent . "/api/agent") (model . "/api/model") (provider . "/api/provider")
-    (command . "/api/command") (skill . "/api/skill") (mcp . "/api/mcp"))
+    (command . "/api/command"))
   "Catalog kinds and their routes.")
 
 (defun opencode-catalog (kind &optional directory)
@@ -214,6 +214,11 @@ first request, so an empty answer is fetched again before being cached."
                                        error)))))
           (fetch 2))))))
 
+(defun opencode-catalog-wait (kind &optional directory)
+  "Return the KIND catalog of DIRECTORY, waiting for it when not cached.
+For commands that prompt with it; see `opencode-wait'."
+  (opencode-wait (lambda (then else) (opencode-catalog-fetch kind then directory else))))
+
 (defun opencode-catalog-ensure (kind &optional directory)
   "Return the cached KIND catalog of DIRECTORY, else fetch it in the background.
 Return nil while fetching; mode lines are redisplayed once it arrives.
@@ -234,9 +239,7 @@ Callers run at redisplay, so the request starts from a timer."
               (kind (pcase (alist-get 'type event)
                       ("agent.updated" '(agent))
                       ((or "model.updated" "provider.updated" "integration.updated") '(model provider))
-                      ("command.updated" '(command))
-                      ("skill.updated" '(skill))
-                      ("mcp.updated" '(mcp)))))
+                      ("command.updated" '(command)))))
     (dolist (one kind)
       (remhash (cons directory one) opencode--catalogs))
     (cl-incf opencode-catalog-generation)))
@@ -247,7 +250,7 @@ Callers run at redisplay, so the request starts from a timer."
   (cl-incf opencode-catalog-generation))
 
 (dolist (type '("agent.updated" "model.updated" "provider.updated" "integration.updated"
-                "command.updated" "skill.updated" "mcp.updated"))
+                "command.updated"))
   (opencode-events-register type #'opencode--invalidate-catalog))
 (opencode-events-register "server.connected" #'opencode--clear-catalogs)
 
@@ -1436,9 +1439,9 @@ From a session buffer prompt for the buffer, elsewhere attach the current one."
   (call-interactively #'self-insert-command)
   (when (comint-after-pmark-p)
     (let ((subagents (seq-filter (lambda (agent)
-                                   (and (equal (alist-get 'mode agent) "subagent")
+                                   (and (member (alist-get 'mode agent) '("subagent" "all"))
                                         (not (alist-get 'hidden agent))))
-                                 (opencode-catalog 'agent))))
+                                 (opencode-catalog-wait 'agent))))
       (when subagents
         (when-let* ((name (opencode-annotated-completion
                            "Subagent: "
@@ -1458,7 +1461,7 @@ From a session buffer prompt for the buffer, elsewhere attach the current one."
                          (mapcar (lambda (command)
                                    (list (alist-get 'name command) (alist-get 'name command)
                                          (alist-get 'description command)))
-                                 (opencode-catalog 'command)))))
+                                 (opencode-catalog-wait 'command)))))
         (insert "/" name " "))
     (call-interactively #'self-insert-command)))
 
@@ -1555,60 +1558,49 @@ A missing variant is the model's default, as the service compares them."
   "Choose this session's primary agent."
   (interactive)
   (opencode--require-session)
-  (opencode-catalog-fetch
-   'agent
-   (lambda (_)
-     (when-let* ((agent (opencode-annotated-completion
-                         "Agent: "
-                         (mapcar (lambda (agent)
-                                   (list (alist-get 'id agent) (alist-get 'id agent)
-                                         (alist-get 'description agent)))
-                                 (opencode-primary-agents)))))
-       (opencode-switch-agent agent)))))
+  (opencode-catalog-wait 'agent)
+  (when-let* ((agent (opencode-annotated-completion
+                      "Agent: "
+                      (mapcar (lambda (agent)
+                                (list (alist-get 'id agent) (alist-get 'id agent)
+                                      (alist-get 'description agent)))
+                              (opencode-primary-agents)))))
+    (opencode-switch-agent agent)))
 
 (defun opencode-select-model ()
   "Choose this session's model."
   (interactive)
   (opencode--require-session)
-  (let ((buffer (current-buffer)))
-    (opencode-catalog-fetch
-     'model
-     (lambda (models)
-       (with-current-buffer buffer
-         (when-let* ((model (opencode-annotated-completion
-                             "Model: "
-                             (mapcar (lambda (entry)
-                                       (list (format "%s/%s" (alist-get 'providerID entry)
-                                                     (alist-get 'id entry))
-                                             entry (alist-get 'name entry)))
-                                     models))))
-           (let* ((variant (alist-get 'variant opencode-session-model))
-                  (offered (mapcar (lambda (v) (alist-get 'id v)) (alist-get 'variants model))))
-             (opencode-switch-model
-              `((id . ,(alist-get 'id model)) (providerID . ,(alist-get 'providerID model))
-                ,@(when (member variant offered) `((variant . ,variant))))))))))))
+  (when-let* ((model (opencode-annotated-completion
+                      "Model: "
+                      (mapcar (lambda (entry)
+                                (list (format "%s/%s" (alist-get 'providerID entry)
+                                              (alist-get 'id entry))
+                                      entry (alist-get 'name entry)))
+                              (opencode-catalog-wait 'model)))))
+    (let* ((variant (alist-get 'variant opencode-session-model))
+           (offered (mapcar (lambda (v) (alist-get 'id v)) (alist-get 'variants model))))
+      (opencode-switch-model
+       `((id . ,(alist-get 'id model)) (providerID . ,(alist-get 'providerID model))
+         ,@(when (member variant offered) `((variant . ,variant))))))))
 
 (defun opencode-select-variant ()
   "Choose the variant, such as the reasoning effort, of this session's model."
   (interactive)
   (opencode--require-session)
-  (let ((buffer (current-buffer)))
-    (opencode-catalog-fetch
-     'model
-     (lambda (_)
-       (with-current-buffer buffer
-         (let* ((info (opencode-model-info opencode-session-model))
-                (variants (alist-get 'variants info)))
-           (if (null variants)
-               (message "This model has no variants")
-             (let ((variant (completing-read
-                             "Variant: "
-                             (cons "default" (mapcar (lambda (v) (alist-get 'id v)) variants))
-                             nil t)))
-               (opencode-switch-model
-                `((id . ,(alist-get 'id opencode-session-model))
-                  (providerID . ,(alist-get 'providerID opencode-session-model))
-                  ,@(unless (equal variant "default") `((variant . ,variant)))))))))))))
+  (opencode-catalog-wait 'model)
+  (let* ((info (opencode-model-info opencode-session-model))
+         (variants (alist-get 'variants info)))
+    (if (null variants)
+        (message "This model has no variants")
+      (let ((variant (completing-read
+                      "Variant: "
+                      (cons "default" (mapcar (lambda (v) (alist-get 'id v)) variants))
+                      nil t)))
+        (opencode-switch-model
+         `((id . ,(alist-get 'id opencode-session-model))
+           (providerID . ,(alist-get 'providerID opencode-session-model))
+           ,@(unless (equal variant "default") `((variant . ,variant)))))))))
 
 ;;;; Session commands
 
@@ -1726,9 +1718,10 @@ The files changed since are restored; the next prompt commits the revert."
   "Open a subagent session of this session."
   (interactive)
   (opencode--require-session)
-  (opencode-request 'get "/api/session" :query `((parentID . ,opencode-session-id))
-                    :then (lambda (response)
-                            (opencode--select-session "Subagent: " (opencode-request-data response)))))
+  (opencode--select-session
+   "Subagent: "
+   (opencode-request-data
+    (opencode-request-sync 'get "/api/session" :query `((parentID . ,opencode-session-id))))))
 
 (defun opencode-scroll-to-last-response-start ()
   "Scroll to the start of the latest assistant text."

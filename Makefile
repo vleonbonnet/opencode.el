@@ -6,7 +6,9 @@
 EMACS ?= emacs
 DEPS ?= $(HOME)/.emacs.d/elpaca/builds
 LOAD_PATH = -L . -L test -L $(DEPS)/plz -L $(DEPS)/transient -L $(DEPS)/cond-let -L $(DEPS)/compat -L $(DEPS)/llama
-BATCH = $(EMACS) -Q --batch $(LOAD_PATH)
+# Stale byte code must never shadow an edited source, in builds or tests.
+PREFER_NEWER = --eval '(setq load-prefer-newer t)'
+BATCH = $(EMACS) -Q --batch $(LOAD_PATH) $(PREFER_NEWER)
 
 SOURCES = $(filter-out %-pkg.el %-autoloads.el,$(wildcard opencode*.el))
 TESTS = $(wildcard test/*-test.el)
@@ -22,7 +24,7 @@ test:
 	$(BATCH) -l test/opencode-test-helpers.el $(addprefix -l ,$(TESTS)) -f ert-run-tests-batch-and-exit
 
 test-gui:
-	$(EMACS) -Q $(LOAD_PATH) -l test/opencode-test-helpers.el $(addprefix -l ,$(TESTS)) \
+	$(EMACS) -Q $(LOAD_PATH) $(PREFER_NEWER) -l test/opencode-test-helpers.el $(addprefix -l ,$(TESTS)) \
 	  --eval '(ert-run-tests-batch-and-exit (quote (tag gui)))'
 
 lint:

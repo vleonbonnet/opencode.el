@@ -60,9 +60,10 @@
 
 ;;;; Server data
 
-(defun opencode-fetch-projects (callback)
-  "Call CALLBACK with the projects the service knows."
-  (opencode-request 'get "/api/project" :buffer nil
+(defun opencode-fetch-projects (callback &optional else)
+  "Call CALLBACK with the projects the service knows.
+ELSE, when given, receives the `opencode-error' of a failed request."
+  (opencode-request 'get "/api/project" :buffer nil :else else
                     :then (lambda (response) (funcall callback response))))
 
 (defun opencode-project-for-directory (projects directory)
@@ -85,17 +86,21 @@ innermost match wins."
   (or (alist-get 'name project)
       (file-name-nondirectory (directory-file-name (alist-get 'canonical project)))))
 
-(defun opencode-fetch-sessions (query callback &optional cursor accumulated)
+(defun opencode-fetch-sessions (query callback &optional else cursor accumulated)
   "Call CALLBACK with every session matching QUERY, newest first.
-CURSOR and ACCUMULATED page through the list."
+ELSE, when given, receives the `opencode-error' of a failed request.
+CURSOR and ACCUMULATED page through the list; a cursor carries the
+filters of the first page, so later pages send it alone."
   (opencode-request
-   'get "/api/session" :buffer nil
-   :query `(,@query (order . "desc") (limit . 100) ,@(when cursor `((cursor . ,cursor))))
+   'get "/api/session" :buffer nil :else else
+   :query (if cursor
+              `((limit . 100) (cursor . ,cursor))
+            `(,@query (order . "desc") (limit . 100)))
    :then (lambda (response)
            (let ((data (opencode-request-data response))
                  (next (alist-get 'next (alist-get 'cursor response))))
              (if (and data next)
-                 (opencode-fetch-sessions query callback next (append accumulated data))
+                 (opencode-fetch-sessions query callback else next (append accumulated data))
                (funcall callback (append accumulated data)))))))
 
 ;;;; Branches
@@ -284,35 +289,34 @@ A sortable number, never nil: vtable would propertize the name of nil."
 (defun opencode-select-project ()
   "List the sessions of a project the service knows, most recently active first."
   (interactive)
-  (opencode-fetch-projects
-   (lambda (projects)
-     (when-let* ((project
-                  (opencode-annotated-completion
-                   "Project: "
-                   (mapcar (lambda (project)
-                             (let ((active (or (map-nested-elt project '(time active))
-                                               (map-nested-elt project '(time updated)))))
-                               (list (abbreviate-file-name (alist-get 'canonical project)) project
-                                     (opencode-format-time-ago (opencode-time-ago active))
-                                     (- (or active 0)))))
-                           (seq-filter (lambda (project) (stringp (alist-get 'canonical project)))
-                                       projects)))))
-       (opencode (alist-get 'canonical project))))))
+  (when-let* ((project
+               (opencode-annotated-completion
+                "Project: "
+                (mapcar (lambda (project)
+                          (let ((active (or (map-nested-elt project '(time active))
+                                            (map-nested-elt project '(time updated)))))
+                            (list (abbreviate-file-name (alist-get 'canonical project)) project
+                                  (opencode-format-time-ago (opencode-time-ago active))
+                                  (- (or active 0)))))
+                        (seq-filter (lambda (project) (stringp (alist-get 'canonical project)))
+                                    (opencode-wait #'opencode-fetch-projects))))))
+    (opencode (alist-get 'canonical project))))
 
 (defun opencode-select-session ()
   "Open a session of the current project."
   (interactive)
-  (opencode-events-connect)
-  (let ((directory (opencode-project-directory)))
-    (opencode-fetch-projects
-     (lambda (projects)
-       (let ((project (opencode-project-for-directory projects directory)))
-         (opencode-fetch-sessions
-          `((parentID . "null")
-            ,(if project
-                 `(project . ,(alist-get 'id project))
-               `(directory . ,(directory-file-name directory))))
-          (lambda (sessions) (opencode--select-session "Session: " sessions))))))))
+  (let* ((directory (opencode-project-directory))
+         (project (opencode-project-for-directory (opencode-wait #'opencode-fetch-projects)
+                                                  directory)))
+    (opencode--select-session
+     "Session: "
+     (opencode-wait (lambda (then else)
+                      (opencode-fetch-sessions
+                       `((parentID . "null")
+                         ,(if project
+                              `(project . ,(alist-get 'id project))
+                            `(directory . ,(directory-file-name directory))))
+                       then else))))))
 
 (defun opencode-session-list-open (info)
   "Open session INFO in the selected window."
@@ -406,25 +410,19 @@ The worktree goes under `opencode-worktree-directory'; a session opens in it."
   "Disconnect a connected MCP server of this location, or connect another.
 The change lasts until the service restarts."
   (interactive)
-  (opencode-request
-   'get "/api/mcp"
-   :then (lambda (response)
-           (let* ((servers (opencode-request-data response))
-                  (server (opencode-annotated-completion
-                           "MCP server: "
-                           (mapcar (lambda (server)
-                                     (list (alist-get 'name server) server
-                                           (opencode--mcp-status-label server)))
-                                   servers))))
-             (when server
-               (let* ((name (alist-get 'name server))
-                      (connected (member (map-nested-elt server '(status status)) '("connected" "pending")))
-                      (action (if connected "disconnect" "connect")))
-                 (opencode-request
-                  'post (format "/api/experimental/mcp/%s/%s" (url-hexify-string name) action)
-                  :body (opencode-empty-object)
-                  :then (lambda (_)
-                          (message (if connected "Disconnected %s" "Connected %s") name)))))))))
+  (when-let* ((server (opencode-annotated-completion
+                       "MCP server: "
+                       (mapcar (lambda (server)
+                                 (list (alist-get 'name server) server
+                                       (opencode--mcp-status-label server)))
+                               (opencode-request-data (opencode-request-sync 'get "/api/mcp"))))))
+    (let* ((name (alist-get 'name server))
+           (connected (member (map-nested-elt server '(status status)) '("connected" "pending")))
+           (action (if connected "disconnect" "connect")))
+      (opencode-request
+       'post (format "/api/experimental/mcp/%s/%s" (url-hexify-string name) action)
+       :then (lambda (_)
+               (message (if connected "Disconnected %s" "Connected %s") name))))))
 
 (provide 'opencode-sessions)
 ;;; opencode-sessions.el ends here

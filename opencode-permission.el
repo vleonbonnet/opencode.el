@@ -406,7 +406,9 @@ The transient shows the full command, so the block stays collapsed."
   :transient nil
   (interactive)
   (let* ((buffer (plist-get opencode--permission-transient-state :buffer))
-         (agents (with-current-buffer buffer (opencode--handoff-agents)))
+         (agents (with-current-buffer buffer
+                   (opencode-catalog-wait 'agent)
+                   (opencode--handoff-agents)))
          (names (mapcar (lambda (agent) (alist-get 'id agent)) agents)))
     (unless names (user-error "No other primary agent"))
     (let ((agent (completing-read (format-prompt "Hand off to" (car names)) names nil t nil nil (car names))))

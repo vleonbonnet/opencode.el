@@ -33,13 +33,17 @@
      (time (created . 1) (updated . 1)) (sandboxes))))
 
 (defun opencode-test-session-routes (sessions)
-  "Return routes listing SESSIONS two per page, and the test projects."
+  "Return routes listing SESSIONS two per page, and the test projects.
+As the service does, a cursor carries the filters of the first page,
+and filters sent with it are ignored."
   (list
    (list 'get "\\`/api/project\\'" (lambda (_) (opencode-test-projects)))
    (list 'get "\\`/api/session\\'"
          (lambda (request)
-           (let* ((query (plist-get request :query))
-                  (start (string-to-number (or (alist-get 'cursor query) "0")))
+           (let* ((cursor (and (alist-get 'cursor (plist-get request :query))
+                               (read (alist-get 'cursor (plist-get request :query)))))
+                  (query (if cursor (cdr cursor) (plist-get request :query)))
+                  (start (or (car cursor) 0))
                   (matching (seq-filter (lambda (info)
                                           (and (or (not (alist-get 'project query))
                                                    (equal (alist-get 'projectID info) (alist-get 'project query)))
@@ -48,7 +52,10 @@
                                         sessions)))
              `((data . ,(seq-take (nthcdr start matching) 2))
                ;; The server always offers a next page, even past the end.
-               (cursor (next . ,(number-to-string (+ start 2))))))))))
+               (cursor (next . ,(prin1-to-string
+                                 (cons (+ start 2)
+                                       (seq-filter (lambda (pair) (memq (car pair) '(project parentID)))
+                                                   query)))))))))))
 
 (defmacro opencode-test-with-sessions (&rest body)
   "Run BODY with the recorded sessions served."
@@ -130,9 +137,14 @@
       (should (equal (mapcar (lambda (info) (alist-get 'id info)) result)
                      (seq-keep (lambda (info) (and (not (alist-get 'parentID info)) (alist-get 'id info)))
                                (opencode-test-recorded-sessions))))
-      (let ((query (plist-get (car (last opencode-test-requests)) :query)))
-        (should (equal (alist-get 'order query) "desc"))
-        (should (equal (alist-get 'project query) opencode-test-project-id))))))
+      (let ((pages (reverse opencode-test-requests)))
+        (should (> (length pages) 1))
+        (let ((query (plist-get (car pages) :query)))
+          (should (equal (alist-get 'order query) "desc"))
+          (should (equal (alist-get 'project query) opencode-test-project-id)))
+        ;; Later pages carry only the cursor, which holds the filters.
+        (dolist (page (cdr pages))
+          (should (equal (mapcar #'car (plist-get page :query)) '(limit cursor))))))))
 
 (ert-deftest opencode-test-opencode-lists-the-project ()
   "`opencode' lists the project of the current directory by its ID."
