@@ -216,9 +216,27 @@ Relative names are tried against the project root and `default-directory'."
                      (expand-file-name file (opencode-project-directory))
                      (expand-file-name file default-directory))))))
 
+(defun opencode-terminal-text (text)
+  "Return TEXT as a terminal leaves it on screen.
+CRLF line ends, which Windows programs print, become LF, and a carriage
+return within a line, as in a progress display, writes over that line
+from its start."
+  (if (not (string-search "\r" text))
+      text
+    (mapconcat (lambda (line)
+                 (let ((shown ""))
+                   (dolist (segment (split-string line "\r"))
+                     (setq shown (concat segment (when (> (length shown) (length segment))
+                                                   (substring shown (length segment))))))
+                   shown))
+               (split-string (replace-regexp-in-string "\r+\n" "\n" text) "\n")
+               "\n")))
+
 (defun opencode-fenced-block (text language)
-  "Return TEXT in a LANGUAGE fence longer than any backtick run in TEXT."
-  (let ((length 3)
+  "Return TEXT in a LANGUAGE fence longer than any backtick run in TEXT.
+TEXT is shown as a terminal would show it; see `opencode-terminal-text'."
+  (let ((text (opencode-terminal-text text))
+        (length 3)
         (start 0))
     (while (string-match "`+" text start)
       (setq length (max length (1+ (- (match-end 0) (match-beginning 0))))

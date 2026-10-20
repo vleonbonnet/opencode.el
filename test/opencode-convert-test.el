@@ -29,6 +29,14 @@
     ;; Messages with nothing to show leave no empty headings.
     (should-not (string-match-p "^## Assistant\n\n## " text))))
 
+(ert-deftest opencode-test-fenced-line-ends ()
+  "Verbatim text reads as a terminal shows it: CRLF ends lines, a lone CR rewrites its line."
+  (should (equal (opencode-fenced-block "alpha\r\nbeta\r\n" "text") "```text\nalpha\nbeta\n```"))
+  (should (equal (opencode-terminal-text "10%\r50%\r100%\ndone") "100%\ndone"))
+  (should (equal (opencode-terminal-text "abcdef\rXY") "XYcdef"))
+  (should (equal (opencode-terminal-text "end\r") "end"))
+  (should (equal (opencode-terminal-text "plain\n") "plain\n")))
+
 (ert-deftest opencode-test-transcript-other-messages ()
   "Shell commands, compaction summaries and system context are included."
   (let ((shell (opencode-test-transcript "shell-input"))
