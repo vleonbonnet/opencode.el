@@ -21,7 +21,7 @@
   "Prompts, tool calls with their input and output, and answers are listed."
   (let ((text (opencode-test-transcript "edit-tools")))
     (should (string-prefix-p "# OpenCode Conversation\n\n" text))
-    (should (string-match-p "^## User\n\nCreate hello.txt" text))
+    (should (string-match-p "^## User\n\nWith the patch tool, one call per change, create hello.txt" text))
     (should (string-match-p "^### Tool call: patch$" text))
     (should (string-match-p "\"patchText\": \"\\*\\*\\* Begin Patch" text))
     (should (string-match-p "^Success. Updated the following files:$" text))

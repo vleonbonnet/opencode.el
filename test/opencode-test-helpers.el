@@ -79,6 +79,18 @@
     (when (re-search-forward (format "\t%s\t\\(ses_[A-Za-z0-9]+\\)" (regexp-quote name)) nil t)
       (match-string 1))))
 
+(defun opencode-test-first-reasoning (session-id)
+  "Return the ID of the first recorded assistant message of SESSION-ID with reasoning."
+  (alist-get 'id (seq-find (lambda (message)
+                             (and (equal (alist-get 'type message) "assistant")
+                                  (seq-some (lambda (item) (equal (alist-get 'type item) "reasoning"))
+                                            (alist-get 'content message))))
+                           (alist-get 'data (opencode-test-fixture (format "messages-%s.json" session-id))))))
+
+(defun opencode-test-session-title (session-id)
+  "Return the recorded title of SESSION-ID."
+  (alist-get 'title (alist-get 'data (opencode-test-fixture (format "session-%s.json" session-id)))))
+
 (defvar opencode-test-requests nil
   "Requests made under `opencode-test-with-server', newest first.
 Each is a plist (:method :path :query :body).")

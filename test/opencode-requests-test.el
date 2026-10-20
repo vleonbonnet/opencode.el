@@ -12,7 +12,7 @@
 (require 'opencode-test-helpers)
 
 (ert-deftest opencode-test-permission-marks-its-tool ()
-  "A permission request marks the block of the call that asked, expanded."
+  "A permission request marks the block of the call that asked, with its command and rule."
   (opencode-test-with-server
     (let* ((id (opencode-test-scenario "permission"))
            (buffer (opencode-test-open-empty id))
@@ -24,7 +24,8 @@
           (should (equal (plist-get permission :title) "Shell command: rm junk.txt"))
           (should overlay)
           (should (eq (plist-get (opencode-block-data overlay) :waiting-kind) 'permission))
-          (should (string-match-p "rm junk.txt" (buffer-substring (overlay-start overlay) (overlay-end overlay))))
+          (should (string-match-p "rm junk.txt · asked by rule \"rm \\*\""
+                                  (buffer-substring (overlay-start overlay) (overlay-end overlay))))
           (should (opencode-pending-request-p))
           ;; Answered in another client.
           (opencode-test-dispatch-until rest "permission.replied")

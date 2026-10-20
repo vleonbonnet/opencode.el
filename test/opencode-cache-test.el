@@ -198,13 +198,14 @@ The fake service answers preflights with `opencode-test-reports'."
   "Dropped blocks are relabelled and reported in one notice."
   (opencode-test-with-server
     (let* ((id (opencode-test-scenario "reasoning"))
-           (key (opencode-reasoning-key "msg_14fb6a141001g6EKRFFNVpwLGN" 0)))
+           (message (opencode-test-first-reasoning id))
+           (key (opencode-reasoning-key message 0)))
       (with-current-buffer (opencode-test-open id)
         (should (opencode-block key))
         (opencode-test-dispatch
          `(((type . "session.thinking.dropped")
             (data (sessionID . ,id)
-                  (blocks ((messageID . "msg_14fb6a141001g6EKRFFNVpwLGN") (ordinal . 0)
+                  (blocks ((messageID . ,message) (ordinal . 0)
                            (reason . "dropped with consent: no longer matches the conversation")
                            (asText . t)))))))
         (let ((overlay (opencode-block key)))
@@ -215,14 +216,16 @@ The fake service answers preflights with `opencode-test-reports'."
 (ert-deftest opencode-test-dropped-thinking-on-replay ()
   "Reopening a session relabels the blocks the server dropped before."
   (opencode-test-with-server
-    (let* ((opencode-test-routes
+    (let* ((id (opencode-test-scenario "reasoning"))
+           (message (opencode-test-first-reasoning id))
+           (opencode-test-routes
             (cons (list 'get "/thinking\\'"
-                        (lambda (_) '((data (dropped ((messageID . "msg_14fb6a141001g6EKRFFNVpwLGN")
+                        (lambda (_) `((data (dropped ((messageID . ,message)
                                                        (ordinal . 0) (asText)
                                                        (reason . "dropped by the provider: no longer matches the conversation")))))))
                   opencode-test-routes)))
-      (with-current-buffer (opencode-test-open (opencode-test-scenario "reasoning"))
-        (let ((overlay (opencode-block (opencode-reasoning-key "msg_14fb6a141001g6EKRFFNVpwLGN" 0))))
+      (with-current-buffer (opencode-test-open id)
+        (let ((overlay (opencode-block (opencode-reasoning-key message 0))))
           (should (string-match-p "dropped" (buffer-substring (overlay-start overlay) (overlay-end overlay)))))
         (should-not (string-match-p "Dropped 1" (opencode-test-text (current-buffer))))))))
 

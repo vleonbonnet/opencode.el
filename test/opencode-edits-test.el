@@ -80,8 +80,9 @@
                     (setq finished (mapcar #'file-name-nondirectory files))
                     (opencode-report-diagnostic "- notes.txt:4: warning: trailing word")))))
       (opencode-test-dispatch (opencode-test-events id))
+      ;; Appending to the CRLF notes.txt adds line 4 alone: the patch keeps the file's line ends.
       (should (equal (reverse opencode-test-edits)
-                     '(("hello.txt" (1 . 1)) ("hello.txt" (1 . 1)) ("notes.txt" (3 . 4)))))
+                     '(("hello.txt" (1 . 1)) ("hello.txt" (1 . 1)) ("notes.txt" (4 . 4)))))
       (should (equal finished '("hello.txt" "notes.txt")))
       (with-current-buffer buffer
         (should-not opencode--files-edited-this-turn))
