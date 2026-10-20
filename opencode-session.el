@@ -611,15 +611,15 @@ Input still being typed is lifted out and put back afterwards."
          (cl-incf text-ordinal))
         ("reasoning"
          (let ((text (alist-get 'text item))
-               (state (alist-get 'state item))
+               (native (alist-get 'native item))
                (key (opencode-reasoning-key id reasoning-ordinal)))
-           (if (opencode-narration-p text state)
+           (if (opencode-narration-p text native)
                (progn (opencode-open-block 'text)
                       (opencode--output-message (string-trim text) id))
              (when (or (not (string-empty-p (or text "")))
-                       (opencode-reasoning-hidden-kind text state))
+                       (opencode-reasoning-hidden-kind text native))
                (opencode-open-block 'reasoning)
-               (opencode-reasoning-end key text state))))
+               (opencode-reasoning-end key text native))))
          (cl-incf reasoning-ordinal))
         ("tool"
          (opencode-open-block 'tool)
@@ -794,8 +794,8 @@ An error already shown during the current turn is not repeated."
           (opencode-session-reload)))
       (opencode-align-finished-tables t))))
 
-(defvar-local opencode--reasoning-states nil
-  "Hash table of reasoning keys to the state their start event carried.")
+(defvar-local opencode--reasoning-native nil
+  "Hash table of reasoning keys to the native data their start event carried.")
 
 (defun opencode--event-reasoning (event)
   "Handle the `session.reasoning.*' EVENT.
@@ -804,28 +804,28 @@ reasoning encrypted stream empty blocks, which replay omits too."
   (opencode--on-session-event event
     (let ((key (opencode-reasoning-key (alist-get 'assistantMessageID data)
                                        (alist-get 'ordinal data))))
-      (unless (hash-table-p opencode--reasoning-states)
-        (setq opencode--reasoning-states (make-hash-table :test #'equal)))
+      (unless (hash-table-p opencode--reasoning-native)
+        (setq opencode--reasoning-native (make-hash-table :test #'equal)))
       (pcase (alist-get 'type event)
         ("session.reasoning.started"
-         (puthash key (alist-get 'state data) opencode--reasoning-states))
+         (puthash key (alist-get 'native data) opencode--reasoning-native))
         ("session.reasoning.delta"
          (unless (opencode-block key)
            (opencode-align-finished-tables t)
            (opencode-open-block 'reasoning)
-           (opencode-reasoning-start key "" (gethash key opencode--reasoning-states)))
+           (opencode-reasoning-start key "" (gethash key opencode--reasoning-native)))
          (opencode-reasoning-append key (alist-get 'delta data)))
         ("session.reasoning.ended"
          (let ((text (alist-get 'text data))
-               (state (alist-get 'state data)))
-           (remhash key opencode--reasoning-states)
+               (native (alist-get 'native data)))
+           (remhash key opencode--reasoning-native)
            (when (or (opencode-block key)
                      (not (string-empty-p (or text "")))
-                     (opencode-reasoning-hidden-kind text state))
+                     (opencode-reasoning-hidden-kind text native))
              (unless (opencode-block key)
                (opencode-align-finished-tables t)
-               (opencode-open-block (if (opencode-narration-p text state) 'text 'reasoning)))
-             (opencode-reasoning-end key text state))))))))
+               (opencode-open-block (if (opencode-narration-p text native) 'text 'reasoning)))
+             (opencode-reasoning-end key text native))))))))
 
 (defun opencode--event-tool (event)
   "Handle the `session.tool.*' EVENT."

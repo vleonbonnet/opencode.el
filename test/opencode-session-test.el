@@ -58,6 +58,57 @@
           (opencode-test-dispatch (opencode-test-events id))
           (should (equal (opencode-test-text live) replayed)))))))
 
+;; Signed reasoning as Anthropic sends it: the signature's decoded header names the block's kind.
+(defun opencode-test-signature (kind)
+  "Return a signature whose decoded header names block KIND."
+  (base64-encode-string (concat (string #x12 #x05) "B" (string (length kind)) kind (string 0) (make-string 45 7)) t))
+
+(defconst opencode-test-signed-reasoning
+  `(((text . "Narrated for the user.") (native (signature . ,(opencode-test-signature "narration"))))
+    ((text . "") (native (signature . ,(opencode-test-signature "thinking")))))
+  "Reasoning blocks of one assistant message: narration, then withheld thinking.")
+
+(defun opencode-test-signed-reasoning-labels (buffer message)
+  "Return how BUFFER shows the signed reasoning blocks of MESSAGE."
+  (with-current-buffer buffer
+    ;; Narration is prose: no reasoning block holds it, replayed or live.
+    (list (let ((block (opencode-block (opencode-reasoning-key message 0))))
+            (or (null block) (overlay-get block 'opencode-narration)))
+          (plist-get (opencode-block-data (opencode-block (opencode-reasoning-key message 1))) :hidden-kind)
+          (and (string-match-p "Narrated for the user\\." (opencode-test-text buffer)) t))))
+
+(ert-deftest opencode-test-signed-reasoning ()
+  "Narration shows as prose and withheld thinking by its kind, replayed or live."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "reasoning"))
+           (messages (alist-get 'data (opencode-test-fixture (format "messages-%s.json" id))))
+           (assistant (seq-find (lambda (message) (equal (alist-get 'type message) "assistant")) messages))
+           (message (alist-get 'id assistant))
+           (signed (mapcar (lambda (message)
+                             (if (eq message assistant)
+                                 (cons (cons 'content (mapcar (lambda (block) (cons '(type . "reasoning") block))
+                                                              opencode-test-signed-reasoning))
+                                       (assq-delete-all 'content (copy-alist message)))
+                               message))
+                           messages))
+           (opencode-test-routes
+            (cons (list 'get "/message\\'" (lambda (_) `((data . ,signed) (cursor))))
+                  opencode-test-routes)))
+      (should (equal (opencode-test-signed-reasoning-labels (opencode-test-open id) message)
+                     '(t "thinking" t)))
+      (kill-buffer (gethash id opencode-session-buffers))
+      (let ((live (opencode-test-open-empty id)))
+        (seq-do-indexed
+         (lambda (block ordinal)
+           (let ((base `((sessionID . ,id) (assistantMessageID . ,message) (ordinal . ,ordinal))))
+             (opencode-test-dispatch
+              `(((type . "session.reasoning.started") (data ,@base (native . ,(alist-get 'native block))))
+                ,@(unless (string-empty-p (alist-get 'text block))
+                    `(((type . "session.reasoning.delta") (data ,@base (delta . ,(alist-get 'text block))))))
+                ((type . "session.reasoning.ended") (data ,@base ,@block))))))
+         opencode-test-signed-reasoning)
+        (should (equal (opencode-test-signed-reasoning-labels live message) '(t "thinking" t)))))))
+
 (ert-deftest opencode-test-own-prompt-not-echoed ()
   "A prompt sent from Emacs is not rendered again when the server echoes it."
   (opencode-test-with-server

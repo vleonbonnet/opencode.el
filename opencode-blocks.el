@@ -307,12 +307,12 @@ one: the block must exist for a permission to expand it."
 
 ;;;; Reasoning summaries
 
-(defun opencode-reasoning-block-kind (state)
-  "Return the block kind named by the Anthropic signature in reasoning STATE.
+(defun opencode-reasoning-block-kind (native)
+  "Return the block kind named by the Anthropic signature in reasoning NATIVE data.
 The decoded header names the type as a length-prefixed string such as
 \"thinking\" or \"narration\".  The format is undocumented; an unknown
 or malformed header gives nil."
-  (let ((signature (alist-get 'signature state)))
+  (let ((signature (alist-get 'signature native)))
     (when (stringp signature)
       (let ((head (ignore-errors
                     (base64-decode-string
@@ -324,16 +324,16 @@ or malformed header gives nil."
                      (= (aref (match-string 1 head) 0) (length (match-string 2 head))))
             (match-string 2 head)))))))
 
-(defun opencode-reasoning-hidden-kind (text state)
+(defun opencode-reasoning-hidden-kind (text native)
   "Return the kind of a reasoning block whose TEXT the provider withheld.
-Nil unless TEXT is empty and STATE carries a readable signature."
+Nil unless TEXT is empty and its NATIVE data carries a readable signature."
   (when (string-empty-p (or text ""))
-    (opencode-reasoning-block-kind state)))
+    (opencode-reasoning-block-kind native)))
 
-(defun opencode-narration-p (text state)
-  "Return non-nil when reasoning TEXT with STATE is narration meant for the user."
+(defun opencode-narration-p (text native)
+  "Return non-nil when reasoning TEXT with NATIVE data is narration for the user."
   (and (not (string-empty-p (or text "")))
-       (equal (opencode-reasoning-block-kind state) "narration")))
+       (equal (opencode-reasoning-block-kind native) "narration")))
 
 (defun opencode-reasoning-preview (text)
   "Return a bounded one-line preview of reasoning TEXT.
@@ -712,12 +712,12 @@ Never switches the session agent; that is \\[opencode-cycle-agent]."
 
 ;;;; Reasoning blocks
 
-(defun opencode-reasoning-start (key &optional text state)
-  "Write a collapsed reasoning block for KEY with TEXT and STATE, and return it."
+(defun opencode-reasoning-start (key &optional text native)
+  "Write a collapsed reasoning block for KEY with TEXT and NATIVE data; return it."
   (opencode-blocks-ensure)
   (or (opencode-block key)
       (let* ((text (or text ""))
-             (hidden (opencode-reasoning-hidden-kind text state))
+             (hidden (opencode-reasoning-hidden-kind text native))
              (overlay (opencode-insert-collapsed
                        (opencode-reasoning-summary text hidden)
                        'opencode-reasoning-margin-highlight
@@ -753,16 +753,16 @@ block was shown; an expanded copy goes too."
       (puthash key marker opencode--blocks)
       (opencode-set-last-response-start (+ start (length prefix))))))
 
-(defun opencode-reasoning-end (key text state)
-  "Finish reasoning block KEY with its full TEXT and provider STATE."
+(defun opencode-reasoning-end (key text native)
+  "Finish reasoning block KEY with its full TEXT and the provider's NATIVE data."
   (opencode-blocks-ensure)
-  (let ((overlay (or (opencode-block key) (opencode-reasoning-start key text state))))
+  (let ((overlay (or (opencode-block key) (opencode-reasoning-start key text native))))
     (unless (overlay-get overlay 'opencode-narration)
-      (if (opencode-narration-p text state)
+      (if (opencode-narration-p text native)
           (progn (opencode--show-narration overlay text)
                  (setq opencode--last-block-kind 'text))
         (opencode-block-update overlay :text (or text "")
-                               :hidden-kind (opencode-reasoning-hidden-kind text state))))))
+                               :hidden-kind (opencode-reasoning-hidden-kind text native))))))
 
 (defun opencode-reasoning-mark-dropped (key dropped)
   "Relabel reasoning block KEY with its DROPPED marker."
