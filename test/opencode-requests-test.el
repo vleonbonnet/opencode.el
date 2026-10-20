@@ -31,6 +31,14 @@
           (should-not opencode-pending-permissions)
           (should-not (plist-get (opencode-block-data overlay) :waiting)))))))
 
+(ert-deftest opencode-test-permission-summary-keeps-command ()
+  "A block waiting on a permission shows its command, then the rule that asked."
+  (should (string-match-p "rm junk.txt · asked by rule \"rm \\*\""
+                          (opencode-tool-collapsed-summary
+                           '(:type tool :tool "shell" :input ((command . "rm junk.txt"))
+                             :waiting t :waiting-kind permission
+                             :waiting-description "asked by rule \"rm *\"")))))
+
 (ert-deftest opencode-test-permission-reply-request ()
   "Answering sends the decision to the session's reply route."
   (opencode-test-with-server

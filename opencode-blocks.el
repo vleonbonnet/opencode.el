@@ -241,12 +241,13 @@ Questions are shortened so the answers stay within the summary width."
             ("subagent" (format "%s: %s" (capitalize (or .agent "subagent")) (or .description "")))
             (_ (opencode--generic-tool-description input)))))))
 
-(defun opencode-tool-summary (tool input face &optional status-icon description)
+(defun opencode-tool-summary (tool input face &optional status-icon description note)
   "Return the one-line summary of TOOL called with INPUT, colored as FACE.
 STATUS-ICON goes between the boxed label and the description, which
-DESCRIPTION replaces.  Whitespace is flattened so a multi-line argument
-cannot break the line.  A failing description falls back to the generic
-one: the block must exist for a permission to expand it."
+DESCRIPTION replaces; NOTE follows the description.  Whitespace is
+flattened so a multi-line argument cannot break the line.  A failing
+description falls back to the generic one: the block must exist for a
+permission to expand it."
   (let* ((description
           (or description
               (condition-case err
@@ -259,7 +260,8 @@ one: the block must exist for a permission to expand it."
                                              (opencode-tool-short-label tool) face)
                        (when status-icon (concat " " status-icon))
                        " "
-                       (string-trim (replace-regexp-in-string "[ \t\n\r]+" " " (or description ""))))))
+                       (string-trim (replace-regexp-in-string "[ \t\n\r]+" " " (or description "")))
+                       (when note (concat " · " note)))))
     (if (> (length full) opencode-tool-summary-max-width)
         (concat (substring full 0 opencode-tool-summary-max-width) "…")
       full)))
@@ -463,7 +465,7 @@ every summary replacement."
     (cond
      ((plist-get data :waiting)
       (opencode-tool-summary tool input face (opencode-pending-prompt-icon)
-                             (plist-get data :waiting-description)))
+                             nil (plist-get data :waiting-description)))
      ((plist-get data :error) (opencode-tool-error-summary tool input (plist-get data :error)))
      ((and (equal tool "question") (plist-get data :answers))
       (opencode-tool-summary tool input face nil
