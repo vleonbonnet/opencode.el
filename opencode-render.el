@@ -356,7 +356,9 @@ session property, where mode setup and cleanup disturb the transcript."
 (defun opencode--fontify-prompts (start end)
   "Show prompt text between START and END in `opencode-prompt'.
 Every prompt follows the hidden \"> \", so markdown-ts reads it as a
-block quote; answers keep their quote face."
+block quote; answers keep their quote face.  The input being typed
+shows its Markdown as typed: none of it is hidden or displayed as
+something else."
   (let* ((process (get-buffer-process (current-buffer)))
          (pmark (and process (marker-position (process-mark process)))))
     (with-silent-modifications
@@ -365,6 +367,8 @@ block quote; answers keep their quote face."
           (let ((next (next-single-property-change pos 'opencode-prompt nil end)))
             (when (and pmark (< pos pmark next))
               (setq next pmark))
+            (when (and pmark (>= pos pmark))
+              (remove-list-of-text-properties pos next '(invisible display)))
             (when (or (get-text-property pos 'opencode-prompt)
                       (and pmark (>= pos pmark)))
               (opencode--prompt-face-region pos next))
@@ -407,6 +411,10 @@ block quote; answers keep their quote face."
   ;; The settings are shared between markdown buffers, so copy them first.
   (setq-local treesit-font-lock-settings (mapcar #'copy-sequence treesit-font-lock-settings))
   (treesit-font-lock-recompute-features nil '(error))
+  ;; Typed text inherits from the text before it, and redisplay never
+  ;; fontifies hidden text, so text typed after hidden markup would stay hidden.
+  (setq-local text-property-default-nonsticky
+              (append '((invisible . t) (display . t)) text-property-default-nonsticky))
   (setq-local comint-prompt-read-only t)
   (when opencode-remap-headings
     (dolist (face '(markdown-ts-heading-1 markdown-ts-heading-2 markdown-ts-heading-3
