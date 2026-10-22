@@ -36,6 +36,8 @@ OpenCode 2 runs one background service per user. Emacs never starts a server of 
 
 Locations are keyed by the exact directory string the service receives, so every directory is normalized the same way: truename, trailing slash, and an uppercase drive letter on Windows.
 
+A service starting on a database from OpenCode 1 imports that history in the background while it already answers, and it answers 404 for a session the import has yet to reach. So ready means imported: =opencode-service-ensure= polls =/api/experimental/migration/v1= once per service process before it settles its waiters, and no request can mistake a session not imported yet for a deleted one. A failed or stalled import is reported and then left behind, since the service is usable without it.
+
 * Live rendering equals replay
 
 Opening a session renders its projected messages; afterwards the event stream drives the buffer. Both paths must produce the same text, which the tests check for every recorded scenario. That rule settled several choices:

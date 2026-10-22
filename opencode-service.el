@@ -27,6 +27,13 @@
 ;; service answers, asks the CLI to start one.  Emacs never owns the
 ;; service: disconnecting or exiting Emacs leaves it running, and a new
 ;; binary is picked up through `opencode service restart'.
+;;
+;; On its first start the service imports OpenCode 1's session history
+;; in the background while it already answers, and until the import
+;; reaches a session, that session looks deleted.  So the service is
+;; ready only once its import status says completed: requests wait for
+;; it meanwhile, and an import that fails or stalls is reported and then
+;; left behind.
 
 ;;; Code:
 
@@ -52,6 +59,13 @@ every platform."
   :type 'number
   :group 'opencode)
 
+(defcustom opencode-service-import-stall-timeout 300
+  "Seconds the service's import of earlier sessions may make no progress.
+Requests wait while the service imports OpenCode 1's sessions; after
+this long without progress they stop waiting, with a warning."
+  :type 'number
+  :group 'opencode)
+
 (defcustom opencode-service-stale-functions nil
   "Abnormal hook run when the service runs another version than the CLI.
 Each function receives the service's version and the installed one."
@@ -69,6 +83,12 @@ Each function receives the service's version and the installed one."
 
 (defvar opencode-service--installed-version nil
   "Cons (MTIME . VERSION) of the last `opencode --version' result.")
+
+(defvar opencode-service--import-checked nil
+  "Cons (ID . PID) of the service whose import Emacs no longer waits for.")
+
+(defvar opencode-service--import-interval 1
+  "Seconds between two import status requests.")
 
 (defun opencode-service-registration-file ()
   "Return the service registration file name."
@@ -135,6 +155,83 @@ while it boots, and nil when nothing usable answers."
     (when connection
       (opencode-service-check-version connection))))
 
+(defun opencode-service--import-key (connection)
+  "Return the cons (ID . PID) naming CONNECTION's service process."
+  (cons (plist-get connection :id) (plist-get connection :pid)))
+
+(defun opencode-service--import-progress (status)
+  "Return the text of the progress reported in import STATUS."
+  (let-alist (alist-get 'progress status)
+    (if (not .label)
+        "waiting to import the earlier sessions"
+      (concat .label
+              (cond ((and .numerator .denominator) (format " %d/%d" .numerator .denominator))
+                    (.numerator (format " %d" .numerator)))))))
+
+(defun opencode-service--import-done (connection)
+  "Stop waiting for the import of CONNECTION's service and settle the waiters."
+  (setq opencode-service--import-checked (opencode-service--import-key connection))
+  (opencode-service--finish connection nil))
+
+(defun opencode-service--plz-error-text (error)
+  "Return a short description of plz ERROR."
+  (let ((response (plz-error-response error)))
+    (cond (response (format "HTTP %d" (plz-response-status response)))
+          ((plz-error-curl-error error)
+           (format "curl error %d" (car (plz-error-curl-error error))))
+          (t (or (plz-error-message error) "no answer")))))
+
+(defun opencode-service--await-import (connection &optional progress deadline)
+  "Settle the waiters with CONNECTION once its service imported the earlier sessions.
+PROGRESS is the progress text last reported, and DEADLINE the time
+after which the import counts as stalled unless it progresses."
+  (if (equal opencode-service--import-checked (opencode-service--import-key connection))
+      (opencode-service--finish connection nil)
+    (let ((deadline (or deadline (+ (float-time) opencode-service-import-stall-timeout))))
+      (condition-case err
+          (plz 'get (concat (plist-get connection :url) "/api/experimental/migration/v1")
+            :headers `(("Authorization" . ,(opencode-service-authorization connection)))
+            :as (lambda () (json-parse-buffer :object-type 'alist :null-object nil
+                                              :false-object nil))
+            :connect-timeout 2 :timeout 5 :noquery t
+            :then
+            (lambda (status)
+              (pcase (alist-get 'status status)
+                ("completed"
+                 (when progress (message "OpenCode service: earlier sessions imported"))
+                 (opencode-service--import-done connection))
+                ("error"
+                 (display-warning
+                  'opencode (format "The OpenCode service could not import the earlier sessions: %s"
+                                    (alist-get 'error status)))
+                 (opencode-service--import-done connection))
+                (_
+                 (let ((current (opencode-service--import-progress status)))
+                   (unless (equal current progress)
+                     (message "OpenCode service: %s…" current)
+                     (setq deadline (+ (float-time) opencode-service-import-stall-timeout)))
+                   (if (> (float-time) deadline)
+                       (progn
+                         (display-warning
+                          'opencode
+                          (format "The OpenCode service's import of earlier sessions made no progress for %s s; sessions it has yet to import look deleted"
+                                  opencode-service-import-stall-timeout))
+                         (opencode-service--import-done connection))
+                     (run-at-time opencode-service--import-interval nil
+                                  #'opencode-service--await-import connection current deadline))))))
+            :else
+            (lambda (error)
+              (if (eql 404 (when-let* ((response (plz-error-response error)))
+                             (plz-response-status response)))
+                  ;; A service without the import route has nothing to import.
+                  (opencode-service--import-done connection)
+                (opencode-service--finish
+                 nil (format "Cannot read the OpenCode service's import of earlier sessions (%s)"
+                             (opencode-service--plz-error-text error))))))
+        (error (opencode-service--finish
+                nil (format "Cannot read the OpenCode service's import of earlier sessions (%s)"
+                            (error-message-string err))))))))
+
 (defun opencode-service--process-environment ()
   "Return the environment for the CLI, without credentials of an older server."
   (seq-remove (lambda (entry)
@@ -173,7 +270,7 @@ Output goes to a hidden buffer that is killed afterwards."
        connection
        (lambda (outcome)
          (cond
-          ((eq outcome 'ready) (opencode-service--finish connection nil))
+          ((eq outcome 'ready) (opencode-service--await-import connection))
           ((> (float-time) deadline)
            (opencode-service--finish nil "The OpenCode service did not become ready"))
           (t (run-at-time 0.25 nil #'opencode-service--await deadline))))))))
@@ -205,7 +302,7 @@ ERRBACK, when given, receives an error message instead on failure."
            connection
            (lambda (outcome)
              (pcase outcome
-               ('ready (opencode-service--finish connection nil))
+               ('ready (opencode-service--await-import connection))
                ('starting
                 (opencode-service--await (+ (float-time) opencode-service-start-timeout)))
                (_ (opencode-service--start))))))))))

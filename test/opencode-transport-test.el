@@ -63,6 +63,99 @@
       (opencode-test-wait-for (lambda () ready))
       (should (>= answers 3)))))
 
+(defun opencode-test-import-route (&rest answers)
+  "Return a route answering the import status with ANSWERS in turn, the last one after."
+  (cons "/api/experimental/migration/v1"
+        (lambda (_) (cons 200 (if (cdr answers) (pop answers) (car answers))))))
+
+(defun opencode-test-import-requests ()
+  "Return how many import status requests the fake service received."
+  (seq-count (lambda (request) (equal (plist-get request :path) "/api/experimental/migration/v1"))
+             (opencode-test-service-requests opencode-test-service)))
+
+(ert-deftest opencode-test-service-waits-for-import ()
+  "Requests wait while the service imports the earlier sessions, which look deleted until then."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service)
+          (list (opencode-test-import-route
+                 '((status . "running") (progress (label . "Clearing old events")))
+                 '((status . "running")
+                   (progress (label . "Migrating sessions") (numerator . 1) (denominator . 2)))
+                 '((status . "completed")))
+                (cons "/api/agent" (lambda (_) '(200 . ((data . [])))))))
+    (let ((opencode-service--import-interval 0.1)
+          (messages nil)
+          (answered nil))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format &rest arguments)
+                   (push (apply #'format-message format arguments) messages))))
+        (opencode-request 'get "/api/agent" :buffer nil :then (lambda (_) (setq answered t)))
+        (opencode-test-wait-for (lambda () answered)))
+      (should (= (opencode-test-import-requests) 3))
+      ;; The request went out only once the import had completed.
+      (should (equal (plist-get (car (opencode-test-service-requests opencode-test-service)) :path)
+                     "/api/agent"))
+      (should (equal (plist-get (cadr (opencode-test-service-requests opencode-test-service)) :path)
+                     "/api/experimental/migration/v1"))
+      (should (equal (reverse messages)
+                     '("OpenCode service: Clearing old events…"
+                       "OpenCode service: Migrating sessions 1/2…"
+                       "OpenCode service: earlier sessions imported")))
+      ;; Reconnecting to the same service asks no more; a new service is asked again.
+      (setq opencode-service-connection nil)
+      (opencode-request-sync 'get "/api/agent" :timeout 10)
+      (should (= (opencode-test-import-requests) 3))
+      (setf (opencode-test-service-pid opencode-test-service) 4343)
+      (opencode-test-service-register opencode-test-service)
+      (setq opencode-service-connection nil)
+      (opencode-request-sync 'get "/api/agent" :timeout 10)
+      (should (= (opencode-test-import-requests) 4)))))
+
+(ert-deftest opencode-test-service-import-failed ()
+  "A failed import is reported once, and the service is used all the same."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service)
+          (list (opencode-test-import-route '((status . "error") (error . "disk full")))
+                (cons "/api/agent" (lambda (_) '(200 . ((data . [])))))))
+    (let ((warnings nil))
+      (cl-letf (((symbol-function 'display-warning)
+                 (lambda (type message &rest _) (push (cons type message) warnings))))
+        (should (opencode-request-sync 'get "/api/agent" :timeout 10))
+        (setq opencode-service-connection nil)
+        (should (opencode-request-sync 'get "/api/agent" :timeout 10)))
+      (should (equal warnings
+                     '((opencode . "The OpenCode service could not import the earlier sessions: disk full"))))
+      (should (= (opencode-test-import-requests) 1)))))
+
+(ert-deftest opencode-test-service-import-stalled ()
+  "An import that stops making progress is given up on, with a warning."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service)
+          (list (opencode-test-import-route
+                 '((status . "running")
+                   (progress (label . "Migrating sessions") (numerator . 1) (denominator . 9))))
+                (cons "/api/agent" (lambda (_) '(200 . ((data . [])))))))
+    (let ((opencode-service--import-interval 0.1)
+          (opencode-service-import-stall-timeout 0.5)
+          (warnings nil))
+      (cl-letf (((symbol-function 'display-warning)
+                 (lambda (type message &rest _) (push (cons type message) warnings))))
+        (should (opencode-request-sync 'get "/api/agent" :timeout 10)))
+      (should (>= (opencode-test-import-requests) 4))
+      (should (equal (mapcar #'car warnings) '(opencode)))
+      (should (string-match-p "made no progress for 0.5 s" (cdar warnings))))))
+
+(ert-deftest opencode-test-service-import-unanswerable ()
+  "A service that stops answering during its import fails the waiting requests."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service)
+          (list (cons "/api/experimental/migration/v1" (lambda (_) '(500 . ((message . "boom")))))))
+    (let ((failure nil))
+      (opencode-service-ensure #'ignore (lambda (text) (setq failure text)))
+      (opencode-test-wait-for (lambda () failure))
+      (should (string-match-p "import of earlier sessions" failure))
+      (should-not opencode-service-connection))))
+
 (ert-deftest opencode-test-service-restarted-password ()
   "A 401 after the service restarted with a new password rereads the registration."
   (opencode-test-with-service

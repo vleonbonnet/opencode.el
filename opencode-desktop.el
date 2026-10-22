@@ -41,7 +41,8 @@
 (defvar desktop-save-buffer)
 
 (defcustom opencode-desktop-restore-timeout 60
-  "Seconds a session buffer may take to restore before it reports failure."
+  "Seconds a session buffer may take to restore before it reports failure.
+They count from the moment the service is ready."
   :type 'natnum
   :group 'opencode)
 
@@ -122,14 +123,17 @@ BODY runs only while ATTEMPT is the buffer's restore attempt in progress."
   (unless opencode--desktop-data (user-error "No saved session in this buffer"))
   (opencode--desktop-stop)
   (let ((attempt (setq opencode--desktop-attempt (make-symbol "attempt"))))
-    (setq opencode--desktop-timer
-          (run-at-time opencode-desktop-restore-timeout nil
-                       (opencode--desktop-current attempt ()
-                         (opencode--desktop-fail "Timed out restoring the session"))))
-    (opencode--desktop-notice "Restoring the OpenCode session…")
+    (opencode--desktop-notice "Waiting for the OpenCode service…")
     (opencode-events-connect)
+    ;; The service's start and import have deadlines of their own.
     (opencode-service-ensure
-     (opencode--desktop-current attempt (_connection) (opencode--desktop-fetch attempt))
+     (opencode--desktop-current attempt (_connection)
+       (setq opencode--desktop-timer
+             (run-at-time opencode-desktop-restore-timeout nil
+                          (opencode--desktop-current attempt ()
+                            (opencode--desktop-fail "Timed out restoring the session"))))
+       (opencode--desktop-notice "Restoring the OpenCode session…")
+       (opencode--desktop-fetch attempt))
      (opencode--desktop-current attempt (text) (opencode--desktop-fail text)))))
 
 (defun opencode--desktop-fetch (attempt)

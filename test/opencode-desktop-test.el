@@ -60,7 +60,7 @@
       (with-current-buffer buffer
         (should (derived-mode-p 'opencode-desktop-pending-mode))
         (should (equal (funcall desktop-save-buffer nil) entry))
-        (should (string-match-p "Restoring" (buffer-string))))
+        (should (string-match-p "Waiting for the OpenCode service" (buffer-string))))
       ;; Restoring the same entry again finds the placeholder.
       (should (eq (opencode-desktop-restore nil "other" entry) buffer))
       (opencode-test-service-ready)
@@ -102,6 +102,23 @@
       (with-current-buffer buffer
         (should (derived-mode-p 'opencode-desktop-pending-mode))
         (should (string-match-p "OpenCode did not start" (buffer-string)))))))
+
+(ert-deftest opencode-test-desktop-deadline-after-service ()
+  "Waiting for the service, as while it imports the earlier sessions, uses none of the restore deadline."
+  (opencode-test-with-desktop
+    (let* ((opencode-desktop-restore-timeout 0.2)
+           (buffer (opencode-desktop-restore nil "*slow service*"
+                                             (opencode-test-desktop-entry (opencode-test-scenario "text")))))
+      (push buffer placeholders)
+      (accept-process-output nil 0.5)
+      (with-current-buffer buffer
+        (should-not (string-match-p "Timed out" (buffer-string)))
+        (should opencode--desktop-attempt)
+        (should-not opencode--desktop-timer))
+      (opencode-test-service-ready)
+      (with-current-buffer buffer
+        (should (derived-mode-p 'opencode-session-mode))
+        (should-not opencode--desktop-timer)))))
 
 (ert-deftest opencode-test-desktop-late-answers-ignored ()
   "Answers to an abandoned attempt do nothing."

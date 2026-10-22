@@ -31,6 +31,8 @@ With =package-vc=:
 
 OpenCode 2 runs one background service per user. It registers its URL, process ID, version and password in =~/.local/state/opencode/service.json= (=$XDG_STATE_HOME/opencode/service.json= when set). Emacs reads that file, checks that the registered process answers, and runs =opencode service start= when none does. A restarted service is found again from the file, and running turns resume. =M-x opencode-service-restart= restarts it, for instance after installing a new build; =opencode-service-stale-functions= run when the service is older than the installed CLI. =M-x opencode-service-stop= stops it and closes Emacs's event stream, so nothing starts it again until a session is reopened.
 
+On its first start, the service imports the sessions of OpenCode 1 in the background while it already answers, and a session it has yet to import looks deleted. Emacs therefore waits for the import before sending anything, showing its progress in the echo area; an import that fails, or makes no progress for =opencode-service-import-stall-timeout= seconds, is reported as a warning and no longer waited for.
+
 * Sessions
 
 =M-x opencode= lists the sessions of the current project, including those of its worktrees, with their branch. =M-x opencode-list-all-sessions= lists every project's. In a list:
@@ -94,7 +96,7 @@ A turn that ends, a retry, and a permission request or question of a session tha
 
 * Desktop
 
-Session buffers are saved with the desktop by session ID, directory and point, and restored in place in the background. A restore that fails, because the service is unavailable or the session was deleted, leaves a placeholder that is still saved; =g= in it retries.
+Session buffers are saved with the desktop by session ID, directory and point, and restored in place in the background. A restore that fails, because the service is unavailable or the session was deleted, leaves a placeholder that is still saved; =g= in it retries. The restore's =opencode-desktop-restore-timeout= counts from the moment the service is ready, so a slow start or import does not use it up.
 
 * Development
 
