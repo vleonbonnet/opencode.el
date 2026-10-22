@@ -286,5 +286,33 @@ FUNCTION receives the event alist with members `type', `data', `id',
       (delete-process process)))
   (setq opencode-service-connection nil))
 
+(defun opencode-service-stop (&optional callback errback)
+  "Stop the shared service, then call CALLBACK with no argument.
+ERRBACK, when given, receives an error message instead on failure.
+The event stream closes first, so its reconnect cannot start another
+service; reopening a session starts one again.  Every client loses the
+service, and running turns resume once one starts, though their current
+step starts over, so interactively this asks first while any runs."
+  (interactive)
+  (when (process-live-p opencode-service--starter)
+    (user-error "An OpenCode service start or restart is already running"))
+  (when-let* (((called-interactively-p 'any))
+              (running (opencode-service-running-sessions))
+              ((> running 0)))
+    (unless (yes-or-no-p (format "%d OpenCode session%s running a turn; stop the service anyway? "
+                                 running (if (= running 1) " is" "s are")))
+      (user-error "Stop cancelled")))
+  (opencode-disconnect)
+  (opencode-service--run-cli
+   '("service" "stop")
+   (lambda (status output)
+     (cond
+      ((not (zerop status))
+       (let ((text (format "opencode service stop failed: %s" output)))
+         (if errback (funcall errback text) (message "OpenCode: %s" text))))
+      (t
+       (message "OpenCode service stopped")
+       (when callback (funcall callback)))))))
+
 (provide 'opencode-events)
 ;;; opencode-events.el ends here

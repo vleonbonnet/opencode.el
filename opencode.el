@@ -79,6 +79,10 @@
 ;;;###autoload
 (autoload 'opencode-consult-sessions "opencode" "Search every open session buffer." t)
 ;;;###autoload
+(autoload 'opencode-service-restart "opencode" "Restart the shared service." t)
+;;;###autoload
+(autoload 'opencode-service-stop "opencode" "Stop the shared service." t)
+;;;###autoload
 (autoload 'opencode-desktop-restore "opencode")
 
 ;;;###autoload

@@ -29,7 +29,7 @@ With =package-vc=:
 
 * The service
 
-OpenCode 2 runs one background service per user. It registers its URL, process ID, version and password in =~/.local/state/opencode/service.json= (=$XDG_STATE_HOME/opencode/service.json= when set). Emacs reads that file, checks that the registered process answers, and runs =opencode service start= when none does. A restarted service is found again from the file, and running turns resume. =M-x opencode-service-restart= restarts it, for instance after installing a new build; =opencode-service-stale-functions= run when the service is older than the installed CLI.
+OpenCode 2 runs one background service per user. It registers its URL, process ID, version and password in =~/.local/state/opencode/service.json= (=$XDG_STATE_HOME/opencode/service.json= when set). Emacs reads that file, checks that the registered process answers, and runs =opencode service start= when none does. A restarted service is found again from the file, and running turns resume. =M-x opencode-service-restart= restarts it, for instance after installing a new build; =opencode-service-stale-functions= run when the service is older than the installed CLI. =M-x opencode-service-stop= stops it and closes Emacs's event stream, so nothing starts it again until a session is reopened.
 
 * Sessions
 

@@ -115,6 +115,43 @@
         (opencode-service-restart #'ignore (lambda (text) (setq failure text)))
         (should (equal failure "opencode service restart failed: service is locked"))))))
 
+(ert-deftest opencode-test-service-stop ()
+  "Stopping closes the event stream first, so no reconnect starts a new service."
+  (opencode-test-with-service
+    (let ((cli nil)
+          (wanted 'unknown)
+          (stopped nil))
+      (opencode-events-connect)
+      (opencode-test-wait-for #'opencode-events-connected-p)
+      (cl-letf (((symbol-function 'opencode-service--run-cli)
+                 (lambda (arguments on-exit)
+                   (setq cli arguments
+                         wanted opencode-events--wanted)
+                   (delete-file (opencode-test-service-registration opencode-test-service))
+                   (funcall on-exit 0 ""))))
+        (opencode-service-stop (lambda () (setq stopped t)))
+        (should stopped)
+        (should (equal cli '("service" "stop")))
+        (should-not wanted)
+        (should-not opencode-service-connection)
+        (should-not (opencode-events-connected-p))
+        (should-not opencode-events--reconnect-timer)
+        ;; Nothing asks for a service once the stream is gone.
+        (setq cli nil)
+        (accept-process-output nil 1.5)
+        (should-not cli)))))
+
+(ert-deftest opencode-test-service-stop-failure ()
+  "A failed stop reaches the error callback."
+  (opencode-test-with-service
+    (let ((failure nil))
+      (cl-letf (((symbol-function 'opencode-service--run-cli)
+                 (lambda (arguments on-exit)
+                   (should (equal arguments '("service" "stop")))
+                   (funcall on-exit 1 "access denied"))))
+        (opencode-service-stop #'ignore (lambda (text) (setq failure text)))
+        (should (equal failure "opencode service stop failed: access denied"))))))
+
 (ert-deftest opencode-test-running-sessions ()
   "Running sessions are counted from the service; an absent service counts as none known."
   (opencode-test-with-service
