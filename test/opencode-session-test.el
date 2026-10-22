@@ -90,6 +90,179 @@
       (set-face-attribute 'opencode-tool-running-margin nil :foreground running)
       (set-face-attribute 'opencode-tool-margin-highlight nil :foreground finished))))
 
+;; The shell scenario runs one command in the background; the service posts its completion as a synthetic message.
+(defun opencode-test-summary-text (overlay)
+  "Return the summary line of block OVERLAY, without properties."
+  (with-current-buffer (overlay-buffer overlay)
+    (buffer-substring-no-properties (overlay-start overlay) (1- (overlay-end overlay)))))
+
+(defun opencode-test-shell-messages (function)
+  "Return the shell scenario's messages, its synthetic ones passed through FUNCTION."
+  (mapcan (lambda (message)
+            (if (equal (alist-get 'type message) "synthetic")
+                (funcall function message)
+              (list message)))
+          (alist-get 'data (opencode-test-fixture
+                            (format "messages-%s.json" (opencode-test-scenario "shell"))))))
+
+(defun opencode-test-open-shell-with (messages)
+  "Open the shell scenario's session, its transcript being MESSAGES."
+  (let ((opencode-test-routes
+         (cons (list 'get "/message\\'" (lambda (_) `((data . ,messages) (cursor)))) opencode-test-routes)))
+    (opencode-test-open (opencode-test-scenario "shell"))))
+
+(ert-deftest opencode-test-background-shell-completion ()
+  "A call that moved its command to the background says so; the completion is a shell block, replayed or live."
+  (let* ((completion (seq-find (lambda (message) (equal (alist-get 'type message) "synthetic"))
+                               (opencode-test-shell-messages #'list)))
+         (key (alist-get 'id completion))
+         (command (alist-get 'description completion)))
+    (should (equal (alist-get 'source (alist-get 'metadata completion)) "shell"))
+    (dolist (live '(nil t))
+      (opencode-test-with-server
+        (let* ((id (opencode-test-scenario "shell"))
+               (buffer (if live (opencode-test-open-empty id) (opencode-test-open id))))
+          (when live (opencode-test-dispatch (opencode-test-events id)))
+          (with-current-buffer buffer
+            (let* ((calls (seq-filter (lambda (overlay)
+                                        (equal (alist-get 'shellID (plist-get (opencode-block-data overlay) :metadata))
+                                               (alist-get 'shellID (alist-get 'metadata completion))))
+                                      (opencode-tool-blocks)))
+                   (call (seq-find (lambda (overlay) (not (eq overlay (opencode-block key)))) calls))
+                   (block (opencode-block key))
+                   (data (opencode-block-data block)))
+              (should call)
+              (should (string-suffix-p (concat command " · in the background") (opencode-test-summary-text call)))
+              (should (equal (plist-get data :type) 'tool))
+              (should (equal (plist-get data :tool) "shell"))
+              (should (equal (plist-get data :status) "completed"))
+              (should (equal (string-trim (plist-get data :output)) "background-done"))
+              (should (eq (opencode-block-face data) 'opencode-tool-margin-highlight))
+              (should (string-suffix-p (concat command " · finished in the background")
+                                       (opencode-test-summary-text block)))
+              (should (string-match-p "\\`\\$ sleep 3 && echo background-done\n# in the background\n"
+                                      (opencode--expanded-content block)))
+              (should-not (string-match-p "<shell" (opencode--expanded-content block))))))))))
+
+(ert-deftest opencode-test-background-completion-failures ()
+  "A background command that failed or was cancelled shows in the error face, with its reason."
+  (pcase-dolist (`(,state ,text ,note ,reason)
+                 '(("error" "Command failed" "failed in the background" "Failed: Command failed")
+                   ("cancelled" "Cancelled" "cancelled in the background" "Interrupted")))
+    (opencode-test-with-server
+      (let* ((key nil)
+             (messages
+              (opencode-test-shell-messages
+               (lambda (message)
+                 (let-alist message
+                   (setq key .id)
+                   (list `((id . ,.id) (type . "synthetic") (time . ,.time) (description . ,.description)
+                           (text . ,(format "<shell id=\"%s\" state=\"%s\" command=\"%s\">\n%s\n</shell>"
+                                            .metadata.jobID state .description text))
+                           (metadata (source . "shell") (shellID . ,.metadata.shellID)
+                                     (jobID . ,.metadata.jobID) (state . ,state))))))))
+             (buffer (opencode-test-open-shell-with messages)))
+        (with-current-buffer buffer
+          (let* ((block (opencode-block key))
+                 (data (opencode-block-data block)))
+            (should (equal (plist-get data :status) "error"))
+            (should (eq (opencode-block-face data) 'error))
+            (should (string-suffix-p note (opencode-test-summary-text block)))
+            (should (string-suffix-p reason (opencode--expanded-content block)))))))))
+
+(ert-deftest opencode-test-background-command-outcomes ()
+  "A completed background command that exited non-zero, was killed or timed out shows in the error face."
+  (pcase-dolist (`(,extra ,note ,face)
+                 '((((exit . 0)) "finished in the background" opencode-tool-margin-highlight)
+                   (((exit . 255)) "exited with code 255 in the background" error)
+                   (((signal . "SIGKILL")) "killed by SIGKILL in the background" error)
+                   (((timeout . t)) "timed out in the background" error)))
+    (opencode-test-with-server
+      (let* ((key nil)
+             (messages (opencode-test-shell-messages
+                        (lambda (message)
+                          (setq key (alist-get 'id message))
+                          (let ((metadata (append extra (assq-delete-all
+                                                         'exit (copy-alist (alist-get 'metadata message))))))
+                            (list (cons (cons 'metadata metadata) (assq-delete-all 'metadata (copy-alist message))))))))
+             (buffer (opencode-test-open-shell-with messages)))
+        (with-current-buffer buffer
+          (let* ((block (opencode-block key))
+                 (data (opencode-block-data block)))
+            (should (equal (plist-get data :status) "completed"))
+            (should (equal (string-trim (plist-get data :output)) "background-done"))
+            (should (eq (opencode-block-face data) face))
+            (should (string-suffix-p note (opencode-test-summary-text block)))))))))
+
+(ert-deftest opencode-test-background-subagent-completion ()
+  "A background subagent's completion is a subagent block holding its answer and opening its session."
+  (opencode-test-with-server
+    (let* ((completion
+            '((id . "msg_test_background_subagent") (type . "synthetic") (time (created . 1))
+              (description . "Survey the fixtures")
+              (text . "<subagent sessionID=\"ses_test_child\" state=\"completed\" description=\"Survey the fixtures\">\nThree fixtures.\n</subagent>")
+              (metadata (source . "subagent") (childID . "ses_test_child") (agent . "explore")
+                        (state . "completed"))))
+           (buffer (opencode-test-open-shell-with
+                    (opencode-test-shell-messages (lambda (message) (list message completion)))))
+           opened)
+      (with-current-buffer buffer
+        (let* ((block (opencode-block "msg_test_background_subagent"))
+               (data (opencode-block-data block)))
+          (should (equal (plist-get data :tool) "subagent"))
+          (should (equal (plist-get data :session-id) "ses_test_child"))
+          (should (equal (plist-get data :output) "Three fixtures."))
+          (should (string-suffix-p "Explore: Survey the fixtures · finished in the background"
+                                   (opencode-test-summary-text block)))
+          (cl-letf (((symbol-function 'opencode-session-open-by-id) (lambda (id &rest _) (setq opened id))))
+            (goto-char (overlay-start block))
+            (opencode-open-link-at-point))
+          (should (equal opened "ses_test_child")))))))
+
+(ert-deftest opencode-test-background-completion-unwrapped ()
+  "A completion whose text lacks the wrapper the service writes shows all of its text."
+  (opencode-test-with-server
+    (let* ((key nil)
+           (messages (opencode-test-shell-messages
+                      (lambda (message)
+                        (setq key (alist-get 'id message))
+                        (list (cons '(text . "background-done, unwrapped")
+                                    (assq-delete-all 'text (copy-alist message)))))))
+           (buffer (opencode-test-open-shell-with messages)))
+      (with-current-buffer buffer
+        (should (equal (plist-get (opencode-block-data (opencode-block key)) :output)
+                       "background-done, unwrapped"))))))
+
+(ert-deftest opencode-test-background-note ()
+  "Only a shell or subagent call that left its job running is marked as in the background."
+  (should (equal (opencode-tool-background-note
+                  '(:tool "subagent" :status "completed" :metadata ((sessionID . "ses_x") (status . "running"))))
+                 "in the background"))
+  (should-not (opencode-tool-background-note
+               '(:tool "subagent" :status "completed" :metadata ((sessionID . "ses_x") (status . "completed")))))
+  (should-not (opencode-tool-background-note
+               '(:tool "shell" :status "running" :metadata ((status . "running")))))
+  (should-not (opencode-tool-background-note
+               '(:tool "slack_post" :status "completed" :metadata ((status . "running"))))))
+
+(ert-deftest opencode-test-other-synthetic-messages-stay-notices ()
+  "Synthetic messages that are no background job's completion, or whose text is not one, stay notices."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open (opencode-test-scenario "switch"))
+      (should-not (opencode-tool-blocks))
+      (should (string-match-p "synthetic message" (opencode-test-text (current-buffer))))))
+  (opencode-test-with-server
+    (let* ((key nil)
+           (messages (opencode-test-shell-messages
+                      (lambda (message)
+                        (setq key (alist-get 'id message))
+                        ;; A user's shell command, whose own shell block is drawn already.
+                        (list (cons '(text . "The following shell command was executed by the user:\n<shell>")
+                                    (assq-delete-all 'description (assq-delete-all 'text (copy-alist message))))))))
+           (buffer (opencode-test-open-shell-with messages)))
+      (with-current-buffer buffer
+        (should (eq (plist-get (opencode-block-data (opencode-block key)) :type) 'notice))))))
+
 ;; Signed reasoning as Anthropic sends it: the signature's decoded header names the block's kind.
 (defun opencode-test-signature (kind)
   "Return a signature whose decoded header names block KIND."

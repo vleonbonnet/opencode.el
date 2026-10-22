@@ -36,6 +36,11 @@
 ;; other clients are rendered.  A prompt sent while a turn runs steers
 ;; it by default (`opencode-prompt-delivery').
 ;;
+;; A shell command or subagent run in the background ends its tool call
+;; at once.  The server posts the job's completion later as a synthetic
+;; message, which is drawn as a block of the same tool, colored by how
+;; the job ended.
+;;
 ;; Nothing is replayed after the stream reconnects, so every open buffer
 ;; reconciles with the server then, and reloads its transcript when the
 ;; session changed meanwhile.
@@ -659,6 +664,64 @@ An error already shown during the current turn is not repeated."
           (setq opencode-session-tokens total)
           (force-mode-line-update))))))
 
+(defun opencode--unwrap-notification (text tag attributes)
+  "Return TEXT without its TAG element wrapper, or TEXT when it has none.
+ATTRIBUTES are the element's (NAME . VALUE) pairs, in the order the
+service writes them, unescaped as it writes them."
+  (let ((prefix (format "<%s %s>\n" tag
+                        (mapconcat (lambda (attribute) (format "%s=\"%s\"" (car attribute) (cdr attribute)))
+                                   attributes " ")))
+        (suffix (format "\n</%s>" tag)))
+    (if (and (>= (length text) (+ (length prefix) (length suffix)))
+             (string-prefix-p prefix text)
+             (string-suffix-p suffix text))
+        (substring text (length prefix) (- (length suffix)))
+      text)))
+
+(defun opencode--background-completion (description text metadata)
+  "Return the tool block of a background job's completion, or nil.
+DESCRIPTION, TEXT and METADATA are those of the synthetic message the
+service posts once a shell command or subagent run in the background
+ends.  The value is a plist of the block's `:tool', `:input', `:text'
+\(TEXT unwrapped) and `:session-id'.  A user's shell command has no
+DESCRIPTION: its own shell block shows it already."
+  (let-alist metadata
+    (when (and description (member .state '("completed" "error" "cancelled")))
+      (pcase .source
+        ((and "shell" (guard (or .jobID .shellID)))
+         (list :tool "shell"
+               :input `((command . ,description) (background . t))
+               :text (opencode--unwrap-notification
+                      text "shell" `((id . ,(or .jobID .shellID)) (state . ,.state) (command . ,description)))))
+        ((and "subagent" (guard .childID))
+         (list :tool "subagent"
+               :input `((agent . ,.agent) (description . ,description) (background . t))
+               :session-id .childID
+               :text (opencode--unwrap-notification
+                      text "subagent"
+                      `((sessionID . ,.childID) (state . ,.state) (description . ,description)))))))))
+
+(defun opencode--render-synthetic (id description text metadata)
+  "Render synthetic message ID with DESCRIPTION, TEXT and METADATA.
+A background job's completion is a block of the job's tool, in the
+error face unless the job completed; any other message is a notice."
+  (opencode-open-block 'tool)
+  (if-let* ((completion (opencode--background-completion description text metadata)))
+      (let* ((state (alist-get 'state metadata))
+             (completed (equal state "completed"))
+             (overlay (opencode-tool-start id (plist-get completion :tool) (plist-get completion :input)
+                                           (if completed "completed" "error"))))
+        (opencode-block-update
+         overlay
+         :background-state state
+         :metadata metadata
+         :session-id (plist-get completion :session-id)
+         :output (and completed (plist-get completion :text))
+         :error (unless completed
+                  `((type . ,(if (equal state "cancelled") "aborted" ""))
+                    (message . ,(string-trim (plist-get completion :text)))))))
+    (opencode-notice-block (or description "synthetic message") text id)))
+
 (defun opencode-replay-message (message)
   "Render projected MESSAGE of the transcript."
   (pcase (alist-get 'type message)
@@ -666,9 +729,8 @@ An error already shown during the current turn is not repeated."
      (opencode--render-user-prompt (opencode--user-message-text message) (alist-get 'id message)))
     ("assistant" (opencode--render-assistant-content message))
     ("synthetic"
-     (opencode-open-block 'tool)
-     (opencode-notice-block (or (alist-get 'description message) "synthetic message")
-                            (alist-get 'text message) (alist-get 'id message)))
+     (opencode--render-synthetic (alist-get 'id message) (alist-get 'description message)
+                                 (alist-get 'text message) (alist-get 'metadata message)))
     ("system"
      (opencode-open-block 'tool)
      (opencode-notice-block (or (alist-get 'description message) "Instructions updated")
@@ -928,9 +990,8 @@ reasoning encrypted stream empty blocks, which replay omits too."
        (opencode--render-user-prompt (opencode--user-message-text payload) id))
       ("synthetic"
        (opencode-before-prompt
-         (opencode-open-block 'tool)
-         (opencode-notice-block (or (alist-get 'description payload) "synthetic message")
-                                (alist-get 'text payload) id))))))
+         (opencode--render-synthetic id (alist-get 'description payload)
+                                     (alist-get 'text payload) (alist-get 'metadata payload)))))))
 
 (defun opencode--event-inbox (event)
   "Handle the `session.inbox.*' EVENT.
@@ -963,9 +1024,8 @@ once delivered: that is where the transcript places them."
       (opencode-before-prompt
         (pcase (alist-get 'type event)
           ("session.synthetic"
-           (opencode-open-block 'tool)
-           (opencode-notice-block (or (alist-get 'description data) "synthetic message")
-                                  (alist-get 'text data) id))
+           (opencode--render-synthetic id (alist-get 'description data)
+                                       (alist-get 'text data) (alist-get 'metadata data)))
           ("session.instructions.updated"
            (when-let* ((text (alist-get 'text data)))
              (opencode-open-block 'tool)

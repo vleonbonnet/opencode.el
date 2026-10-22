@@ -298,14 +298,42 @@ permission to expand it."
       ('interrupted "Interrupted")
       (_ (format "Failed: %s" message)))))
 
-(defun opencode-tool-error-summary (tool input error)
-  "Return TOOL's summary for INPUT with a status icon for ERROR."
+(defun opencode-tool-error-summary (tool input error &optional note)
+  "Return TOOL's summary for INPUT with a status icon for ERROR, then NOTE."
   (let ((icon (propertize (if (memq (car (opencode-tool-error-info error))
                                     '(blocked rejected dismissed))
                               "\uf05e"          ; nf-fa-ban
                             "\uf057")           ; nf-fa-times_circle
                           'face 'error 'font-lock-face 'error)))
-    (opencode-tool-summary tool input 'error icon)))
+    (opencode-tool-summary tool input 'error icon nil note)))
+
+(defun opencode-tool-background-outcome (data)
+  "Return how the background job of completion block DATA ended, or nil.
+The value is (TEXT . FAILED).  A completion block stands for the job's
+run, so a command that exited non-zero, was killed or timed out failed;
+blocks other than completions give nil."
+  (when-let* ((state (plist-get data :background-state)))
+    (let-alist (plist-get data :metadata)
+      (pcase state
+        ("completed"
+         (cond (.timeout '("timed out" . t))
+               (.signal (cons (format "killed by %s" .signal) t))
+               ((and (numberp .exit) (/= .exit 0)) (cons (format "exited with code %d" .exit) t))
+               (t '("finished"))))
+        ("error" '("failed" . t))
+        (_ (cons state t))))))
+
+(defun opencode-tool-background-note (data)
+  "Return the note ending the summary of tool block DATA about background jobs.
+A shell command or subagent the model ran in the background ends its
+call at once, still running: its block says so.  The block of its
+completion, posted later, says how it ended.  Other blocks get nil."
+  (if-let* ((outcome (opencode-tool-background-outcome data)))
+      (concat (car outcome) " in the background")
+    (and (member (plist-get data :tool) '("shell" "subagent"))
+         (equal (plist-get data :status) "completed")
+         (equal (alist-get 'status (plist-get data :metadata)) "running")
+         "in the background")))
 
 ;;;; Reasoning summaries
 
@@ -455,7 +483,7 @@ in another color."
 (defun opencode-block-face (data)
   "Return the display face of block DATA."
   (cond
-   ((plist-get data :error) 'error)
+   ((or (plist-get data :error) (cdr (opencode-tool-background-outcome data))) 'error)
    ((plist-get data :waiting) 'opencode-attention)
    ((member (plist-get data :status) '("streaming" "running")) 'opencode-tool-running-margin)
    ((eq (plist-get data :type) 'reasoning) 'opencode-reasoning-margin-highlight)
@@ -471,13 +499,14 @@ in another color."
      ((plist-get data :waiting)
       (opencode-tool-summary tool input face (opencode-pending-prompt-icon)
                              nil (plist-get data :waiting-description)))
-     ((plist-get data :error) (opencode-tool-error-summary tool input (plist-get data :error)))
+     ((plist-get data :error)
+      (opencode-tool-error-summary tool input (plist-get data :error) (opencode-tool-background-note data)))
      ((and (equal tool "question") (plist-get data :answers))
       (opencode-tool-summary tool input face nil
                              (opencode-question-answer-description input (plist-get data :answers))))
      ((equal (plist-get data :status) "streaming")
       (opencode-tool-summary tool input face nil "…"))
-     (t (opencode-tool-summary tool input face)))))
+     (t (opencode-tool-summary tool input face nil nil (opencode-tool-background-note data))))))
 
 (defun opencode-refresh-block (overlay)
   "Redraw OVERLAY's summary, colors and expanded content after its data changed."

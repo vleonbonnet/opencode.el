@@ -47,6 +47,7 @@ Opening a session renders its projected messages; afterwards the event stream dr
 - A prompt sent from Emacs carries an ID generated locally, in the service's ID layout, so its echo on the stream is recognized and not rendered twice; prompts of other clients render when the inbox delivers them, where replay places them.
 - The package tracks its own prompt start marker: =comint-last-prompt= would count the last line of output as the prompt.
 - Notices are inserted before the idle prompt, and a turn started elsewhere lifts the prompt first.
+- A background job's completion is a synthetic message, keyed by its message ID, which its inbox item shares. Its metadata makes it a block of the job's tool, and the element wrapping its text is removed only when it is exactly what the service writes, so an unexpected text shows whole.
 
 * Fontification that survives
 
