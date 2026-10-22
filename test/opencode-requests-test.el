@@ -122,6 +122,59 @@
                            '((answer . ((q0 . "Blue") (q1 . ["Apple" "Plum"])))))))
           (should-not opencode-pending-forms))))))
 
+(defun opencode-test-tool-form (call-id)
+  "Return a web search consent form, as tool call CALL-ID asks it."
+  `((id . "frm_websearch") (sessionID . "ses_test") (title . "Web Search")
+    (metadata (kind . "websearch.provider") (tool (messageID . "msg_test") (id . ,call-id)))
+    (fields ((key . "choice") (type . "string") (required . t) (custom . :false)
+             (description . "Allow OpenCode to search the web for up-to-date information?")
+             (options ((value . "allow") (label . "Allow search via Exa"))
+                      ((value . "disable") (label . "Disable web search")))))))
+
+(defun opencode-test-summary (overlay)
+  "Return block OVERLAY's summary line."
+  (buffer-substring-no-properties (overlay-start overlay) (1- (overlay-end overlay))))
+
+(ert-deftest opencode-test-tool-form-on-its-block ()
+  "A form another tool asks marks that tool's block, named by its title, without expanding it."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "read-tools"))
+           (buffer (opencode-test-open-empty id)))
+      (opencode-test-dispatch-until (opencode-test-events id) "session.tool.called")
+      (with-current-buffer buffer
+        (let* ((overlay (car (sort (opencode-tool-blocks) :key #'overlay-start)))
+               (entry (opencode-form-queue
+                       (opencode-test-tool-form (plist-get (opencode-block-data overlay) :key)))))
+          (should (eq (opencode--form-block entry) overlay))
+          (should (plist-get (opencode-block-data overlay) :waiting))
+          (should (eq (opencode-block-face (opencode-block-data overlay)) 'opencode-attention))
+          (should (string-suffix-p " · Web Search" (opencode-test-summary overlay)))
+          (should-not (overlay-get overlay 'opencode-expanded))
+          ;; The block shows the form, so no separate notice does.
+          (should-not (string-search "Form: Web Search" (buffer-string)))
+          (opencode--form-resolved "frm_websearch")
+          (should-not (plist-get (opencode-block-data overlay) :waiting))
+          (should-not (string-search "Web Search" (opencode-test-summary overlay))))))))
+
+(ert-deftest opencode-test-tool-form-before-its-block ()
+  "A form queued before its tool's block is drawn marks the block once it is."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "read-tools"))
+           (buffer (opencode-test-open-empty id))
+           (events (opencode-test-events id))
+           (call (alist-get 'id (alist-get 'data (seq-find (lambda (event)
+                                                             (equal (alist-get 'type event)
+                                                                    "session.tool.input.started"))
+                                                           events)))))
+      (with-current-buffer buffer
+        (opencode-form-queue (opencode-test-tool-form call)))
+      (opencode-test-dispatch-until events "session.tool.called")
+      (with-current-buffer buffer
+        (let ((overlay (opencode-block call)))
+          (should overlay)
+          (should (plist-get (opencode-block-data overlay) :waiting))
+          (should (string-suffix-p " · Web Search" (opencode-test-summary overlay))))))))
+
 (ert-deftest opencode-test-question-answers-in-summary ()
   "A completed question block summarizes each question with its answers."
   (opencode-test-with-server

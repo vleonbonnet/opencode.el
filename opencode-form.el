@@ -113,43 +113,50 @@ holds one saved selection (MARKED-VECTOR . CUSTOM-TEXT) per field.")
 ;;;; Question blocks
 
 (defun opencode--form-block (entry)
-  "Return the live block of the question tool call that asked ENTRY."
+  "Return the live block of the tool call that asked ENTRY."
   (when-let* ((id (plist-get entry :call-id)))
     (opencode-block id)))
 
-(defun opencode--set-question-waiting (overlay waiting)
-  "Mark question block OVERLAY as WAITING for an answer, expanded meanwhile."
-  (let ((data (opencode-block-data overlay)))
+(defun opencode--set-form-waiting (overlay waiting &optional title)
+  "Mark tool block OVERLAY as WAITING for a form's answer.
+A question block is expanded meanwhile, since it lists its questions;
+another tool's block stays collapsed, its summary naming the form by
+TITLE."
+  (let* ((data (opencode-block-data overlay))
+         (question (equal (plist-get data :tool) "question")))
     (unless (eq (and (eq (plist-get data :waiting-kind) 'question) t) (and waiting t))
       (opencode-block-update overlay :waiting (and waiting t)
-                             :waiting-kind (and waiting 'question))
+                             :waiting-kind (and waiting 'question)
+                             :waiting-description (and waiting (not question) title))
       (overlay-put overlay 'help-echo
                    (and waiting (substitute-command-keys "Question pending.  \\[opencode-respond] answers it.")))
-      (opencode-call-preserving-viewport
-       (overlay-buffer overlay)
-       (lambda ()
-         (opencode--refresh-expanded overlay)
-         (when waiting (opencode-expand-block overlay))))
+      (when question
+        (opencode-call-preserving-viewport
+         (overlay-buffer overlay)
+         (lambda ()
+           (opencode--refresh-expanded overlay)
+           (when waiting (opencode-expand-block overlay)))))
       (force-mode-line-update))))
 
 (defun opencode--form-attach (overlay)
-  "Mark newly inserted question block OVERLAY when its form is queued."
+  "Mark newly inserted tool block OVERLAY when a form it asked is queued."
   (let ((data (opencode-block-data overlay)))
-    (when (and (equal (plist-get data :tool) "question")
+    (when (and (eq (plist-get data :type) 'tool)
                (not (member (plist-get data :status) '("completed" "error"))))
       (when-let* ((entry (opencode--form-find :call-id (plist-get data :key))))
         (unless (plist-get entry :submitted)
-          (opencode--set-question-waiting overlay t))))))
+          (opencode--set-form-waiting overlay t (alist-get 'title (plist-get entry :form))))))))
 
 (defun opencode--form-block-finished (overlay)
-  "Collapse question block OVERLAY once answered and release its form."
+  "Release the form tool block OVERLAY asked, once the call ended.
+A question block, expanded while it waited, collapses."
   (let ((data (opencode-block-data overlay)))
     (when (equal (plist-get data :tool) "question")
-      (opencode--set-question-waiting overlay nil)
+      (opencode--set-form-waiting overlay nil)
       (opencode-call-preserving-viewport (overlay-buffer overlay)
-                                         (lambda () (opencode-collapse-block overlay)))
-      (when-let* ((entry (opencode--form-find :call-id (plist-get data :key))))
-        (opencode--form-resolved (plist-get entry :id))))))
+                                         (lambda () (opencode-collapse-block overlay))))
+    (when-let* ((entry (opencode--form-find :call-id (plist-get data :key))))
+      (opencode--form-resolved (plist-get entry :id)))))
 
 (defun opencode-format-questions (questions &optional answers)
   "Return QUESTIONS, the question tool's input, with their options.
@@ -220,7 +227,7 @@ shows typed answers in place of the option keys."
       (let ((entry (opencode--form-entry form)))
         (setq opencode-pending-forms (append opencode-pending-forms (list entry)))
         (if-let* ((overlay (opencode--form-block entry)))
-            (opencode--set-question-waiting overlay t)
+            (opencode--set-form-waiting overlay t (alist-get 'title form))
           (opencode-output-notice
            (format "%s %s" (if (opencode-form-question-p form) "Question:" "Form:")
                    (or (alist-get 'title form) id))
@@ -247,7 +254,7 @@ shows typed answers in place of the option keys."
     (when (eq entry (plist-get opencode--active-form :entry))
       (opencode--form-close-transient))
     (when-let* ((overlay (opencode--form-block entry)))
-      (opencode--set-question-waiting overlay nil))
+      (opencode--set-form-waiting overlay nil))
     (force-mode-line-update)
     (opencode-request-state-changed)))
 
