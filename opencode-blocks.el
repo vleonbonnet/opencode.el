@@ -413,6 +413,7 @@ every summary replacement."
       (overlay-put overlay 'opencode-collapsible t)
       (overlay-put overlay 'opencode-expanded nil)
       (overlay-put overlay 'opencode-data data)
+      (overlay-put overlay 'opencode-summary summary)
       (overlay-put overlay 'before-string (opencode-disclosure-string nil face))
       (overlay-put overlay 'keymap opencode-collapsible-keymap)
       (overlay-put overlay 'mouse-face 'highlight)
@@ -422,11 +423,14 @@ every summary replacement."
       overlay)))
 
 (defun opencode-replace-summary (overlay summary)
-  "Replace OVERLAY's summary text with SUMMARY, unless it already shows it."
+  "Replace OVERLAY's summary text with SUMMARY, unless it already shows it.
+Faces count: a finished call's summary reads as its running one did,
+in another color."
   (let ((inhibit-read-only t)
         (start (overlay-start overlay))
         (end (overlay-end overlay)))
-    (unless (equal summary (buffer-substring-no-properties start (1- end)))
+    (unless (and (equal-including-properties summary (overlay-get overlay 'opencode-summary))
+                 (equal summary (buffer-substring-no-properties start (1- end))))
       ;; Keep an adjacent expansion outside the summary while replacing it.
       (overlay-put overlay 'front-advance nil)
       (unwind-protect
@@ -436,6 +440,7 @@ every summary replacement."
             (insert (opencode-fontify-as summary 'verbatim))
             (move-overlay overlay start (1+ (point))))
         (overlay-put overlay 'front-advance t))
+      (overlay-put overlay 'opencode-summary summary)
       (opencode-summary-fit-queue overlay))))
 
 (defun opencode-style-block (overlay face)

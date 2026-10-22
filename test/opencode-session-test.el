@@ -58,6 +58,38 @@
           (opencode-test-dispatch (opencode-test-events id))
           (should (equal (opencode-test-text live) replayed)))))))
 
+(defun opencode-test-label-boxes (buffer)
+  "Return the box colors of BUFFER's tool block labels, in buffer order."
+  (with-current-buffer buffer
+    (mapcar (lambda (overlay)
+              (let ((start (overlay-start overlay)))
+                (seq-some (lambda (position)
+                            (let ((face (get-text-property position 'font-lock-face)))
+                              (and (consp face) (plist-get (plist-get face :box) :color))))
+                          (number-sequence start (save-excursion (goto-char start) (1- (line-end-position)))))))
+            (sort (opencode-tool-blocks) :key #'overlay-start))))
+
+(ert-deftest opencode-test-live-tool-colors-match-replay ()
+  "Finished live tool blocks take the colors replayed ones are drawn in, labels included."
+  (let ((running (face-attribute 'opencode-tool-running-margin :foreground))
+        (finished (face-attribute 'opencode-tool-margin-highlight :foreground)))
+    (unwind-protect
+        (progn
+          (set-face-attribute 'opencode-tool-running-margin nil :foreground "blue")
+          (set-face-attribute 'opencode-tool-margin-highlight nil :foreground "green")
+          (dolist (scenario '("read-tools" "shell" "edit-tools"))
+            (opencode-test-with-server
+              (let* ((id (opencode-test-scenario scenario))
+                     (replayed (opencode-test-label-boxes (opencode-test-open id))))
+                (kill-buffer (gethash id opencode-session-buffers))
+                (let ((live (opencode-test-open-empty id)))
+                  (opencode-test-dispatch (opencode-test-events id))
+                  (should (member "green" replayed))
+                  (should-not (member "blue" replayed))
+                  (should (equal (opencode-test-label-boxes live) replayed)))))))
+      (set-face-attribute 'opencode-tool-running-margin nil :foreground running)
+      (set-face-attribute 'opencode-tool-margin-highlight nil :foreground finished))))
+
 ;; Signed reasoning as Anthropic sends it: the signature's decoded header names the block's kind.
 (defun opencode-test-signature (kind)
   "Return a signature whose decoded header names block KIND."
