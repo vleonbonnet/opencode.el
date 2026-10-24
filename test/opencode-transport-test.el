@@ -51,6 +51,24 @@ two locations of one directory."
            (cdr (opencode-request-directory-header
                  (opencode-test-lowercase-drive opencode-test-workspace))))))
 
+(ert-deftest opencode-test-network-share-uses-its-drive ()
+  "A directory on a mapped network share is spelled with the drive it is mapped to.
+Imported sessions name a share by its UNC path while `file-truename' of a
+link to the drive gives the drive, and the service would key the two as
+separate locations."
+  (skip-unless (memq system-type '(windows-nt ms-dos)))
+  (let ((opencode--network-drives nil))
+    (cl-letf (((symbol-function 'w32-read-registry)
+               (lambda (root key name)
+                 (and (eq root 'HKCU) (equal key "Network\\Q") (equal name "RemotePath")
+                      "\\\\SERVER\\Share")))
+              ((symbol-function 'file-truename) #'identity))
+      (should (equal (opencode-normalize-directory "//server/share/Notes/") "Q:/Notes/"))
+      (should (equal (opencode-directory-name "//SERVER/Share/Notes") "Q:/Notes"))
+      (should (equal (opencode-normalize-directory "//SERVER/Share") "Q:/"))
+      ;; A share no drive is mapped to keeps its UNC name.
+      (should (equal (opencode-normalize-directory "//other/share/x/") "//other/share/x/")))))
+
 (ert-deftest opencode-test-request-errors ()
   "Failed requests carry the status and the server's message."
   (opencode-test-with-service

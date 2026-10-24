@@ -31,6 +31,8 @@
 (require 'project)
 (require 'subr-x)
 
+(declare-function w32-read-registry "w32fns.c" (root key name))
+
 (defgroup opencode nil
   "Emacs client for the OpenCode 2 server."
   :group 'applications
@@ -116,12 +118,52 @@ them avoids an expensive fallback search on every redisplay."
       (concat (upcase (substring name 0 1)) (substring name 1))
     name))
 
+(defvar opencode--network-drives nil
+  "Cons (TIME . DRIVES) of the network drives read at TIME.
+See `opencode--network-drives'.")
+
+(defun opencode--network-drives ()
+  "Return the user's mapped network drives as ((SHARE . ROOT) ...).
+SHARE is a share's UNC name as a directory, //HOST/SHARE/, and ROOT the
+root of the drive mapped to it, such as Z:/.  Windows keeps the
+mappings in the registry, read at most once a minute.  A drive is not
+probed: a disconnected share would stall the request, and neither of
+its names reaches it until it reconnects."
+  (unless (and opencode--network-drives
+               (< (- (float-time) (car opencode--network-drives)) 60))
+    (setq opencode--network-drives
+          (cons (float-time)
+                (and (fboundp 'w32-read-registry)
+                     (seq-keep (lambda (letter)
+                                 (when-let* ((remote (ignore-errors
+                                                       (w32-read-registry
+                                                        'HKCU (format "Network\\%c" letter) "RemotePath")))
+                                             ((stringp remote)))
+                                   (cons (file-name-as-directory (string-replace "\\" "/" remote))
+                                         (format "%c:/" letter))))
+                               (number-sequence ?A ?Z))))))
+  (cdr opencode--network-drives))
+
+(defun opencode--mapped-drive-name (name)
+  "Return directory NAME through the drive its network share is mapped to, if any."
+  (or (and (memq system-type '(windows-nt ms-dos))
+           (string-prefix-p "//" name)
+           (seq-some (lambda (drive)
+                       (when (string-prefix-p (car drive) name t)
+                         (concat (cdr drive) (substring name (length (car drive))))))
+                     (opencode--network-drives)))
+      name))
+
 (defun opencode-normalize-directory (directory)
   "Return DIRECTORY as a canonical absolute directory name.
 Symbolic links are resolved, so one project reached through two paths
-maps to one location.  On Windows the drive letter is upcased, as the
-server spells it: it keys locations by the exact string it receives."
-  (opencode--upcase-drive (file-name-as-directory (file-truename (expand-file-name directory)))))
+maps to one location.  On Windows a network share is named by the drive
+mapped to it, as a link to the drive resolves, and the drive letter is
+upcased, as the server spells it: it keys locations by the exact string
+it receives."
+  (opencode--upcase-drive
+   (opencode--mapped-drive-name
+    (file-name-as-directory (file-truename (expand-file-name directory))))))
 
 (defun opencode-directory-name (directory)
   "Return DIRECTORY as the server names it: normalized, with no trailing slash.
