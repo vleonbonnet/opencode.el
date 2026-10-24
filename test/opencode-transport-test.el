@@ -35,13 +35,21 @@
                      (opencode-test-service-url opencode-test-service)))
       (let ((request (opencode-test-last-request "/api/agent")))
         (should (equal (cdr (assoc "x-opencode-directory" (plist-get request :headers)))
-                       (url-hexify-string (directory-file-name
-                                           (opencode-normalize-directory opencode-test-workspace))))))
+                       (url-hexify-string (opencode-directory-name opencode-test-workspace)))))
       ;; Bodies are UTF-8 JSON.
       (let ((response (opencode-request-sync 'post "/api/session" :body '((title . "Café ☕")) :timeout 10)))
         (should (equal (json-parse-string (alist-get 'echo (opencode-request-data response))
                                           :object-type 'alist)
                        '((title . "Café ☕"))))))))
+
+(ert-deftest opencode-test-directory-header-capital-drive ()
+  "The directory header spells a Windows drive letter as a capital.
+The service keys locations by the exact string, so `c:' and `C:' would be
+two locations of one directory."
+  (skip-unless (memq system-type '(windows-nt ms-dos)))
+  (should (opencode-test-capital-drive-p
+           (cdr (opencode-request-directory-header
+                 (opencode-test-lowercase-drive opencode-test-workspace))))))
 
 (ert-deftest opencode-test-request-errors ()
   "Failed requests carry the status and the server's message."

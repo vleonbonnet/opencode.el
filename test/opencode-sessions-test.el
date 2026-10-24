@@ -215,6 +215,31 @@ and filters sent with it are ignored."
                             opencode-test-requests))
           (should opencode--session-list-sessions))))))
 
+(ert-deftest opencode-test-session-lists-capital-drive ()
+  "Lists of a directory outside any project filter on it with a capital drive letter."
+  (skip-unless (memq system-type '(windows-nt ms-dos)))
+  (opencode-test-with-sessions
+    (let ((outside (opencode-test-lowercase-drive
+                    (file-name-directory (directory-file-name temporary-file-directory)))))
+      ;; Requests are recorded newest first; later pages carry only the cursor.
+      (cl-flet ((filtered ()
+                  (alist-get 'directory
+                             (plist-get (seq-find (lambda (request)
+                                                    (equal (plist-get request :path) "/api/session"))
+                                                  (reverse opencode-test-requests))
+                                        :query))))
+        (with-temp-buffer
+          (opencode-session-list-mode)
+          (setq opencode--session-list-scope (cons outside nil))
+          (setq opencode-test-requests nil)
+          (opencode-session-list-refresh)
+          (should (opencode-test-capital-drive-p (filtered))))
+        (setq opencode-test-requests nil)
+        (cl-letf (((symbol-function 'opencode-project-directory) (lambda () outside))
+                  ((symbol-function 'opencode--select-session) #'ignore))
+          (opencode-select-session))
+        (should (opencode-test-capital-drive-p (filtered)))))))
+
 (ert-deftest opencode-test-toggle-mcp ()
   "A connected server is disconnected and a disabled one connected."
   (opencode-test-with-server

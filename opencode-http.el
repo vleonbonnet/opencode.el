@@ -99,7 +99,7 @@ goes to `message'."
 (defun opencode-request-directory-header (directory)
   "Return the directory header for DIRECTORY, URI-encoded as the server expects."
   (cons "x-opencode-directory"
-        (url-hexify-string (directory-file-name (opencode-normalize-directory directory)))))
+        (url-hexify-string (opencode-directory-name directory))))
 
 (defun opencode-request--parse ()
   "Parse the response body in the current buffer, nil when empty."

@@ -472,7 +472,7 @@ is otherwise reported.  NO-DISPLAY leaves every window alone."
                 (let ((model (or model (opencode-new-session-model agent directory))))
                   (opencode-request
                    'post "/api/session" :directory directory :buffer nil
-                   :body `((location . ((directory . ,(directory-file-name directory))))
+                   :body `((location . ((directory . ,(opencode-directory-name directory))))
                            ,@(when title `((title . ,title)))
                            ,@(when agent `((agent . ,agent)))
                            ,@(when model `((model . ,model))))

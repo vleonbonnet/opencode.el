@@ -33,6 +33,16 @@
   (with-temp-file (expand-file-name name opencode-test-workspace)
     (insert name "\n")))
 
+(defun opencode-test-lowercase-drive (directory)
+  "Return DIRECTORY with a lowercase drive letter, as Emacs spells it on Windows."
+  (concat (downcase (substring directory 0 1)) (substring directory 1)))
+
+(defun opencode-test-capital-drive-p (directory)
+  "Return non-nil when DIRECTORY starts with a capital drive letter.
+The letter may be followed by a colon or, URI-encoded, by %3A."
+  (let ((case-fold-search nil))
+    (string-match-p "\\`[A-Z]\\(?::/\\|%3A%2F\\)" directory)))
+
 (defun opencode-test-substitute (text)
   "Replace the fixture placeholders in TEXT."
   (let ((workspace (directory-file-name opencode-test-workspace)))

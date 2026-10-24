@@ -109,16 +109,25 @@ them avoids an expensive fallback search on every redisplay."
 
 ;;;; Helpers
 
+(defun opencode--upcase-drive (name)
+  "Return file NAME with a Windows drive letter upcased."
+  (if (and (memq system-type '(windows-nt ms-dos))
+           (string-match-p "\\`[a-z]:" name))
+      (concat (upcase (substring name 0 1)) (substring name 1))
+    name))
+
 (defun opencode-normalize-directory (directory)
   "Return DIRECTORY as a canonical absolute directory name.
 Symbolic links are resolved, so one project reached through two paths
 maps to one location.  On Windows the drive letter is upcased, as the
 server spells it: it keys locations by the exact string it receives."
-  (let ((name (file-name-as-directory (file-truename (expand-file-name directory)))))
-    (if (and (memq system-type '(windows-nt ms-dos))
-             (string-match-p "\\`[a-z]:" name))
-        (concat (upcase (substring name 0 1)) (substring name 1))
-      name)))
+  (opencode--upcase-drive (file-name-as-directory (file-truename (expand-file-name directory)))))
+
+(defun opencode-directory-name (directory)
+  "Return DIRECTORY as the server names it: normalized, with no trailing slash.
+On Windows `directory-file-name' lowercases the drive letter again, so
+it is upcased after it; otherwise one directory would be two locations."
+  (opencode--upcase-drive (directory-file-name (opencode-normalize-directory directory))))
 
 (defun opencode-same-directory-p (a b)
   "Return non-nil when directory names A and B name the same directory."

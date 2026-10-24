@@ -247,7 +247,7 @@ A sortable number, never nil: vtable would propertize the name of nil."
        (pcase scope
          ('all nil)
          (`(,_directory . ,(and project (pred stringp))) `((project . ,project)))
-         (`(,directory . ,_) `((directory . ,(directory-file-name directory)))))
+         (`(,directory . ,_) `((directory . ,(opencode-directory-name directory)))))
        (lambda (data) (setq sessions data) (done))))))
 
 (defun opencode--session-list-show (buffer)
@@ -315,7 +315,7 @@ A sortable number, never nil: vtable would propertize the name of nil."
                        `((parentID . "null")
                          ,(if project
                               `(project . ,(alist-get 'id project))
-                            `(directory . ,(directory-file-name directory))))
+                            `(directory . ,(opencode-directory-name directory))))
                        then else))))))
 
 (defun opencode-session-list-open (info)

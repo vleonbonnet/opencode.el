@@ -440,6 +440,22 @@ an agent of mode `all'."
           (clrhash opencode--catalogs)
           (should (equal (created-model) opencode-test-pinned-model)))))))
 
+(ert-deftest opencode-test-create-capital-drive ()
+  "A session is created in its directory spelled with a capital drive letter."
+  (skip-unless (memq system-type '(windows-nt ms-dos)))
+  (opencode-test-with-server
+    (let* ((info (alist-get 'data (opencode-test-fixture
+                                   (format "session-%s.json" (opencode-test-scenario "text")))))
+           (opencode-test-routes
+            (cons (list 'post "\\`/api/session\\'" (lambda (_) `((data . ,info))))
+                  (opencode-test-agent-routes))))
+      (opencode-session-create :directory (opencode-test-lowercase-drive opencode-test-workspace)
+                               :no-display t)
+      (kill-buffer (gethash (alist-get 'id info) opencode-session-buffers))
+      (should (opencode-test-capital-drive-p
+               (alist-get 'directory
+                          (alist-get 'location (car (opencode-test-requests-to 'post "/api/session")))))))))
+
 (ert-deftest opencode-test-switch-agent-follows-pin ()
   "Switching to an agent that pins a model switches to that model, then calls back."
   (opencode-test-with-server
