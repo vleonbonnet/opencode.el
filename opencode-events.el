@@ -62,6 +62,9 @@
 (defvar opencode-events--wanted nil
   "Non-nil while Emacs wants the stream open; nil after a disconnect.")
 
+(defvar opencode-events--closed-for-stop nil
+  "Non-nil when `opencode-service-stop' closed the stream, until it reopens.")
+
 (defvar opencode-events--backoff 1
   "Seconds before the next reconnection attempt.")
 
@@ -265,7 +268,8 @@ FUNCTION receives the event alist with members `type', `data', `id',
 
 (defun opencode-events-connect (&optional callback)
   "Open the event stream, then call CALLBACK with the service connection."
-  (setq opencode-events--wanted t)
+  (setq opencode-events--wanted t
+        opencode-events--closed-for-stop nil)
   (unless (timerp opencode-events--watchdog)
     (setq opencode-events--watchdog (run-at-time 15 15 #'opencode-events--watch)))
   (opencode-events--open)
@@ -275,7 +279,8 @@ FUNCTION receives the event alist with members `type', `data', `id',
 (defun opencode-disconnect ()
   "Close the event stream.  The shared service keeps running."
   (interactive)
-  (setq opencode-events--wanted nil)
+  (setq opencode-events--wanted nil
+        opencode-events--closed-for-stop nil)
   (dolist (timer (list opencode-events--reconnect-timer opencode-events--watchdog))
     (when (timerp timer) (cancel-timer timer)))
   (setq opencode-events--reconnect-timer nil
@@ -290,7 +295,9 @@ FUNCTION receives the event alist with members `type', `data', `id',
   "Stop the shared service, then call CALLBACK with no argument.
 ERRBACK, when given, receives an error message instead on failure.
 The event stream closes first, so its reconnect cannot start another
-service; reopening a session starts one again.  Every client loses the
+service; reopening a session starts one again, and the stream reopens
+once any service answers Emacs while session buffers are open.  Every
+client loses the
 service, and running turns resume once one starts, though their current
 step starts over, so interactively this asks first while any runs."
   (interactive)
@@ -303,6 +310,7 @@ step starts over, so interactively this asks first while any runs."
                                  running (if (= running 1) " is" "s are")))
       (user-error "Stop cancelled")))
   (opencode-disconnect)
+  (setq opencode-events--closed-for-stop t)
   (opencode-service--run-cli
    '("service" "stop")
    (lambda (status output)
@@ -313,6 +321,17 @@ step starts over, so interactively this asks first while any runs."
       (t
        (message "OpenCode service stopped")
        (when callback (funcall callback)))))))
+
+(defun opencode-events--reopen-after-stop (_connection)
+  "Reopen the stream `opencode-service-stop' closed, now that a service answers.
+Any request starts a service again; without this, open session buffers
+would stay stale.  With none open, the next session opened reconnects."
+  (when (and opencode-events--closed-for-stop
+             (not opencode-events--wanted)
+             (seq-some #'buffer-live-p (hash-table-values opencode-session-buffers)))
+    (opencode-events-connect)))
+
+(add-hook 'opencode-service-ready-functions #'opencode-events--reopen-after-stop)
 
 (provide 'opencode-events)
 ;;; opencode-events.el ends here

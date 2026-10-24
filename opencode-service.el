@@ -72,6 +72,9 @@ Each function receives the service's version and the installed one."
   :type 'hook
   :group 'opencode)
 
+(defvar opencode-service-ready-functions nil
+  "Abnormal hook run with the connection each time a service is ready for Emacs.")
+
 (defvar opencode-service-connection nil
   "Plist (:url :password :pid :version :id) of the service Emacs uses.")
 
@@ -153,6 +156,7 @@ while it boots, and nil when nothing usable answers."
             (when (cdr waiter) (funcall (cdr waiter) error)))
         (error (message "OpenCode: %s" (error-message-string err)))))
     (when connection
+      (run-hook-with-args 'opencode-service-ready-functions connection)
       (opencode-service-check-version connection))))
 
 (defun opencode-service--import-key (connection)

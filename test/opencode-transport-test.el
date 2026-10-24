@@ -242,6 +242,51 @@ two locations of one directory."
         (accept-process-output nil 1.5)
         (should-not cli)))))
 
+(ert-deftest opencode-test-service-stop-then-start ()
+  "A service answering again after a stop reopens the stream while session buffers are open.
+Any request starts a service by itself, and open buffers must not go stale."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service)
+          (list (cons "/api/agent" (lambda (_) '(200 . ((data . [])))))))
+    (let ((opencode-session-buffers (make-hash-table :test #'equal))
+          (buffer (generate-new-buffer " *opencode-test-session*")))
+      (unwind-protect
+          (progn
+            (opencode-events-connect)
+            (opencode-test-wait-for #'opencode-events-connected-p)
+            ;; The registration stays, as when something starts the service right away.
+            (cl-letf (((symbol-function 'opencode-service--run-cli)
+                       (lambda (_arguments on-exit) (funcall on-exit 0 ""))))
+              (opencode-service-stop #'ignore))
+            (should-not (opencode-events-connected-p))
+            ;; Without a session buffer, a request leaves the stream closed.
+            (opencode-request-sync 'get "/api/agent" :timeout 10)
+            (accept-process-output nil 0.5)
+            (should-not (opencode-events-connected-p))
+            (puthash "ses_test" buffer opencode-session-buffers)
+            (setq opencode-service-connection nil)
+            (opencode-request-sync 'get "/api/agent" :timeout 10)
+            (opencode-test-wait-for #'opencode-events-connected-p))
+        (kill-buffer buffer)))))
+
+(ert-deftest opencode-test-disconnect-stays-closed ()
+  "A deliberate disconnect stays closed even with session buffers open."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service)
+          (list (cons "/api/agent" (lambda (_) '(200 . ((data . [])))))))
+    (let ((opencode-session-buffers (make-hash-table :test #'equal))
+          (buffer (generate-new-buffer " *opencode-test-session*")))
+      (unwind-protect
+          (progn
+            (puthash "ses_test" buffer opencode-session-buffers)
+            (opencode-events-connect)
+            (opencode-test-wait-for #'opencode-events-connected-p)
+            (opencode-disconnect)
+            (opencode-request-sync 'get "/api/agent" :timeout 10)
+            (accept-process-output nil 0.5)
+            (should-not (opencode-events-connected-p)))
+        (kill-buffer buffer)))))
+
 (ert-deftest opencode-test-service-stop-failure ()
   "A failed stop reaches the error callback."
   (opencode-test-with-service
