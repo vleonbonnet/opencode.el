@@ -1282,7 +1282,7 @@ those blocks with their text.  Services without my fork ignore the key."
     (cons `(thinkingLoss . ,(if accept "accept" "ask")) metadata)))
 
 (cl-defun opencode-session-send (text &key files agents delivery metadata accept-thinking-loss
-                                         show then else)
+                                      show then else)
   "Send TEXT as a prompt of this session.
 FILES and AGENTS are vectors of attachments; DELIVERY overrides
 `opencode-prompt-delivery'; METADATA is an alist attached to the
