@@ -155,6 +155,9 @@ Each is a plist (:file URI-ALIST) or (:agent NAME).")
 (defvar-local opencode--turn-errors nil
   "Error messages already shown during the current turn.")
 
+(defvar-local opencode--location-generation 0
+  "Count of live moves, to detect when one overtakes a session fetch.")
+
 (defun opencode-empty-object ()
   "Return a value `json-serialize' encodes as an empty object."
   (make-hash-table))
@@ -380,18 +383,48 @@ resize."
   "Return the directory of session INFO."
   (opencode-normalize-directory (alist-get 'directory (alist-get 'location info))))
 
+(defun opencode--adopt-location (info)
+  "Adopt the confirmed location in session INFO or a move event's data."
+  (setq default-directory (opencode--session-directory info)
+        list-buffers-directory default-directory)
+  (dolist (field '(location projectID subpath))
+    (setf (alist-get field opencode-session-info nil t) (alist-get field info))))
+
+(defun opencode--cd (original directory)
+  "Ask the server to move this session when ORIGINAL `cd' selects DIRECTORY."
+  (if (not (and (derived-mode-p 'opencode-session-mode) opencode-session-id))
+      (funcall original directory)
+    (let ((destination
+           (let ((default-directory default-directory)
+                 (list-buffers-directory list-buffers-directory))
+             (funcall original directory)
+             (opencode-directory-name default-directory))))
+      (opencode-request
+       'post (format "/api/session/%s/move" opencode-session-id)
+       :body `((directory . ,destination))
+       :else (lambda (error) (opencode-report-error (opencode-error-describe error)))))))
+
+(advice-add 'cd :around #'opencode--cd)
+
 (defun opencode--display (buffer no-display other-window)
   "Show BUFFER unless NO-DISPLAY: in another window when OTHER-WINDOW."
   (unless no-display
     (if other-window (pop-to-buffer buffer) (switch-to-buffer buffer)))
   buffer)
 
-(defun opencode--adopt-info (info)
-  "Record session INFO in this buffer."
+(defun opencode--adopt-info (info &optional location-generation)
+  "Record session INFO in this buffer.
+LOCATION-GENERATION is the live move count when INFO was requested;
+keep the newer location if a move overtook that request."
+  (when (and location-generation (/= location-generation opencode--location-generation))
+    (setq info (copy-alist info))
+    (dolist (field '(location projectID subpath))
+      (setf (alist-get field info nil t) (alist-get field opencode-session-info))))
   (setq opencode-session-info info
         opencode-session-agent (or (alist-get 'agent info) opencode-session-agent)
         opencode-session-model (or (alist-get 'model info) opencode-session-model)
         opencode-session-revert (alist-get 'revert info))
+  (opencode--adopt-location info)
   (force-mode-line-update))
 
 (cl-defun opencode-session-open (info &key buffer no-display (other-window t) callback else)
@@ -416,8 +449,7 @@ the buffer."
             (erase-buffer))
           (setq buffer-read-only nil)
           (opencode-session-mode)
-          (setq opencode-session-id id
-                default-directory (opencode--session-directory info))
+          (setq opencode-session-id id)
           (opencode--adopt-info info)
           (hack-dir-local-variables-non-file-buffer)
           (puthash id buffer opencode-session-buffers)
@@ -539,7 +571,8 @@ Input typed at the prompt is kept."
   (unless opencode-session-id (user-error "Not in an OpenCode session"))
   (let ((input (and (get-buffer-process (current-buffer))
                     (buffer-substring-no-properties (opencode-pmark) (point-max))))
-        (line (line-number-at-pos)))
+        (line (line-number-at-pos))
+        (location-generation opencode--location-generation))
     (opencode-session-fetch
      opencode-session-id
      (lambda (info)
@@ -551,7 +584,7 @@ Input typed at the prompt is kept."
          (clrhash opencode--text-blocks)
          (when (hash-table-p opencode--blocks) (clrhash opencode--blocks))
          (setq opencode--last-block-kind nil opencode--current-assistant nil)
-         (opencode--adopt-info info)
+         (opencode--adopt-info info location-generation)
          (opencode-session-load
           (lambda ()
             (goto-char (point-max))
@@ -761,6 +794,8 @@ error face unless the job completed; any other message is a notice."
     ("model-switched"
      (when opencode-show-switch-notices
        (opencode-output-notice (format "Switched to %s" (opencode-model-label (alist-get 'model message))))))
+    ("location-switched"
+     (opencode-output-notice (format "Moved to %s" (opencode--session-directory message))))
     ("idle"
      (pcase (alist-get 'outcome message)
        ("failed" (when-let* ((error (alist-get 'error message))) (opencode--output-error error)))
@@ -1120,8 +1155,8 @@ once delivered: that is where the transcript places them."
             (setq opencode-session-revert nil)
             (opencode-session-reload))
            ("session.moved"
-            (setq default-directory (opencode-normalize-directory
-                                     (alist-get 'directory (alist-get 'location data))))
+            (cl-incf opencode--location-generation)
+            (opencode--adopt-location data)
             (opencode-output-notice (format "Moved to %s" default-directory))))
          (force-mode-line-update))))))
 
@@ -1173,6 +1208,7 @@ once delivered: that is where the transcript places them."
   "Reconcile this buffer with the server after the stream reopened."
   (let ((buffer (current-buffer))
         (known (alist-get 'updated (alist-get 'time opencode-session-info)))
+        (location-generation opencode--location-generation)
         (was-busy (eq opencode-session-status 'busy)))
     (opencode-session-fetch
      opencode-session-id
@@ -1180,10 +1216,10 @@ once delivered: that is where the transcript places them."
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (let ((changed (not (equal known (alist-get 'updated (alist-get 'time info))))))
-             (opencode--adopt-info info)
+             (opencode--adopt-info info location-generation)
              (if (or changed was-busy)
                  (opencode-session-reload)
-               (run-hook-with-args 'opencode-session-resync-functions info)))))))))
+               (run-hook-with-args 'opencode-session-resync-functions opencode-session-info)))))))))
 
 (defun opencode--resync-all ()
   "Reconcile every open session buffer with the reconnected server."

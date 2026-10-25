@@ -76,6 +76,8 @@ Prompts are typed at the bottom. A prompt sent while a turn runs steers it (=ope
 
 Images pasted with =yank-media= are attached to the next prompt.
 
+=M-x cd= in a session buffer moves the session to the chosen directory. The buffer's directory follows the server: it changes when the move takes effect, and stays at the last confirmed location while a request is pending or if it fails. Moves made by the agent or another client are reflected automatically, including after reconnecting.
+
 The mode line shows the session's status, title, agent, model, variant, provider and context use, fitted to the window. A model billed more past some context size, from its catalog pricing or =opencode-long-context-tiers=, is flagged as the context approaches it.
 
 * Permissions and questions
