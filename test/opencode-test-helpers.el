@@ -179,6 +179,9 @@ The service refuses message pages asked for so."
 (defvar opencode-test-notifications nil
   "Notifications shown under `opencode-test-with-server', newest first.")
 
+(defvar opencode-test-dismissed-notifications nil
+  "Notifications dismissed under `opencode-test-with-server', newest first.")
+
 (defmacro opencode-test-with-server (&rest body)
   "Run BODY with requests answered by `opencode-test-routes' and no display.
 Notifications reach `opencode-test-notifications' instead of the OS."
@@ -191,10 +194,13 @@ Notifications reach `opencode-test-notifications' instead of the OS."
          (opencode-last-session-buffer nil)
          (opencode-alerted-sessions nil)
          (opencode-test-notifications nil)
+         (opencode-test-dismissed-notifications nil)
          (opencode-notification-messages-filter nil)
          (opencode-notification-os-filter t)
          (opencode-notify-os-function (lambda (notification)
-                                        (push notification opencode-test-notifications))))
+                                        (push notification opencode-test-notifications)
+                                        (lambda ()
+                                          (push notification opencode-test-dismissed-notifications)))))
      (cl-letf (((symbol-function 'opencode-request) #'opencode-test--request)
                ((symbol-function 'opencode-events-connected-p) (lambda () t))
                ((symbol-function 'opencode-events-connect) #'ignore)

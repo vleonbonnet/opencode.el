@@ -60,7 +60,9 @@ Takes the same values as `opencode-notification-messages-filter'."
   :group 'opencode)
 
 (defcustom opencode-notify-os-function #'opencode-notify-os-native
-  "Function showing a notification alist outside Emacs."
+  "Function showing a notification alist outside Emacs.
+Return a zero-argument function to dismiss that notification, when the
+backend supports removal.  Other return values are ignored."
   :type '(choice (function-item opencode-notify-os-native)
                  (function-item opencode-notify-os-alert)
                  function)
@@ -68,6 +70,31 @@ Takes the same values as `opencode-notification-messages-filter'."
 
 (defconst opencode-notifications-buffer " *OpenCode Notifications*"
   "Name of the hidden buffer logging every notification.")
+
+(defvar-local opencode--notification-dismissers nil
+  "Alist of (KIND . REQUEST-ID) keys to functions dismissing this buffer's toasts.")
+
+(defun opencode-notification-id (notification)
+  "Return a backend identifier for NOTIFICATION's session, kind and request."
+  (format "opencode:%s:%s:%s" (or (alist-get 'session notification) (buffer-name))
+          (alist-get 'kind notification) (alist-get 'request notification)))
+
+(defun opencode-dismiss-notifications (&optional kind request)
+  "Dismiss this buffer's notifications matching KIND and REQUEST.
+Without KIND, dismiss all.  Without REQUEST, dismiss every request of KIND.
+Removal failures are reported without interrupting the session."
+  (dolist (entry (copy-sequence opencode--notification-dismissers))
+    (when (and (or (null kind) (eq kind (caar entry)))
+               (or (null request) (equal request (cdar entry))))
+      (setq opencode--notification-dismissers (delq entry opencode--notification-dismissers))
+      (condition-case err
+          (funcall (cdr entry))
+        (error (message "OpenCode: cannot dismiss a notification: %s" (error-message-string err)))))))
+
+(defun opencode-dismiss-turn-notifications ()
+  "Dismiss the previous outcome and retry notifications of this session."
+  (dolist (kind '(finished failed interrupted retry))
+    (opencode-dismiss-notifications kind)))
 
 (defun opencode-notification-messages-default-p (notification)
   "Return non-nil unless NOTIFICATION reports a finished turn or a retry."
@@ -96,15 +123,20 @@ Takes the same values as `opencode-notification-messages-filter'."
   "Log NOTIFICATION and show it where the filters allow.
 NOTIFICATION is an alist: `title', `message', `variant' (info, success,
 warning or error), `kind' (a symbol such as `finished', `failed',
-`interrupted', `retry', `permission' or `question') and `session' (its
-ID)."
+`interrupted', `retry', `permission' or `question'), `session' (its ID)
+and optionally `request' (the permission or form ID).
+Call in the originating session buffer so it owns the dismissal function."
   (opencode--log-notification notification)
   (let-alist notification
     (when (opencode--notification-allowed-p opencode-notification-messages-filter notification)
       (message "%s: %s" .title .message))
     (when (opencode--notification-allowed-p opencode-notification-os-filter notification)
       (condition-case err
-          (funcall opencode-notify-os-function notification)
+          (let ((kind (or .kind 'notice)))
+            (opencode-dismiss-notifications kind .request)
+            (when-let* ((dismiss (funcall opencode-notify-os-function notification))
+                        ((functionp dismiss)))
+              (push (cons (cons kind .request) dismiss) opencode--notification-dismissers)))
         (error (message "OpenCode: cannot show a notification: %s" (error-message-string err)))))))
 
 ;;;; Session notifications
@@ -116,13 +148,15 @@ ID)."
               (seq-remove (lambda (info) (equal (alist-get 'id info) opencode-session-id))
                           opencode-alerted-sessions))))
 
-(defun opencode-notify-session (title text kind)
+(defun opencode-notify-session (title text kind &optional request)
   "Report TEXT under TITLE for this session's request of KIND.
+REQUEST identifies the permission or form for later dismissal.
 Shown in the echo area when this buffer is displayed, else notified."
   (if (opencode-buffer-active-p (current-buffer))
       (message "%s: %s" title text)
     (opencode-notify `((title . ,title) (message . ,text) (variant . "info")
-                       (kind . ,kind) (session . ,opencode-session-id)))))
+                       (kind . ,kind) (session . ,opencode-session-id)
+                       (request . ,request)))))
 
 (defun opencode-notify-turn-ended (outcome)
   "Notify that this session's turn ended with OUTCOME.
@@ -155,12 +189,16 @@ whose parent reports for them."
 ;;;; Operating system backends
 
 (declare-function notifications-notify "notifications")
+(declare-function notifications-close-notification "notifications")
 (declare-function w32-notification-notify "w32fns.c")
 (declare-function w32-notification-close "w32fns.c")
 (declare-function alert "alert")
+(declare-function alert-notifications-remove "alert")
+(defvar alert-notifications-ids)
 
 (defun opencode-notify-os-native (notification)
-  "Show NOTIFICATION with the operating system's notifications."
+  "Show NOTIFICATION with the operating system's notifications.
+Return a dismissal function when the selected backend supports removal."
   (cond
    ((opencode--notify-dbus notification))
    ((eq system-type 'darwin) (opencode--notify-macos notification))
@@ -171,26 +209,28 @@ whose parent reports for them."
   (when (and (featurep 'dbusbind) (require 'notifications nil t))
     (let-alist notification
       (condition-case nil
-          (progn
-            (notifications-notify :title .title
-                                  :body .message
-                                  :urgency (if (member .variant '("error" "warning")) 'critical 'normal)
-                                  :timeout 5000
-                                  :app-icon 'none)
-            t)
+          (when-let* ((id (notifications-notify
+                           :title .title :body .message
+                           :urgency (if (member .variant '("error" "warning")) 'critical 'normal)
+                           :timeout 5000 :app-icon 'none)))
+            (lambda () (notifications-close-notification id)))
         (dbus-error nil)))))
 
 (defun opencode--notify-macos (notification)
   "Show NOTIFICATION with terminal-notifier, else osascript."
   (let-alist notification
-    (let ((title (concat (pcase .variant ("error" "❌") ("warning" "⚠️") (_ "ℹ️")) " " .title)))
+    (let ((title (concat (pcase .variant ("error" "❌") ("warning" "⚠️") (_ "ℹ️")) " " .title))
+          (group (opencode-notification-id notification)))
       (if (executable-find "terminal-notifier")
-          (start-process "opencode-notification" nil "terminal-notifier"
-                         "-title" title
-                         "-message" .message
-                         "-group" "opencode-toast"
-                         "-activate" "org.gnu.Emacs"
-                         "-sound" (if (member .variant '("error" "warning")) "Basso" "default"))
+          (progn
+            (start-process "opencode-notification" nil "terminal-notifier"
+                           "-title" title
+                           "-message" .message
+                           "-group" group
+                           "-activate" "org.gnu.Emacs"
+                           "-sound" (if (member .variant '("error" "warning")) "Basso" "default"))
+            (lambda () (start-process "opencode-notification-close" nil "terminal-notifier"
+                                      "-remove" group)))
         (start-process "opencode-notification" nil "osascript" "-e"
                        (format "display notification %S with title %S" .message title))))))
 
@@ -219,16 +259,22 @@ A frame shows one at a time, so it replaces the previous one."
                      :level (pcase .variant ("error" 'error) ("warning" 'warning) (_ 'info))
                      :tip "OpenCode")))
       (setq opencode--w32-notification (cons id (selected-frame)))
-      (run-at-time 10 nil #'opencode--w32-notification-close id))))
+      (run-at-time 10 nil #'opencode--w32-notification-close id)
+      (lambda () (opencode--w32-notification-close id)))))
 
 (defun opencode-notify-os-alert (notification)
   "Show NOTIFICATION with the alert package."
   (require 'alert)
-  (let-alist notification
-    (alert .message
-           :title .title
-           :severity (pcase .variant ("error" 'high) ("warning" 'moderate) (_ 'normal))
-           :category 'opencode)))
+  (let ((id (opencode-notification-id notification)))
+    (let-alist notification
+      (alert .message
+             :title .title :id id
+             :severity (pcase .variant ("error" 'high) ("warning" 'moderate) (_ 'normal))
+             :category 'opencode))
+    (when-let* ((native-id (gethash id alert-notifications-ids)))
+      (lambda ()
+        (when (eql native-id (gethash id alert-notifications-ids))
+          (alert-notifications-remove (list :id id)))))))
 
 (provide 'opencode-notify)
 ;;; opencode-notify.el ends here

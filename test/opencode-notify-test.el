@@ -98,5 +98,150 @@
       (with-current-buffer buffer
         (should (equal (alist-get 'attempt opencode-session-retry) 2))))))
 
+(ert-deftest opencode-test-notify-permission-dismissal-is-request-scoped ()
+  "Answering each permission dismisses only its toast, even across sessions."
+  (dolist (decision '(once always reject))
+    (opencode-test-with-server
+     (let ((first (opencode-test-open-empty (opencode-test-scenario "permission")))
+           (second (opencode-test-open-empty (opencode-test-scenario "text"))))
+       (dolist (buffer (list first second))
+         (with-current-buffer buffer
+           (dolist (id '("per_one" "per_two"))
+             (opencode-permission-queue
+              `((id . ,id) (action . "shell") (resources "echo hello") (save))))))
+       (with-current-buffer first
+         (opencode-permission-reply (car opencode-pending-permissions) decision)
+         (should (= (length opencode--notification-dismissers) 1))
+         (let ((dismissed (car opencode-test-dismissed-notifications)))
+           (should (= (length opencode-test-dismissed-notifications) 1))
+           (should (equal (alist-get 'request dismissed) "per_one"))
+           (should (equal (alist-get 'session dismissed) opencode-session-id)))
+         (opencode-test-dispatch
+          `(((type . "permission.replied")
+             (data (sessionID . ,opencode-session-id) (requestID . "per_two") (reply . "reject")))))
+         (should-not opencode--notification-dismissers)
+         (should (= (length opencode-test-dismissed-notifications) 2)))
+       (with-current-buffer second
+         (should (= (length opencode--notification-dismissers) 2)))))))
+
+(ert-deftest opencode-test-notify-question-dismissal-is-request-scoped ()
+  "Submitting or declining a question closes it; another client's answer does too."
+  (dolist (cancel '(nil t))
+    (opencode-test-with-server
+     (let* ((id (opencode-test-scenario "question"))
+            (buffer (opencode-test-open-empty id))
+            (event (seq-find (lambda (event) (equal (alist-get 'type event) "form.created"))
+                             (opencode-test-events id)))
+            (form (copy-tree (alist-get 'form (alist-get 'data event)))))
+       (with-current-buffer buffer
+         (opencode-form-queue form)
+         (let ((other (copy-tree form)))
+           (setf (alist-get 'id other) "frm_other")
+           (opencode-form-queue other))
+         (opencode-form-send (car opencode-pending-forms) cancel)
+         (should (= (length opencode-test-dismissed-notifications) 1))
+         (should (equal (alist-get 'request (car opencode-test-dismissed-notifications))
+                        (alist-get 'id form)))
+         (should (= (length opencode--notification-dismissers) 1))
+         (let ((resolved `((type . ,(if cancel "form.cancelled" "form.replied"))
+                           (data (sessionID . ,id) (id . "frm_other")))))
+           (opencode-test-dispatch (list resolved resolved)))
+         (should-not opencode--notification-dismissers)
+         (should (= (length opencode-test-dismissed-notifications) 2)))))))
+
+(ert-deftest opencode-test-notify-prompt-and-kill-dismissal ()
+  "A new prompt clears the outcome; killing a buffer clears only its remaining toasts."
+  (opencode-test-with-server
+   (let ((first (opencode-test-open-empty (opencode-test-scenario "text")))
+         (second (opencode-test-open-empty (opencode-test-scenario "permission"))))
+     (dolist (buffer (list first second))
+       (with-current-buffer buffer
+         (opencode-notify-turn-ended 'succeeded)))
+     (with-current-buffer first
+       (opencode-permission-queue '((id . "per_one") (action . "shell")
+                                    (resources "echo hello") (save)))
+       (opencode-session-send "Next prompt")
+       (should (equal (mapcar (lambda (n) (alist-get 'kind n))
+                              opencode-test-dismissed-notifications)
+                      '(finished)))
+       (should (= (length opencode--notification-dismissers) 1)))
+     (kill-buffer first)
+     (should (= (length opencode-test-dismissed-notifications) 2))
+     (with-current-buffer second
+       (should (= (length opencode--notification-dismissers) 1)))
+     (kill-buffer second)
+     (should (= (length opencode-test-dismissed-notifications) 3)))))
+
+(ert-deftest opencode-test-notify-other-client-prompt-and-command ()
+  "Admitted user prompts and slash commands clear outcomes, synthetic inbox items do not."
+  (opencode-test-with-server
+   (let ((id (opencode-test-scenario "text")))
+     (with-current-buffer (opencode-test-open-empty id)
+       (opencode-notify-turn-ended 'succeeded)
+       (opencode-test-dispatch
+        `(((type . "session.inbox.enqueued")
+           (data (sessionID . ,id) (inboxID . "inb_synthetic") (item (type . "synthetic"))))))
+       (should-not opencode-test-dismissed-notifications)
+       (opencode-test-dispatch
+        `(((type . "session.inbox.enqueued")
+           (data (sessionID . ,id) (inboxID . "inb_user") (item (type . "user"))))))
+       (should (= (length opencode-test-dismissed-notifications) 1))
+       (opencode-notify-turn-ended 'succeeded)
+       (opencode-session-command "review" "this patch")
+       (should (= (length opencode-test-dismissed-notifications) 2))
+       (should-not opencode--notification-dismissers)))))
+
+(ert-deftest opencode-test-notify-replacement-and-failing-dismissal ()
+  "Replacement retires its predecessor; one broken closer never blocks the others."
+  (with-temp-buffer
+    (let ((closed nil)
+          (count 0)
+          (opencode-notification-messages-filter nil)
+          (opencode-notification-os-filter t))
+      (let ((opencode-notify-os-function
+             (lambda (_notification)
+               (let ((number (cl-incf count)))
+                 (lambda ()
+                   (push number closed)
+                   (when (= number 2) (error "Notification service unavailable")))))))
+        (opencode-notify '((title . "Done") (message . "First") (kind . finished)))
+        (opencode-notify '((title . "Done") (message . "Second") (kind . finished)))
+        (should (equal closed '(1)))
+        (opencode-notify '((title . "Question") (message . "One") (kind . question) (request . "one")))
+        (opencode-notify '((title . "Question") (message . "Two") (kind . question) (request . "two")))
+        (opencode-dismiss-notifications)
+        (should (equal (sort closed #'<) '(1 2 3 4)))
+        (should-not opencode--notification-dismissers)
+        (opencode-dismiss-notifications)
+        (should (= (length closed) 4))))))
+
+(ert-deftest opencode-test-notify-dbus-dismisses-native-id ()
+  "The native D-Bus backend's closer sends the ID returned by Notify."
+  (skip-unless (and (featurep 'dbusbind) (require 'notifications nil t)))
+  (let (closed)
+    (cl-letf (((symbol-function 'notifications-notify) (lambda (&rest _) 1234))
+              ((symbol-function 'notifications-close-notification) (lambda (id) (setq closed id))))
+      (let ((dismiss (opencode--notify-dbus '((title . "Question") (message . "Which?")))))
+        (should (functionp dismiss))
+        (funcall dismiss)
+        (should (eql closed 1234))))))
+
+(ert-deftest opencode-test-notify-macos-groups-are-request-scoped ()
+  "Terminal-notifier groups keep sessions and simultaneous requests independent."
+  (let (commands)
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/bin/terminal-notifier"))
+              ((symbol-function 'start-process) (lambda (&rest args) (push args commands))))
+      (let ((first (opencode--notify-macos '((session . "one") (kind . question) (request . "a")
+                                             (title . "One asks") (message . "Which?"))))
+            (second (opencode--notify-macos '((session . "two") (kind . question) (request . "a")
+                                              (title . "Two asks") (message . "Which?"))))
+            (third (opencode--notify-macos '((session . "one") (kind . question) (request . "b")
+                                             (title . "One asks") (message . "Which?")))))
+        (let ((groups (mapcar (lambda (args) (cadr (member "-group" args))) commands)))
+          (should (= (length (delete-dups (copy-sequence groups))) 3)))
+        (mapc #'funcall (list first second third))
+        (should (equal (mapcar (lambda (args) (cadr (member "-remove" args))) (seq-take commands 3))
+                       '("opencode:one:question:b" "opencode:two:question:a" "opencode:one:question:a")))))))
+
 (provide 'opencode-notify-test)
 ;;; opencode-notify-test.el ends here

@@ -338,6 +338,7 @@ first selectable entry of the cached catalog."
 
 (defun opencode--session-cleanup ()
   "Release this buffer's process, registration and temporary files."
+  (opencode-dismiss-notifications)
   (when (and opencode-session-id
              (eq (gethash opencode-session-id opencode-session-buffers) (current-buffer)))
     (remhash opencode-session-id opencode-session-buffers)
@@ -1045,6 +1046,8 @@ once delivered: that is where the transcript places them."
         (setq opencode--pending-inbox (make-hash-table :test #'equal)))
       (pcase (alist-get 'type event)
         ("session.inbox.enqueued"
+         (when (equal (alist-get 'type (alist-get 'item data)) "user")
+           (opencode-dismiss-turn-notifications))
          (unless (gethash id opencode--own-inputs)
            (puthash id (alist-get 'item data) opencode--pending-inbox)))
         ("session.inbox.delivered"
@@ -1127,6 +1130,7 @@ once delivered: that is where the transcript places them."
       ("session.deleted"
        (run-hook-with-args 'opencode-session-deleted-functions id)
        (opencode-with-session-buffer id
+         (opencode-dismiss-notifications)
          (opencode-output-notice "This session was deleted" 'error)
          (remhash id opencode-session-buffers)
          (run-hook-with-args 'opencode-session-buffer-functions id)))
@@ -1290,6 +1294,7 @@ caller rendered it.  THEN runs with the admitted inbox item, ELSE with
 the error."
   (let ((id (opencode-generate-id "msg_"))
         (metadata (opencode-thinking-metadata metadata accept-thinking-loss)))
+    (opencode-dismiss-turn-notifications)
     (unless show
       (puthash id t opencode--own-inputs))
     (when opencode-session-model
@@ -1312,6 +1317,7 @@ the error."
   "Run slash command NAME with ARGUMENTS text in this session.
 METADATA and ACCEPT-THINKING-LOSS are attached to the command's prompt,
 THEN and ELSE run, as for `opencode-session-send'."
+  (opencode-dismiss-turn-notifications)
   (opencode-request
    'post (format "/api/session/%s/command" opencode-session-id)
    :body `((name . ,name) (text . ,arguments)

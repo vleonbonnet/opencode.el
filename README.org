@@ -96,6 +96,8 @@ With my fork, before an idle session sends a turn, the service reports how much 
 
 A turn that ends, a retry, and a permission request or question of a session that is not displayed are logged in the hidden buffer =*OpenCode Notifications*=. =opencode-notification-messages-filter= and =opencode-notification-os-filter= decide what also reaches =*Messages*= and the operating system, through =opencode-notify-os-function=: D-Bus, macOS notifications, Windows tray notifications, or =opencode-notify-os-alert= for the alert package.
 
+Backends that support removal return a dismissal function. Answering or declining a request removes its own notification, including answers from another client. Sending a new prompt or command clears the previous turn's notifications; killing the session buffer clears all of its notifications. The hidden notification log is retained. Custom backends can use =opencode-notification-id= for a stable session/kind/request key and return a zero-argument function to remove that toast.
+
 * Desktop
 
 Session buffers are saved with the desktop by session ID, directory and point, and restored in place in the background. A restore that fails, because the service is unavailable or the session was deleted, leaves a placeholder that is still saved; =g= in it retries. The restore's =opencode-desktop-restore-timeout= counts from the moment the service is ready, so a slow start or import does not use it up.

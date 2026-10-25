@@ -285,7 +285,7 @@ The transient shows the full command, so the block stays collapsed."
             (message (substitute-command-keys
                       "OpenCode permission pending; \\[opencode-respond] answers it"))
           (opencode-notify-session "OpenCode permission request" (plist-get permission :title)
-                                   'permission)
+                                   'permission .id)
           (opencode-alert-session))))))
 
 (defun opencode--permission-attach (overlay)
@@ -304,6 +304,7 @@ The transient shows the full command, so the block stays collapsed."
 
 (defun opencode--permission-forget (permission &optional label face)
   "Drop PERMISSION from the queue, labelling its fallback LABEL in FACE."
+  (opencode-dismiss-notifications 'permission (plist-get permission :id))
   (setq opencode-pending-permissions (delq permission opencode-pending-permissions))
   (opencode--permission-clear-block permission)
   (when label (opencode--permission-label permission label face))

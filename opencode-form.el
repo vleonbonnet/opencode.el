@@ -239,12 +239,13 @@ shows typed answers in place of the option keys."
           (opencode-notify-session
            "OpenCode question"
            (or (alist-get 'description (car (opencode-form-fields form))) (alist-get 'title form) "")
-           'question)
+           'question id)
           (opencode-alert-session))
         entry))))
 
 (defun opencode--form-resolved (id)
   "Forget form ID of this buffer once answered or cancelled, by any client."
+  (opencode-dismiss-notifications 'question id)
   (unless (member id opencode--resolved-forms)
     (push id opencode--resolved-forms)
     (when (nthcdr 50 opencode--resolved-forms)
@@ -262,6 +263,7 @@ shows typed answers in place of the option keys."
   "Reply to form ENTRY with its saved answers, or CANCEL it."
   (let ((id (plist-get entry :id))
         (buffer (current-buffer)))
+    (opencode-dismiss-notifications 'question id)
     (plist-put entry :submitted t)
     (force-mode-line-update)
     (opencode-request-state-changed)
