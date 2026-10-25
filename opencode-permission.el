@@ -26,7 +26,8 @@
 ;; call's block in the attention face; the transient shows the whole
 ;; command, patch or argument list.  A request whose block has not arrived
 ;; yet prints a fallback line that the block replaces.  The transient
-;; accepts once (o), always (a, showing the patterns saved), rejects (n)
+;; accepts once (o), always (a, showing the patterns saved), rejects (n),
+;; rejects with feedback and continues (f),
 ;; or hands the task off to another primary agent (h): the session
 ;; switches agent, a synthetic message tells the model, and the pending
 ;; call is accepted once, so the turn continues with its context intact.
@@ -405,10 +406,19 @@ The transient shows the full command, so the block stays collapsed."
   (opencode--permission-transient-act #'opencode-permission-reply 'always))
 
 (transient-define-suffix opencode-permission-reject ()
-  "Reject the request."
+  "Reject the request and stop the session's current execution."
   :transient nil
   (interactive)
   (opencode--permission-transient-act #'opencode-permission-reply 'reject))
+
+(transient-define-suffix opencode-permission-reject-with-feedback (feedback)
+  "Reject the request and let the assistant continue using FEEDBACK."
+  :transient nil
+  (interactive (list (read-string "Reject and continue with feedback: ")))
+  (let ((message (string-trim feedback)))
+    (when (string-empty-p message)
+      (user-error "Feedback is empty; use Reject to stop instead"))
+    (opencode--permission-transient-act #'opencode-permission-reply 'reject message)))
 
 (transient-define-suffix opencode-permission-hand-off-suffix ()
   "Hand the task off to another primary agent."
@@ -432,10 +442,11 @@ The transient shows the full command, so the block stays collapsed."
 (transient-define-prefix opencode-permission-transient ()
   "Answer an OpenCode permission request."
   [:description opencode--permission-description
-   ("o" "Accept once" opencode-permission-accept)
-   ("a" opencode-permission-accept-always)
-   ("n" "Reject" opencode-permission-reject)
-   ("h" "Hand off to another agent" opencode-permission-hand-off-suffix)])
+                ("o" "Accept once" opencode-permission-accept)
+                ("a" opencode-permission-accept-always)
+                ("n" "Reject and stop" opencode-permission-reject)
+                ("f" "Reject with feedback" opencode-permission-reject-with-feedback)
+                ("h" "Hand off to another agent" opencode-permission-hand-off-suffix)])
 
 (opencode-install-hidden-navigation 'opencode-permission-transient opencode-transient-scroll-suffixes)
 

@@ -82,7 +82,7 @@ The mode line shows the session's status, title, agent, model, variant, provider
 
 * Permissions and questions
 
-A permission request marks the tool call that asked and waits; it never takes focus. =C-c C-q= opens it: accept once, always, reject, or hand the task off to another primary agent. Questions from the question tool open as a form, one question at a time, with your own answer always possible. Requests of a subagent show on the parent session's block. An answer given in another client clears the request in Emacs.
+A permission request marks the tool call that asked and waits; it never takes focus. =C-c C-q= opens it: accept once (=o=), always (=a=), reject and stop (=n=), reject with feedback (=f=), or hand the task off to another primary agent (=h=). Rejection with feedback blocks the tool but lets the assistant continue using the text you enter; plain rejection stops the current execution. Questions from the question tool open as a form, one question at a time, with your own answer always possible. Requests of a subagent show on the parent session's block. An answer given in another client clears the request in Emacs.
 
 * Edits
 

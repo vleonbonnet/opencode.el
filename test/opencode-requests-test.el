@@ -78,7 +78,41 @@
                            "\n    curl example.com")))
     (should (equal (opencode-permission-reasons-summary
                     `(((resource . "a") (rule . ,dynamic)) ((resource . "c"))))
-                   "asked by rule \"\"$*\"; no rule allows the rest"))))
+                    "asked by rule \"\"$*\"; no rule allows the rest"))))
+
+(ert-deftest opencode-test-permission-reject-commands ()
+  "Plain rejection omits feedback; the feedback command sends its trimmed text."
+  (dolist (feedback '(nil "  Use a patch instead.  "))
+    (opencode-test-with-server
+      (let* ((id (opencode-test-scenario "permission"))
+             (buffer (opencode-test-open-empty id)))
+        (opencode-test-dispatch-until (opencode-test-events id) "permission.asked")
+        (with-current-buffer buffer
+          (let ((opencode--permission-transient-state
+                 (list :buffer buffer :permission (car opencode-pending-permissions))))
+            (if feedback
+                (opencode-permission-reject-with-feedback feedback)
+              (opencode-permission-reject))
+            (should (equal (plist-get (car opencode-test-requests) :body)
+                           (if feedback
+                               '((decision . "reject") (message . "Use a patch instead."))
+                             '((decision . "reject")))))
+            (should-not opencode-pending-permissions)))))))
+
+(ert-deftest opencode-test-permission-empty-feedback-stays-pending ()
+  "Empty feedback never silently becomes a plain rejection."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "permission"))
+           (buffer (opencode-test-open-empty id)))
+      (opencode-test-dispatch-until (opencode-test-events id) "permission.asked")
+      (with-current-buffer buffer
+        (let* ((permission (car opencode-pending-permissions))
+               (opencode--permission-transient-state (list :buffer buffer :permission permission))
+               (requests (length opencode-test-requests)))
+          (should-error (opencode-permission-reject-with-feedback "  ") :type 'user-error)
+          (should (equal (length opencode-test-requests) requests))
+          (should (memq permission opencode-pending-permissions))
+          (should (eq (plist-get opencode--permission-transient-state :permission) permission)))))))
 
 (ert-deftest opencode-test-permission-reasons-spelling ()
   "A rule matching another spelling of a command shows that spelling, and locates its match there."
