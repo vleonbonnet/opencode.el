@@ -563,7 +563,8 @@ in another color."
       (replace-match "" t t))
     (goto-char (point-min))
     (while (re-search-forward "^\\*\\*\\* \\(Add File\\|Update File\\|Delete File\\|Move to\\): \\(.*\\)$" nil t)
-      (replace-match (opencode-relative-path-for-display (match-string 2)) t t nil 2))
+      ;; Path resolution can overwrite the header's match data.
+      (replace-match (save-match-data (opencode-relative-path-for-display (match-string 2))) t t nil 2))
     (string-trim (buffer-string) "\n+" "\n+")))
 
 (defun opencode-format-tool-call (tool input)

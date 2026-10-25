@@ -47,6 +47,36 @@
                              (opencode-tool-blocks))))
       (should (string-match-p "git status --short" (opencode-test-text (current-buffer)))))))
 
+(ert-deftest opencode-test-expand-rejected-patch ()
+  "A rejected patch expands with relative header paths and its feedback intact."
+  (opencode-test-with-server
+   (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "edit-tools"))
+     (let* ((outside (expand-file-name "permission-feedback-check/AGENTS.md" temporary-file-directory))
+            (body (concat "*** Add File: %s\n+permission test\n"
+                          "*** Update File: %s\n*** Move to: %s\n@@\n-old\n+new\n"
+                          "*** Delete File: %s\n*** Add File: %s\n+outside\n"))
+            (patch (concat "*** Begin Patch\n"
+                           (format body (expand-file-name "AGENTS.md" default-directory)
+                                   (expand-file-name "notes.txt" default-directory)
+                                   (expand-file-name "renamed notes.txt" default-directory)
+                                   (expand-file-name "hello.txt" default-directory) outside)
+                           "*** End Patch\n"))
+            (input `((patchText . ,patch)))
+            (block (opencode-tool-start "rejected-patch" "patch" input "running"))
+            (expected (concat "patch:\n```diff\n"
+                              (format body "AGENTS.md" "notes.txt" "renamed notes.txt" "hello.txt" outside)
+                              "```\n\nRejected: test feedback\n")))
+       (opencode-tool-update "rejected-patch" :status "error"
+                             :error '((type . "permission.rejected") (message . "test feedback")))
+       (dotimes (_ 2)
+         (opencode-expand-block block)
+         (let ((content (overlay-get block 'opencode-content-overlay)))
+           (should (overlayp content))
+           (should (equal (buffer-substring-no-properties (overlay-start content) (overlay-end content))
+                          expected)))
+         (opencode-collapse-block block))
+       (should (equal (alist-get 'patchText (plist-get (opencode-block-data block) :input)) patch))))))
+
 (ert-deftest opencode-test-live-matches-replay ()
   "Streaming a scenario's events renders what replaying its messages renders."
   (dolist (scenario '("text" "shell" "edit-tools" "reasoning"))
