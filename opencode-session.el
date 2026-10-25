@@ -108,6 +108,10 @@ They run before `opencode-session-idle-functions'.")
   "Functions called in each session buffer after the stream reconnects.
 Each receives the session info fetched from the server.")
 
+(defvar opencode-session-buffer-functions nil
+  "Functions called with a session ID after its buffer registration changes.
+They run in the session buffer, after it is registered or unregistered.")
+
 (defvar opencode-last-model nil
   "Model reference (alist id, providerID, variant) of the last prompt sent.")
 (add-to-list 'savehist-additional-variables 'opencode-last-model)
@@ -336,7 +340,8 @@ first selectable entry of the cached catalog."
   "Release this buffer's process, registration and temporary files."
   (when (and opencode-session-id
              (eq (gethash opencode-session-id opencode-session-buffers) (current-buffer)))
-    (remhash opencode-session-id opencode-session-buffers))
+    (remhash opencode-session-id opencode-session-buffers)
+    (run-hook-with-args 'opencode-session-buffer-functions opencode-session-id))
   (when-let* ((process (get-buffer-process (current-buffer))))
     (delete-process process))
   (mapc (lambda (file) (ignore-errors (delete-file file))) opencode--temp-files)
@@ -454,6 +459,7 @@ the buffer."
           (hack-dir-local-variables-non-file-buffer)
           (puthash id buffer opencode-session-buffers)
           (opencode--make-process buffer)
+          (run-hook-with-args 'opencode-session-buffer-functions id)
           (opencode-session-load
            (lambda ()
              (when callback (funcall callback info)))
@@ -1122,7 +1128,8 @@ once delivered: that is where the transcript places them."
        (run-hook-with-args 'opencode-session-deleted-functions id)
        (opencode-with-session-buffer id
          (opencode-output-notice "This session was deleted" 'error)
-         (remhash id opencode-session-buffers)))
+         (remhash id opencode-session-buffers)
+         (run-hook-with-args 'opencode-session-buffer-functions id)))
       (type
        (opencode-with-session-buffer id
          (pcase type

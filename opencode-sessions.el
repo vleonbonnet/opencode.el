@@ -32,7 +32,8 @@
 ;; directory.  Subagent sessions are hidden until `v' shows them.  Lists
 ;; refresh when sessions are created, deleted, renamed, moved or forked,
 ;; and render again when their window's width changes, since column
-;; limits are fractions of it.
+;; limits are fractions of it.  Titles of sessions with live buffers are
+;; highlighted, following local buffer opens and closes.
 ;;
 ;; OpenCode 2 reports no change summary with sessions, and its diff route
 ;; runs Git over the turn's snapshots, so the lists have no column of
@@ -57,6 +58,11 @@
   "Seconds a worktree's branch is cached for the session lists."
   :type 'natnum
   :group 'opencode)
+
+(defface opencode-session-list-open-session
+  '((t :inherit success))
+  "Title of a session with a live buffer in a session list."
+  :group 'opencode-faces)
 
 ;;;; Server data
 
@@ -189,7 +195,10 @@ A sortable number, never nil: vtable would propertize the name of nil."
 (defun opencode--session-list-value (info column table)
   "Return the cell of session INFO in COLUMN of TABLE."
   (pcase (vtable-column table column)
-    ("Title" (or (alist-get 'title info) (alist-get 'id info)))
+    ("Title" (let ((title (or (alist-get 'title info) (alist-get 'id info))))
+               (if (buffer-live-p (gethash (alist-get 'id info) opencode-session-buffers))
+                   (propertize title 'face 'opencode-session-list-open-session)
+                 title)))
     ("Project" (or (gethash (alist-get 'projectID info) opencode--session-list-projects) "-"))
     ("Branch" (or (opencode-git-branch (opencode--session-directory info)) "-"))
     ("Last Updated" (opencode--session-list-time info 'updated))
@@ -348,6 +357,30 @@ A sortable number, never nil: vtable would propertize the name of nil."
   (seq-filter (lambda (buffer)
                 (eq (buffer-local-value 'major-mode buffer) 'opencode-session-list-mode))
               (buffer-list)))
+
+(defun opencode--session-list-update-buffer (id)
+  "Update session ID's row in each list after its buffer opens or closes."
+  (dolist (buffer (opencode--session-list-buffers))
+    (with-current-buffer buffer
+      (let ((at (vtable-current-object))
+            (offset (- (point) (line-beginning-position))))
+        (save-excursion
+          (goto-char (point-min))
+          (when-let* ((table (vtable-current-table))
+                      (info (seq-find (lambda (info) (equal (alist-get 'id info) id))
+                                      (vtable-objects table))))
+            (vtable-update-object table info)))
+        (when at
+          (vtable-goto-object at)
+          (forward-char (min offset (- (line-end-position) (point)))))))))
+
+(defun opencode--session-list-buffer-changed (id)
+  "Schedule a local update of session ID's row in each list."
+  ;; `kill-buffer' restores an excursion that row replacement would collapse.
+  (when (opencode--session-list-buffers)
+    (run-at-time 0 nil #'opencode--session-list-update-buffer id)))
+
+(add-hook 'opencode-session-buffer-functions #'opencode--session-list-buffer-changed)
 
 (defvar opencode--session-list-refresh-timer nil
   "Timer refreshing the session lists after sessions changed.")

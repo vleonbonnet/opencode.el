@@ -190,7 +190,91 @@ and filters sent with it are ignored."
       (should (equal (gethash opencode-test-project-id opencode--session-list-projects)
                      (file-name-nondirectory (directory-file-name opencode-test-workspace))))
       ;; Narrow batch windows truncate the column to its 12%.
-      (should (string-match-p "^reasoning opencode" (buffer-string))))))
+       (should (string-match-p "^reasoning opencode" (buffer-string))))))
+
+(defun opencode-test-session-list-highlighted-p (info)
+  "Return non-nil when INFO's title is highlighted in the current list."
+  (save-excursion
+    (goto-char (point-min))
+    (should (vtable-goto-object info))
+    (memq 'opencode-session-list-open-session
+          (ensure-list (get-text-property (point) 'face)))))
+
+(ert-deftest opencode-test-session-list-follows-open-buffers ()
+  "Open and close update both list scopes by ID, preserving table navigation."
+  (opencode-test-with-sessions
+    (dolist (scope (list 'all (cons opencode-test-workspace opencode-test-project-id)))
+      (with-temp-buffer
+        (opencode-session-list-mode)
+        (setq opencode--session-list-scope scope)
+        (opencode-session-list-refresh)
+        (let* ((id (opencode-test-scenario "text"))
+               (info (seq-find (lambda (info) (equal (alist-get 'id info) id))
+                               opencode--session-list-sessions))
+               (other (seq-find (lambda (info) (equal (alist-get 'id info)
+                                                      (opencode-test-scenario "reasoning")))
+                                opencode--session-list-sessions)))
+          ;; Equal titles must not make both rows look open.
+          (setf (alist-get 'title info) "Same title"
+                (alist-get 'title other) "Same title")
+          (opencode--session-list-render)
+          (vtable-sort-by-current-column)
+          (vtable-narrow-current-column)
+          (let* ((table (vtable-current-table))
+                 (sort (copy-tree (vtable-sort-by table)))
+                 (width (vtable-column-width (car (vtable-columns table)))))
+            (should-not (opencode-test-session-list-highlighted-p info))
+            (vtable-goto-object other)
+            (forward-char 3)
+            (setq opencode-test-requests nil)
+            (let ((buffer (opencode-test-open id)))
+              (accept-process-output nil 0.01)
+              (should-not (get-buffer-window buffer t))
+              (with-current-buffer buffer (rename-buffer "*renamed session*" t))
+              (should (eq (vtable-current-object) other))
+              (should (= (- (point) (line-beginning-position)) 3))
+              (should (opencode-test-session-list-highlighted-p info))
+              (should-not (opencode-test-session-list-highlighted-p other))
+              (should-not (text-properties-at 0 (alist-get 'title info)))
+              (should-not (seq-find (lambda (request)
+                                     (member (plist-get request :path) '("/api/session" "/api/project")))
+                                   opencode-test-requests))
+              (vtable-goto-object info)
+              (forward-char 2)
+              (setq opencode-test-requests nil)
+              (kill-buffer buffer)
+              (accept-process-output nil 0.01)
+              (should-not opencode-test-requests)
+              (should (eq (vtable-current-object) info))
+              (should (= (- (point) (line-beginning-position)) 2))
+              (should-not (opencode-test-session-list-highlighted-p info)))
+            (should (eq (vtable-current-table) table))
+            (should (equal (vtable-sort-by table) sort))
+            (should (equal (vtable-column-width (car (vtable-columns table))) width))))))))
+
+(ert-deftest opencode-test-session-list-existing-and-dead-buffers ()
+  "Initial rendering highlights live buffers, including ID-only titles, not dead ones."
+  (opencode-test-with-sessions
+    (let* ((id (opencode-test-scenario "text"))
+           (open (opencode-test-open id)))
+      (with-temp-buffer
+        (opencode-session-list-mode)
+        (setq opencode--session-list-scope 'all)
+        (opencode-session-list-refresh)
+        (let* ((info (seq-find (lambda (info) (equal (alist-get 'id info) id))
+                               opencode--session-list-sessions))
+               (other (seq-find (lambda (info) (not (equal (alist-get 'id info) id)))
+                                (vtable-objects (vtable-current-table)))))
+          (puthash (alist-get 'id other) (with-temp-buffer (current-buffer)) opencode-session-buffers)
+          (setf (alist-get 'title info) nil)
+          (opencode--session-list-render)
+          (should (opencode-test-session-list-highlighted-p info))
+          (should-not (opencode-test-session-list-highlighted-p other))
+          (opencode-session-list-toggle-subagents)
+          (should (opencode-test-session-list-highlighted-p info))
+          (kill-buffer open)
+          (accept-process-output nil 0.01)
+          (should-not (opencode-test-session-list-highlighted-p info)))))))
 
 (ert-deftest opencode-test-session-list-refreshes-after-events ()
   "A burst of session events refreshes the open lists once."

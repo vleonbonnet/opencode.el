@@ -35,7 +35,7 @@ On its first start, the service imports the sessions of OpenCode 1 in the backgr
 
 * Sessions
 
-=M-x opencode= lists the sessions of the current project, including those of its worktrees, with their branch. =M-x opencode-list-all-sessions= lists every project's. In a list:
+=M-x opencode= lists the sessions of the current project, including those of its worktrees, with their branch. =M-x opencode-list-all-sessions= lists every project's. Titles of sessions open in a buffer use =opencode-session-list-open-session= (inheriting =success=), even when the buffer is hidden; the highlight follows buffers opening and closing. In a list:
 
 | Key        | Action                              |
 |------------+-------------------------------------|
