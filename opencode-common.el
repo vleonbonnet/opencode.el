@@ -329,5 +329,21 @@ own prompts on the event stream."
               (apply #'string
                      (cl-loop repeat 14 collect (aref chars (random 62))))))))
 
+(defun opencode-identifier-time (id &optional now)
+  "Return the creation time, in float seconds, of ascending identifier ID, or nil.
+ID has the layout `opencode-generate-id' describes, as the service's
+permission and form IDs do.  Its 48 bits wrap every 2^36 milliseconds,
+about 795 days, so the time is the one closest to NOW, the current
+time by default.  Session IDs descend and do not qualify."
+  (when (and (stringp id)
+             (string-match "\\`[a-z]+_\\([0-9a-f]\\{12\\}\\)[0-9A-Za-z]\\{14\\}\\'" id))
+    (let* ((value (string-to-number (match-string 1 id) 16))
+           (period (ash 1 48))
+           (now (* 4096 (truncate (* 1000 (or now (float-time))))))
+           (candidate (+ (* (/ now period) period) value)))
+      (cond ((> (- candidate now) (/ period 2)) (cl-decf candidate period))
+            ((> (- now candidate) (/ period 2)) (cl-incf candidate period)))
+      (/ (/ candidate 4096) 1000.0))))
+
 (provide 'opencode-common)
 ;;; opencode-common.el ends here

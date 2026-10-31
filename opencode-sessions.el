@@ -29,11 +29,14 @@
 ;; worktrees, and the Branch column tells them apart.  Branches are read
 ;; from each worktree's HEAD: asking the server would activate a location
 ;; for every directory listed, and running Git would cost a process per
-;; directory.  Subagent sessions are hidden until `v' shows them.  Lists
-;; refresh when sessions are created, deleted, renamed, moved or forked,
-;; and render again when their window's width changes, since column
-;; limits are fractions of it.  Titles of sessions with live buffers are
-;; highlighted, following local buffer opens and closes.
+;; directory.  Subagent sessions are hidden until `v' shows them, and
+;; archived ones are left out.  The Status column shows each session's
+;; status from the session registry, `opencode-state', and follows it.
+;; Lists refresh when sessions are created, deleted, renamed, moved,
+;; forked, archived or restored, and render again when their window's
+;; width changes, since column limits are fractions of it.  Titles of
+;; sessions with live buffers are highlighted, following local buffer
+;; opens and closes.
 ;;
 ;; OpenCode 2 reports no change summary with sessions, and its diff route
 ;; runs Git over the turn's snapshots, so the lists have no column of
@@ -46,6 +49,7 @@
 (require 'opencode-events)
 (require 'opencode-http)
 (require 'opencode-session)
+(require 'opencode-state)
 (require 'url-util)
 (require 'vtable)
 
@@ -63,6 +67,45 @@
   '((t :inherit success))
   "Title of a session with a live buffer in a session list."
   :group 'opencode-faces)
+
+(defface opencode-session-status-waiting
+  '((t :inherit opencode-attention))
+  "Status of a session waiting on a permission request or a question."
+  :group 'opencode-faces)
+
+(defface opencode-session-status-working
+  '((t :inherit font-lock-keyword-face))
+  "Status of a session running a turn."
+  :group 'opencode-faces)
+
+(defface opencode-session-status-retrying
+  '((t :inherit opencode-session-status-working :slant italic))
+  "Status of a session whose turn waits to retry a failed request."
+  :group 'opencode-faces)
+
+(defface opencode-session-status-failed
+  '((t :inherit error))
+  "Status of a session whose turn failed unseen."
+  :group 'opencode-faces)
+
+(defface opencode-session-status-done
+  '((t :inherit success))
+  "Status of a session whose turn ended unseen."
+  :group 'opencode-faces)
+
+(defface opencode-session-status-idle
+  '((t :inherit shadow))
+  "Status of an idle session whose last turn was seen."
+  :group 'opencode-faces)
+
+(defconst opencode-session-status-icons
+  '((waiting "\U000F02D7" opencode-session-status-waiting)   ; nf-md-help_circle
+    (working "\U000F051F" opencode-session-status-working)   ; nf-md-timer_sand
+    (retrying "\uf021" opencode-session-status-retrying)     ; nf-fa-refresh
+    (failed "\uf057" opencode-session-status-failed)         ; nf-fa-times_circle
+    (done "\U000F05E0" opencode-session-status-done)         ; nf-md-check_circle
+    (idle "\uf10c" opencode-session-status-idle))            ; nf-fa-circle_o
+  "Session statuses, as `opencode-state-status' names them, with their icon and face.")
 
 ;;;; Server data
 
@@ -183,9 +226,29 @@ Return nil outside Git.  HEAD is read directly, without running Git."
 A sortable number, never nil: vtable would propertize the name of nil."
   (or (opencode-time-ago (alist-get key (alist-get 'time info))) 1.0e+INF))
 
+(defun opencode-session-status-label (status)
+  "Return STATUS, a session status symbol, as an icon and a name in its face."
+  (if-let* ((display (alist-get status opencode-session-status-icons)))
+      (propertize (format "%s %s" (car display) status) 'face (cadr display))
+    "-"))
+
+(defun opencode--session-list-status (info)
+  "Return the status cell of session INFO in a list.
+The registry knows running sessions and their requests; a session it
+does not hold is idle, and its info tells whether that was seen.  Cells
+are padded to the longest status: a changed row is redrawn within the
+column widths of the table."
+  (let ((label (opencode-session-status-label
+                (opencode-state-status (or (opencode-state-get (alist-get 'id info))
+                                           (opencode-state--info-entry info)))))
+        (longest (+ 2 (seq-max (mapcar (lambda (entry) (length (symbol-name (car entry))))
+                                       opencode-session-status-icons)))))
+    (concat label (make-string (max 0 (- longest (length label))) ?\s))))
+
 (defun opencode--session-list-columns ()
   "Return the columns of this list."
-  `((:name "Title" :max-width "45%")
+  `((:name "Status")
+    (:name "Title" :max-width "45%")
     ,@(when (eq opencode--session-list-scope 'all)
         '((:name "Project" :min-width 8 :max-width "12%")))
     (:name "Branch" :min-width 6 :max-width ,(if (eq opencode--session-list-scope 'all) "10%" "12%"))
@@ -195,6 +258,7 @@ A sortable number, never nil: vtable would propertize the name of nil."
 (defun opencode--session-list-value (info column table)
   "Return the cell of session INFO in COLUMN of TABLE."
   (pcase (vtable-column table column)
+    ("Status" (opencode--session-list-status info))
     ("Title" (let ((title (or (alist-get 'title info) (alist-get 'id info))))
                (if (buffer-live-p (gethash (alist-get 'id info) opencode-session-buffers))
                    (propertize title 'face 'opencode-session-list-open-session)
@@ -224,6 +288,7 @@ A sortable number, never nil: vtable would propertize the name of nil."
        :actions '("RET" opencode-session-list-open
                   "o" opencode-session-list-open
                   "x" opencode-session-list-delete
+                  "A" opencode-session-list-archive
                   "R" opencode-session-list-rename)
        :separator-width 2
        :keymap opencode-session-list-mode-map)
@@ -253,10 +318,11 @@ A sortable number, never nil: vtable would propertize the name of nil."
                     (when callback (funcall callback))))))
       (opencode-fetch-projects (lambda (data) (setq projects data) (done)))
       (opencode-fetch-sessions
-       (pcase scope
-         ('all nil)
-         (`(,_directory . ,(and project (pred stringp))) `((project . ,project)))
-         (`(,directory . ,_) `((directory . ,(opencode-directory-name directory)))))
+       `(,@(pcase scope
+             ('all nil)
+             (`(,_directory . ,(and project (pred stringp))) `((project . ,project)))
+             (`(,directory . ,_) `((directory . ,(opencode-directory-name directory)))))
+         (archived . "false"))
        (lambda (data) (setq sessions data) (done))))))
 
 (defun opencode--session-list-show (buffer)
@@ -268,7 +334,7 @@ A sortable number, never nil: vtable would propertize the name of nil."
 
 (defun opencode--session-list-open-buffer (name scope)
   "Show the list buffer NAME of SCOPE, creating and fetching it when needed."
-  (opencode-events-connect)
+  (opencode-state-ensure)
   (let ((buffer (get-buffer name)))
     (if (buffer-live-p buffer)
         (opencode--session-list-show buffer)
@@ -335,6 +401,12 @@ A sortable number, never nil: vtable would propertize the name of nil."
   "Delete session INFO after confirmation."
   (opencode-delete-session (alist-get 'id info)))
 
+(defun opencode-session-list-archive (info)
+  "Archive session INFO after confirmation."
+  (when (y-or-n-p (format "Archive the OpenCode session %s? "
+                          (or (alist-get 'title info) (alist-get 'id info))))
+    (opencode-session-archive (alist-get 'id info))))
+
 (defun opencode-session-list-rename (info)
   "Rename session INFO."
   (opencode-rename-session (alist-get 'id info)
@@ -385,20 +457,49 @@ A sortable number, never nil: vtable would propertize the name of nil."
 (defvar opencode--session-list-refresh-timer nil
   "Timer refreshing the session lists after sessions changed.")
 
-(defun opencode--session-list-changed (_event)
-  "Refresh every session list shortly, once a burst of session events ends."
+(defvar opencode--session-list-pending nil
+  "What the scheduled update of the session lists does.
+t fetches them again; otherwise it is the IDs of the sessions whose rows
+to draw again.")
+
+(defun opencode--session-list-update ()
+  "Run the update of the session lists scheduled by `opencode--session-list-schedule'."
+  (let ((pending opencode--session-list-pending))
+    (setq opencode--session-list-refresh-timer nil
+          opencode--session-list-pending nil)
+    (if (eq pending t)
+        (dolist (buffer (opencode--session-list-buffers))
+          (with-current-buffer buffer
+            (opencode-session-list-refresh)))
+      (dolist (id pending)
+        (opencode--session-list-update-buffer id)))))
+
+(defun opencode--session-list-schedule (what)
+  "Update every session list shortly, once a burst of changes ends.
+WHAT is t to fetch the lists again, or the ID of a session whose row
+only needs drawing again."
   (when (opencode--session-list-buffers)
+    (setq opencode--session-list-pending
+          (if (or (eq what t) (eq opencode--session-list-pending t))
+              t
+            (cl-adjoin what opencode--session-list-pending :test #'equal)))
     (when (timerp opencode--session-list-refresh-timer)
       (cancel-timer opencode--session-list-refresh-timer))
     (setq opencode--session-list-refresh-timer
-          (run-with-timer 1 nil (lambda ()
-                                  (setq opencode--session-list-refresh-timer nil)
-                                  (dolist (buffer (opencode--session-list-buffers))
-                                    (with-current-buffer buffer
-                                      (opencode-session-list-refresh))))))))
+          (run-with-timer 1 nil #'opencode--session-list-update))))
 
-(dolist (type '("session.created" "session.deleted" "session.renamed" "session.moved" "session.forked"))
+(defun opencode--session-list-changed (_event)
+  "Refresh every session list shortly, once a burst of session events ends."
+  (opencode--session-list-schedule t))
+
+(defun opencode--session-list-status-changed (id _old _new)
+  "Draw session ID's row again in every list once its status changed."
+  (opencode--session-list-schedule id))
+
+(dolist (type '("session.created" "session.deleted" "session.renamed" "session.moved" "session.forked"
+                "session.archived" "session.unarchived"))
   (opencode-events-register type #'opencode--session-list-changed))
+(add-hook 'opencode-state-change-functions #'opencode--session-list-status-changed)
 
 (defun opencode--session-lists-resize (frame)
   "Render the session lists shown in FRAME again where their width changed."

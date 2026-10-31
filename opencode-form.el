@@ -588,7 +588,8 @@ A question transient suspended from this buffer is resumed instead."
   (list :pending (opencode-open-forms)
         :at-point (when-let* ((entry (opencode--form-at-point)))
                     (lambda () (opencode-respond-form entry)))
-        :respond #'opencode-respond-form))
+        :respond #'opencode-respond-form
+        :sync (lambda (callback) (opencode-form-sync nil callback))))
 
 (add-to-list 'opencode-request-providers #'opencode--form-provider t)
 
@@ -611,12 +612,15 @@ A question transient suspended from this buffer is resumed instead."
     (opencode-with-session-buffer (alist-get 'sessionID data)
       (opencode--form-resolved (alist-get 'id data)))))
 
-(defun opencode-form-sync (&optional _info)
+(defun opencode-form-sync (&optional _info callback)
   "Reconcile this buffer's form queue with the server's pending forms.
 Only forms queued before the request started are forgotten, so one asked
 or answered meanwhile is not misfiled; a forgotten form whose block never
-completed was lost by the server and is reported."
-  (when opencode-session-id
+completed was lost by the server and is reported.  CALLBACK, when given,
+is called with no argument in this buffer afterwards, even when the
+request failed."
+  (if (not opencode-session-id)
+      (when callback (funcall callback))
     (let ((known (opencode-open-forms)))
       (opencode-request
        'get (format "/api/session/%s/form" opencode-session-id)
@@ -636,9 +640,11 @@ completed was lost by the server and is reported."
                                   (or (alist-get 'title (plist-get entry :form)) (plist-get entry :id)))
                           'opencode-attention)))))
                  (dolist (form forms)
-                   (opencode-form-queue form))))
-       :else (lambda (error) (message "OpenCode question sync failed: %s"
-                                      (opencode-error-describe error)))))))
+                   (opencode-form-queue form)))
+               (when callback (funcall callback)))
+       :else (lambda (error)
+               (message "OpenCode question sync failed: %s" (opencode-error-describe error))
+               (when callback (funcall callback)))))))
 
 (opencode-events-register "form.created" #'opencode--form-created)
 (opencode-events-register "form.replied" #'opencode--form-settled)

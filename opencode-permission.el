@@ -506,7 +506,8 @@ A transient suspended from this buffer is resumed instead."
   (list :pending opencode-pending-permissions
         :at-point (when-let* ((permission (opencode--permission-at-point)))
                     (lambda () (opencode-respond-permission permission)))
-        :respond #'opencode-respond-permission))
+        :respond #'opencode-respond-permission
+        :sync (lambda (callback) (opencode-permission-sync nil callback))))
 
 (add-to-list 'opencode-request-providers #'opencode--permission-provider)
 (add-hook 'opencode-blocks-attach-functions #'opencode--permission-attach)
@@ -537,11 +538,13 @@ somewhere to wait."
            ("reject" " [rejected]") ("always" " [accepted always]") (_ " [accepted]"))
          (if (equal (alist-get 'reply data) "reject") 'error 'success))))))
 
-(defun opencode-permission-sync (&optional _info)
+(defun opencode-permission-sync (&optional _info callback)
   "Reconcile this buffer's permission queue with the server's pending requests.
 A request the server no longer has is reported lost; one asked while no
-stream listened is queued."
-  (when opencode-session-id
+stream listened is queued.  CALLBACK, when given, is called with no
+argument in this buffer afterwards, even when the request failed."
+  (if (not opencode-session-id)
+      (when callback (funcall callback))
     (let ((known (copy-sequence opencode-pending-permissions)))
       (opencode-request
        'get (format "/api/session/%s/permission" opencode-session-id)
@@ -557,9 +560,11 @@ stream listened is queued."
                               (plist-get permission :title))
                       'opencode-attention)))
                  (dolist (request requests)
-                   (opencode-permission-queue request))))
-       :else (lambda (error) (message "OpenCode permission sync failed: %s"
-                                      (opencode-error-describe error)))))))
+                   (opencode-permission-queue request)))
+               (when callback (funcall callback)))
+       :else (lambda (error)
+               (message "OpenCode permission sync failed: %s" (opencode-error-describe error))
+               (when callback (funcall callback)))))))
 
 (opencode-events-register "permission.asked" #'opencode--permission-asked)
 (opencode-events-register "permission.replied" #'opencode--permission-replied)

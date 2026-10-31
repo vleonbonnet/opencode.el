@@ -35,12 +35,13 @@ On its first start, the service imports the sessions of OpenCode 1 in the backgr
 
 * Sessions
 
-=M-x opencode= lists the sessions of the current project, including those of its worktrees, with their branch. =M-x opencode-list-all-sessions= lists every project's. Titles of sessions open in a buffer use =opencode-session-list-open-session= (inheriting =success=), even when the buffer is hidden; the highlight follows buffers opening and closing. In a list:
+=M-x opencode= lists the sessions of the current project, including those of its worktrees, with their branch. =M-x opencode-list-all-sessions= lists every project's. Archived sessions are left out. The first column, Status, shows each session's status (see [[*Session state][Session state]]) as a Nerd Font icon and a name, in the face =opencode-session-status-waiting=, =-working=, =-retrying=, =-failed=, =-done= or =-idle=, and follows it as it changes. Titles of sessions open in a buffer use =opencode-session-list-open-session= (inheriting =success=), even when the buffer is hidden; the highlight follows buffers opening and closing. In a list:
 
 | Key        | Action                              |
 |------------+-------------------------------------|
 | =RET=, =o= | open the session                    |
 | =x=        | delete the session                  |
+| =A=        | archive the session                 |
 | =R=        | rename the session                  |
 | =n=        | new session in this directory       |
 | =v=        | show or hide subagent sessions      |
@@ -48,6 +49,16 @@ On its first start, the service imports the sessions of OpenCode 1 in the backgr
 | =g=, =r=   | refresh                             |
 
 Other entry points: =opencode-select-project=, =opencode-select-session=, =opencode-new-session=, =opencode-new-worktree= (a new branch in a worktree under =opencode-worktree-directory=, with a session in it), =opencode-select-open-session=, =opencode-consult-sessions=, and =opencode-visit-last-idle= or =opencode-select-idle= for sessions that finished or started waiting while not displayed.
+
+* Session state
+
+Emacs keeps the live state of the recent sessions and of every running one, whether or not they have a buffer, in the registry =opencode-state=: whether a turn runs, the retry it waits for, the permission requests and questions waiting on you, and how the last turn ended. It follows the service's events, and rebuilds itself from the service every time the event stream connects, whoever opened it; =opencode-state-ensure= opens the stream for it. =opencode-state-recent-limit= sets how many recent unarchived sessions it loads.
+
+A session's status, from =opencode-state-status=, is =waiting= while a request awaits you, =retrying= or =working= while a turn runs, =failed= or =done= when a turn ended that nobody viewed yet, and =idle= otherwise. =opencode-state-change-functions= run when a status changes and =opencode-state-updated-functions= when anything about a session does, for session lists, dashboards and mode lines.
+
+Whether a finished turn was seen is the service's read marker, shared by every client. Showing a session's buffer in the selected window of a focused frame, or a turn ending while it is shown there, marks the session viewed (=opencode-session-view=), for the TUI and the desktop app too; a session viewed in another client is no longer done in Emacs either.
+
+Archiving a session (=A= in a list, or =opencode-session-archive=) hides it from the lists and from =opencode-state-sessions= without deleting it; =opencode-session-archive= with a non-nil RESTORE argument brings it back. =opencode-session-interrupt=, =opencode-session-last-reply= and =opencode-respond-session= also act on a session by its ID, with or without a buffer.
 
 * Session buffers
 

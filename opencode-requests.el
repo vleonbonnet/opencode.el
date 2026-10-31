@@ -47,8 +47,10 @@
   "Functions describing the requests a session buffer waits on.
 Each returns, in the current buffer, nil or a plist with :pending (non-nil
 when a request awaits an answer), :at-point (a function answering the
-request at point, or nil) and :respond (a function answering the oldest
-request), tried in order.")
+request at point, or nil), :respond (a function answering the oldest
+request) and :sync (a function reconciling the buffer's requests with
+the server, then calling the function it receives with no argument),
+tried in order.")
 
 (defvar-local opencode--pending-children nil
   "Child session IDs, oldest first, whose requests await the user.")
@@ -134,6 +136,41 @@ switch to the subagent's session and answer there."
         (opencode--respond-child (car opencode--pending-children))
         t)
       (user-error "No pending OpenCode request")))
+
+(defun opencode--sync-requests (callback)
+  "Reconcile this buffer's requests with the server, then call CALLBACK in it."
+  (let* ((buffer (current-buffer))
+         (syncs (delq nil (mapcar (lambda (provider) (plist-get (funcall provider) :sync))
+                                  opencode-request-providers)))
+         (pending (length syncs)))
+    (cl-flet ((done ()
+                (when (and (zerop (cl-decf pending)) (buffer-live-p buffer))
+                  (with-current-buffer buffer (funcall callback)))))
+      (if syncs
+          (dolist (sync syncs) (funcall sync #'done))
+        (cl-incf pending)
+        (done)))))
+
+(defun opencode-respond-session (id &optional other-window)
+  "Show session ID's buffer, opening it if needed, and answer its request.
+OTHER-WINDOW shows it in another window.  The request answered is the
+one \\[opencode-respond] would answer there.  A buffer opened here
+first loads its transcript and the requests the session waits on, then
+is shown again and answers."
+  (let ((buffer (gethash id opencode-session-buffers)))
+    (if (buffer-live-p buffer)
+        (with-current-buffer (opencode--display buffer nil other-window)
+          (opencode-respond))
+      (opencode-session-open-by-id
+       id :other-window other-window
+       :callback (lambda (_info)
+                   (opencode--sync-requests
+                    (lambda ()
+                      (with-current-buffer (opencode--display (current-buffer) nil other-window)
+                        ;; From a callback, a signal would only print "error in process filter".
+                        (condition-case err
+                            (opencode-respond)
+                          (user-error (message "%s" (error-message-string err))))))))))))
 
 ;;;; Subagent requests in their parents
 

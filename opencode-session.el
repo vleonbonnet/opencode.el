@@ -55,6 +55,7 @@
 (require 'opencode-links)
 (require 'opencode-notify)
 (require 'opencode-render)
+(require 'opencode-state)
 (require 'savehist)
 (require 'yank-media)
 
@@ -1713,14 +1714,62 @@ A missing variant is the model's default, as the service compares them."
 
 ;;;; Session commands
 
+(defun opencode-session-interrupt (id)
+  "Interrupt the running turn of session ID, whether or not it has a buffer."
+  (opencode-request 'post (format "/api/session/%s/interrupt" id)
+                    :directory (opencode-state--directory id) :buffer nil
+                    :then (lambda (response)
+                            (unless (alist-get 'interrupted response)
+                              (message "Nothing to interrupt")))))
+
 (defun opencode-interrupt ()
   "Interrupt the running turn of this session."
   (interactive)
   (opencode--require-session)
-  (opencode-request 'post (format "/api/session/%s/interrupt" opencode-session-id)
-                    :then (lambda (response)
-                            (unless (alist-get 'interrupted response)
-                              (message "Nothing to interrupt")))))
+  (opencode-session-interrupt opencode-session-id))
+
+(defun opencode-session-archive (id &optional restore)
+  "Archive session ID, or with RESTORE restore it from the archive.
+Archived sessions stay whole; session lists and `opencode-state-sessions'
+leave them out."
+  (opencode-request 'patch (concat "/api/session/" id)
+                    :directory (opencode-state--directory id) :buffer nil
+                    :body `((archived . ,(if restore :false t)))))
+
+(defun opencode--reply-text (message)
+  "Return the text of assistant MESSAGE, or nil when it has none."
+  (when-let* ((text (opencode-content-text (alist-get 'content message)))
+              (text (string-trim text))
+              ((not (string-empty-p text))))
+    text))
+
+(defun opencode-session-last-reply (id callback &optional max-length)
+  "Call CALLBACK with the text of session ID's last assistant reply, or nil.
+The reply is the newest assistant message with text; steps that only
+called tools are skipped.  Its text is cut to MAX-LENGTH characters,
+2000 by default, the last one an ellipsis.  CALLBACK receives nil when
+there is no reply or the request fails."
+  (let ((max-length (or max-length 2000)))
+    (cl-labels ((page (cursor)
+                  (opencode-request
+                   'get (format "/api/session/%s/message" id)
+                   :directory (opencode-state--directory id) :buffer nil
+                   ;; A cursor carries its order, and the type must follow it.
+                   :query `((limit . 20) (type . "assistant")
+                            ,@(if cursor `((cursor . ,cursor)) '((order . "desc"))))
+                   :else (lambda (_) (funcall callback nil))
+                   :then (lambda (response)
+                           (let ((messages (opencode-request-data response))
+                                 (next (alist-get 'next (alist-get 'cursor response))))
+                             (if-let* ((text (seq-some #'opencode--reply-text messages)))
+                                 (funcall callback
+                                          (if (> (length text) max-length)
+                                              (concat (substring text 0 (max 0 (1- max-length))) "…")
+                                            text))
+                               (if (and messages next)
+                                   (page next)
+                                 (funcall callback nil))))))))
+      (page nil))))
 
 (defun opencode-rename-session (&optional id title)
   "Rename session ID, this one by default, to TITLE."
@@ -1875,15 +1924,38 @@ The files changed since are restored; the next prompt commits the revert."
         (copy-region-as-kill (treesit-node-start content) (treesit-node-end content))
       (kill-new ""))))
 
+(defun opencode--view-selected-session (&rest _)
+  "Mark the session shown in the selected window of a focused frame viewed.
+The read marker is the service's, so every client sees it read."
+  (let ((buffer (window-buffer (selected-window))))
+    (when-let* ((id (buffer-local-value 'opencode-session-id buffer))
+                ((opencode-buffer-active-p buffer)))
+      (opencode-session-view id))))
+
 (defun opencode--selection-changed (&optional _frame)
-  "Remember the selected session buffer and forget its idle alert."
+  "Remember the selected session buffer and forget its idle alert.
+The session shown in the selected window is marked viewed."
   (when opencode-session-id
     (setq opencode-alerted-sessions
           (seq-remove (lambda (info) (equal (alist-get 'id info) opencode-session-id))
                       opencode-alerted-sessions)
-          opencode-last-session-buffer (current-buffer))))
+          opencode-last-session-buffer (current-buffer)))
+  (opencode--view-selected-session))
+
+(defun opencode--view-finished-turn (id _old new)
+  "Mark session ID viewed when its turn ended, NEW, while its buffer is active."
+  (when-let* (((memq new '(done failed)))
+              (buffer (gethash id opencode-session-buffers))
+              ((buffer-live-p buffer))
+              ((opencode-buffer-active-p buffer)))
+    (opencode-session-view id)))
 
 (add-hook 'window-selection-change-functions #'opencode--selection-changed)
+;; A session buffer also becomes active by being shown in the selected
+;; window, or by its frame gaining focus.
+(add-hook 'window-buffer-change-functions #'opencode--view-selected-session)
+(add-function :after after-focus-change-function #'opencode--view-selected-session)
+(add-hook 'opencode-state-change-functions #'opencode--view-finished-turn)
 
 ;;;; Navigating sessions
 

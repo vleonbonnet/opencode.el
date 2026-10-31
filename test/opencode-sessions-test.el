@@ -166,12 +166,14 @@ and filters sent with it are ignored."
       (setq opencode--session-list-scope (cons opencode-test-workspace opencode-test-project-id))
       (opencode-session-list-refresh)
       (let ((text (buffer-string))
+            (done (regexp-quote (opencode-session-status-label 'done)))
             (child (regexp-quote (opencode-test-session-title (opencode-test-scenario "subagent-child")))))
-        (should (string-match-p "^history renamed " text))
-        (should (string-match-p "^reasoning " text))
+        ;; Finished turns nobody viewed show as done.
+        (should (string-match-p (concat "^" done " +history renamed ") text))
+        (should (string-match-p (concat "^" done " +reasoning ") text))
         (should-not (string-match-p child text))
         (goto-char (point-min))
-        (should (equal (opencode-test-list-columns) '("Title" "Branch" "Last Updated" "Created")))
+        (should (equal (opencode-test-list-columns) '("Status" "Title" "Branch" "Last Updated" "Created")))
         (opencode-session-list-toggle-subagents)
         (should (string-match-p child (buffer-string))))
       (goto-char (point-min))
@@ -190,15 +192,19 @@ and filters sent with it are ignored."
       (should (equal (gethash opencode-test-project-id opencode--session-list-projects)
                      (file-name-nondirectory (directory-file-name opencode-test-workspace))))
       ;; Narrow batch windows truncate the column to its 12%.
-       (should (string-match-p "^reasoning opencode" (buffer-string))))))
+      (should (string-match-p (concat "^" (regexp-quote (opencode-session-status-label 'done))
+                                      " +reasoning opencode")
+                              (buffer-string))))))
 
 (defun opencode-test-session-list-highlighted-p (info)
   "Return non-nil when INFO's title is highlighted in the current list."
   (save-excursion
     (goto-char (point-min))
-    (should (vtable-goto-object info))
-    (memq 'opencode-session-list-open-session
-          (ensure-list (get-text-property (point) 'face)))))
+    (let ((title (seq-position (opencode-test-list-columns) "Title")))
+      (should (vtable-goto-object info))
+      (should (vtable-goto-column title))
+      (memq 'opencode-session-list-open-session
+            (ensure-list (get-text-property (point) 'face))))))
 
 (ert-deftest opencode-test-session-list-follows-open-buffers ()
   "Open and close update both list scopes by ID, preserving table navigation."
@@ -298,6 +304,92 @@ and filters sent with it are ignored."
           (should (seq-find (lambda (request) (equal (plist-get request :path) "/api/session"))
                             opencode-test-requests))
           (should opencode--session-list-sessions))))))
+
+(ert-deftest opencode-test-session-list-status ()
+  "The Status column shows the registry's status, and a change redraws only that row."
+  (opencode-test-with-sessions
+    (let ((timers nil)
+          (opencode--session-list-refresh-timer nil)
+          (opencode--session-list-pending nil))
+      (with-temp-buffer
+        (opencode-session-list-mode)
+        (setq opencode--session-list-scope 'all)
+        (opencode-session-list-refresh)
+        ;; Archived sessions are left out; later pages carry the filter in their cursor.
+        (should (equal (alist-get 'archived (plist-get (seq-find (lambda (request)
+                                                                    (equal (plist-get request :path) "/api/session"))
+                                                                  (reverse opencode-test-requests))
+                                                        :query))
+                       "false"))
+        (opencode-test-dispatch '(((type . "server.connected") (data))))
+        (should (opencode-state-ready-p))
+        (let* ((info (car (vtable-objects (vtable-current-table))))
+               (id (alist-get 'id info)))
+          (should (opencode-state-get id))
+          (cl-flet ((status-cell (&optional (status 'done))
+                      (save-excursion
+                        (goto-char (point-min))
+                        (should (vtable-goto-object info))
+                        (should (vtable-goto-column 0))
+                        (list (string-trim (buffer-substring-no-properties
+                                            (point) (next-single-property-change (point) 'vtable-column)))
+                              (car (memq (get-text-property 0 'face (opencode-session-status-label status))
+                                         (ensure-list (get-text-property (point) 'face))))))))
+            (should (equal (status-cell) (list (opencode-session-status-label 'done) 'opencode-session-status-done)))
+            (cl-letf (((symbol-function 'run-with-timer)
+                       (lambda (_delay _repeat function)
+                         (let ((timer (timer-create)))
+                           (timer-set-function timer function)
+                           (push timer timers)
+                           timer))))
+              (opencode-test-dispatch `(((type . "session.execution.started") (created . 1)
+                                         (data (sessionID . ,id)))))
+              (should (= (length timers) 1))
+              (setq opencode-test-requests nil)
+              (funcall (timer--function (car timers)))
+              ;; Only the row is drawn again; nothing is fetched.
+              (should-not opencode-test-requests)
+              (should (equal (status-cell 'working)
+                             (list (opencode-session-status-label 'working) 'opencode-session-status-working)))
+              ;; Archiving or restoring a session refreshes the lists.
+              (opencode-test-dispatch `(((type . "session.archived") (created . 2) (data (sessionID . ,id)))))
+              (should (= (length timers) 2))
+              (should (eq opencode--session-list-pending t)))))))))
+
+(ert-deftest opencode-test-session-status-labels ()
+  "Every status has a one-glyph icon and its own face."
+  (dolist (status '(waiting working retrying failed done idle))
+    (let ((label (opencode-session-status-label status)))
+      (should (string-match-p (format "\\`. %s\\'" status) label))
+      (should (eq (get-text-property 0 'face label)
+                  (intern (format "opencode-session-status-%s" status))))
+      (should (facep (get-text-property 0 'face label)))))
+  (should (equal (opencode-session-status-label nil) "-")))
+
+(ert-deftest opencode-test-session-list-archive ()
+  "A archives the session at point once confirmed."
+  (opencode-test-with-sessions
+    (with-temp-buffer
+      (opencode-session-list-mode)
+      (setq opencode--session-list-scope 'all)
+      (opencode-session-list-refresh)
+      (goto-char (point-min))
+      (let* ((info (vtable-current-object))
+             (command (keymap-lookup (get-char-property (point) 'keymap) "A"))
+             (answer nil)
+             (asked nil))
+        (should command)
+        (cl-letf (((symbol-function 'y-or-n-p) (lambda (prompt) (setq asked prompt) answer)))
+          (setq opencode-test-requests nil)
+          (call-interactively command)
+          (should (string-match-p (regexp-quote (alist-get 'title info)) asked))
+          (should-not opencode-test-requests)
+          (setq answer t)
+          (call-interactively command))
+        (should (equal (mapcar (lambda (request) (list (plist-get request :method) (plist-get request :path)
+                                                       (plist-get request :body)))
+                               opencode-test-requests)
+                       `((patch ,(concat "/api/session/" (alist-get 'id info)) ((archived . t))))))))))
 
 (ert-deftest opencode-test-session-lists-capital-drive ()
   "Lists of a directory outside any project filter on it with a capital drive letter."

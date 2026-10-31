@@ -41,6 +41,7 @@
 (require 'opencode-service)
 (require 'opencode-http)
 (require 'opencode-events)
+(require 'opencode-state)
 (require 'opencode-render)
 (require 'opencode-links)
 (require 'opencode-blocks)
