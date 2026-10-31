@@ -674,15 +674,20 @@ are covered by their answers; those received meanwhile are held."
 CALLBACK, a function of no argument, runs at once when the registry is
 ready on the current stream, else once it is.  The registry bootstraps
 on every connection of the stream, whoever opens it; this also retries
-a bootstrap that failed."
+a bootstrap that failed, and adopts a stream whose connection the
+registry missed, having been loaded after it."
   (opencode-events-connect)
   (if (opencode-state-ready-p)
       (when callback (funcall callback))
     (when callback (push callback opencode-state--waiters))
-    (when (and (eq opencode-state--stream opencode-events--process)
-               (opencode-events-connected-p)
-               (not opencode-state--bootstrapping))
-      (opencode-state--bootstrap))))
+    (when (opencode-events-connected-p)
+      (cond
+       ((eq opencode-state--stream opencode-events--process)
+        (unless opencode-state--bootstrapping
+          (opencode-state--bootstrap)))
+       ((and opencode-events--process
+             (eq opencode-events--greeted opencode-events--process))
+        (opencode-state--connected nil))))))
 
 (opencode-events-register "server.connected" #'opencode-state--connected)
 ;; A fork announces its new session by `session.forked' alone; being

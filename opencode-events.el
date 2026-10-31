@@ -86,6 +86,9 @@
 (defvar opencode-events-connected-hook nil
   "Hook run, after a stream (re)opens, on its `server.connected' event.")
 
+(defvar opencode-events--greeted nil
+  "Stream process whose `server.connected' event was handled, or nil.")
+
 (defvar-local opencode-events--body-start nil
   "Position after the HTTP headers in the stream buffer.")
 
@@ -181,7 +184,8 @@ FUNCTION receives the event alist with members `type', `data', `id',
           (goto-char (point-max))
           (insert (format-time-string "%T ") (or type "?") "\n"))))
     (when (equal type "server.connected")
-      (setq opencode-events--backoff 1))
+      (setq opencode-events--backoff 1
+            opencode-events--greeted opencode-events--process))
     (dolist (handler (append (gethash type opencode-events--handlers)
                              (gethash t opencode-events--handlers)))
       (condition-case err

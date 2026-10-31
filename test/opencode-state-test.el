@@ -301,6 +301,35 @@ DATA are the members of its data besides `sessionID'."
                           (opencode-test-state-requests))
                3))))
 
+(ert-deftest opencode-test-state-adopts-earlier-connection ()
+  "A registry loaded after the stream connected bootstraps on `opencode-state-ensure'."
+  (opencode-test-with-state-server (list :sessions (list (opencode-test-state-info "ses_a")))
+    (let ((opencode-events--process 'test-stream))
+      (opencode-test-state-connect)
+      (should (opencode-state-ready-p))
+      ;; Forget the connection, as a registry loaded after it never saw it.
+      (setq opencode-state--stream 'none
+            opencode-state--ready nil)
+      (clrhash opencode-state--sessions)
+      (setq opencode-test-requests nil)
+      (let ((ready nil))
+        (opencode-state-ensure (lambda () (setq ready t)))
+        (should ready)
+        (should (opencode-state-ready-p))
+        (should (eq (opencode-state-status "ses_a") 'idle))
+        (should (member "/api/session" (opencode-test-state-requests)))))))
+
+(ert-deftest opencode-test-state-waits-for-greeting ()
+  "An open stream not yet greeted by `server.connected' is not adopted early."
+  (opencode-test-with-state-server (list :sessions (list (opencode-test-state-info "ses_a")))
+    (let ((opencode-events--process 'test-stream)
+          (ready nil))
+      (opencode-state-ensure (lambda () (setq ready t)))
+      (should-not ready)
+      (should-not opencode-test-requests)
+      (opencode-test-state-connect)
+      (should ready))))
+
 (ert-deftest opencode-test-state-follows-only-after-connecting ()
   "Events before `server.connected', or of another stream, leave the registry alone."
   (opencode-test-with-state-server (list :sessions (list (opencode-test-state-info "ses_a")))

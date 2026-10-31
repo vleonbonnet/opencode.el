@@ -187,6 +187,7 @@ The service refuses message pages asked for so."
   (declare (indent 0) (debug t))
   `(let ((opencode-state--sessions (make-hash-table :test #'equal))
          (opencode-state--stream 'none)
+         (opencode-events--greeted nil)
          (opencode-state--ready nil)
          (opencode-state--bootstrapping nil)
          (opencode-state--generation 0)
