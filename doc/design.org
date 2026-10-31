@@ -20,7 +20,7 @@
 | =opencode-form.el=        | Question forms and other forms                                                                                          |
 | =opencode-notify.el=      | Notification log, filters and operating-system backends                                                                 |
 | =opencode-modeline.el=    | The session mode line and long-context pricing tiers                                                                    |
-| =opencode-sessions.el=    | Session lists and their Status column, projects, worktrees, MCP servers                                                 |
+| =opencode-sessions.el=    | Session lists and their status icons, projects, worktrees, MCP servers                                                  |
 | =opencode-edits.el=       | Post-edit hooks, safe visiting and saving, indentation, Prettier, Flycheck                                              |
 | =opencode-desktop.el=     | Desktop saving and in-place restoring                                                                                   |
 | =opencode-convert.el=     | Markdown transcripts                                                                                                    |

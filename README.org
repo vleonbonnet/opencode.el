@@ -35,7 +35,7 @@ On its first start, the service imports the sessions of OpenCode 1 in the backgr
 
 * Sessions
 
-=M-x opencode= lists the sessions of the current project, including those of its worktrees, with their branch. =M-x opencode-list-all-sessions= lists every project's. Archived sessions are left out. The first column, Status, shows each session's status (see [[*Session state][Session state]]) as a Nerd Font icon and a name, in the face =opencode-session-status-waiting=, =-working=, =-retrying=, =-failed=, =-done= or =-idle=, and follows it as it changes. Titles of sessions open in a buffer use =opencode-session-list-open-session= (inheriting =success=), even when the buffer is hidden; the highlight follows buffers opening and closing. In a list:
+=M-x opencode= lists the sessions of the current project, including those of its worktrees, with their branch. =M-x opencode-list-all-sessions= lists every project's. Archived sessions are left out. The first column shows each session's status (see [[*Session state][Session state]]) as an icon, its name in the tooltip, and follows it as it changes: =⚑= waiting for you, =◐= working, =↻= retrying, =✗= failed and =✓= done while unseen, =·= idle. =opencode-session-status-icons= sets the icon and face of each. Titles of sessions open in a buffer use =opencode-session-list-open-session= (inheriting =success=), even when the buffer is hidden; the highlight follows buffers opening and closing. In a list:
 
 | Key        | Action                              |
 |------------+-------------------------------------|

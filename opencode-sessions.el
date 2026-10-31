@@ -30,8 +30,9 @@
 ;; from each worktree's HEAD: asking the server would activate a location
 ;; for every directory listed, and running Git would cost a process per
 ;; directory.  Subagent sessions are hidden until `v' shows them, and
-;; archived ones are left out.  The Status column shows each session's
-;; status from the session registry, `opencode-state', and follows it.
+;; archived ones are left out.  The first column shows each session's
+;; status from the session registry, `opencode-state', as an icon, and
+;; follows it.
 ;; Lists refresh when sessions are created, deleted, renamed, moved,
 ;; forked, archived or restored, and render again when their window's
 ;; width changes, since column limits are fractions of it.  Titles of
@@ -98,14 +99,18 @@
   "Status of an idle session whose last turn was seen."
   :group 'opencode-faces)
 
-(defconst opencode-session-status-icons
-  '((waiting "\U000F02D7" opencode-session-status-waiting)   ; nf-md-help_circle
-    (working "\U000F051F" opencode-session-status-working)   ; nf-md-timer_sand
-    (retrying "\uf021" opencode-session-status-retrying)     ; nf-fa-refresh
-    (failed "\uf057" opencode-session-status-failed)         ; nf-fa-times_circle
-    (done "\U000F05E0" opencode-session-status-done)         ; nf-md-check_circle
-    (idle "\uf10c" opencode-session-status-idle))            ; nf-fa-circle_o
-  "Session statuses, as `opencode-state-status' names them, with their icon and face.")
+(defcustom opencode-session-status-icons
+  '((waiting "⚑" opencode-session-status-waiting)
+    (working "◐" opencode-session-status-working)
+    (retrying "↻" opencode-session-status-retrying)
+    (failed "✗" opencode-session-status-failed)
+    (done "✓" opencode-session-status-done)
+    (idle "·" opencode-session-status-idle))
+  "Session statuses, as `opencode-state-status' names them, with their icon and face.
+Session lists show the icon alone, and name the status in its tooltip."
+  :type '(alist :key-type (symbol :tag "Status")
+                :value-type (list (string :tag "Icon") (face :tag "Face")))
+  :group 'opencode)
 
 ;;;; Server data
 
@@ -226,28 +231,28 @@ Return nil outside Git.  HEAD is read directly, without running Git."
 A sortable number, never nil: vtable would propertize the name of nil."
   (or (opencode-time-ago (alist-get key (alist-get 'time info))) 1.0e+INF))
 
-(defun opencode-session-status-label (status)
-  "Return STATUS, a session status symbol, as an icon and a name in its face."
+(defun opencode-session-status-icon (status)
+  "Return the icon of STATUS, a session status symbol, in its face.
+Its tooltip names the status; an unknown status is \"-\"."
   (if-let* ((display (alist-get status opencode-session-status-icons)))
-      (propertize (format "%s %s" (car display) status) 'face (cadr display))
+      (propertize (car display) 'face (cadr display) 'help-echo (symbol-name status))
     "-"))
 
 (defun opencode--session-list-status (info)
   "Return the status cell of session INFO in a list.
 The registry knows running sessions and their requests; a session it
-does not hold is idle, and its info tells whether that was seen.  Cells
-are padded to the longest status: a changed row is redrawn within the
-column widths of the table."
-  (let ((label (opencode-session-status-label
-                (opencode-state-status (or (opencode-state-get (alist-get 'id info))
-                                           (opencode-state--info-entry info)))))
-        (longest (+ 2 (seq-max (mapcar (lambda (entry) (length (symbol-name (car entry))))
-                                       opencode-session-status-icons)))))
-    (concat label (make-string (max 0 (- longest (length label))) ?\s))))
+does not hold is idle, and its info tells whether that was seen."
+  (opencode-session-status-icon
+   (opencode-state-status (or (opencode-state-get (alist-get 'id info))
+                              (opencode-state--info-entry info)))))
 
 (defun opencode--session-list-columns ()
-  "Return the columns of this list."
-  `((:name "Status")
+  "Return the columns of this list.
+The status column has no name, to stay as narrow as its icons; its
+width is fixed, so a row drawn again with a wider icon keeps the table
+aligned."
+  `((:name "" :width ,(seq-max (mapcar (lambda (entry) (string-width (cadr entry)))
+                                       opencode-session-status-icons)))
     (:name "Title" :max-width "45%")
     ,@(when (eq opencode--session-list-scope 'all)
         '((:name "Project" :min-width 8 :max-width "12%")))
@@ -258,7 +263,7 @@ column widths of the table."
 (defun opencode--session-list-value (info column table)
   "Return the cell of session INFO in COLUMN of TABLE."
   (pcase (vtable-column table column)
-    ("Status" (opencode--session-list-status info))
+    ("" (opencode--session-list-status info))
     ("Title" (let ((title (or (alist-get 'title info) (alist-get 'id info))))
                (if (buffer-live-p (gethash (alist-get 'id info) opencode-session-buffers))
                    (propertize title 'face 'opencode-session-list-open-session)
