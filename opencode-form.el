@@ -129,7 +129,8 @@ TITLE."
                              :waiting-kind (and waiting 'question)
                              :waiting-description (and waiting (not question) title))
       (overlay-put overlay 'help-echo
-                   (and waiting (substitute-command-keys "Question pending.  \\[opencode-respond] answers it.")))
+                   (and waiting (format "Question pending.  %s answers it."
+                                           (opencode-command-keys 'opencode-respond))))
       (when question
         (opencode-call-preserving-viewport
          (overlay-buffer overlay)
@@ -235,7 +236,7 @@ shows typed answers in place of the option keys."
         (force-mode-line-update)
         (opencode-request-state-changed)
         (if (opencode-buffer-active-p (current-buffer))
-            (message (substitute-command-keys "OpenCode question pending; \\[opencode-respond] answers it"))
+            (message "OpenCode question pending; %s answers it" (opencode-command-keys 'opencode-respond))
           (opencode-notify-session
            "OpenCode question"
            (or (alist-get 'description (car (opencode-form-fields form))) (alist-get 'title form) "")
@@ -277,7 +278,7 @@ shows typed answers in place of the option keys."
                     (opencode-request-state-changed))
                   (message "OpenCode %s failed (%s); %s retries"
                            (if cancel "dismissal" "reply") (opencode-error-describe error)
-                           (substitute-command-keys "\\[opencode-respond]")))))
+                           (opencode-command-keys 'opencode-respond)))))
       (if cancel
           (opencode-request 'delete (format "/api/session/%s/form/%s" opencode-session-id id)
                             :query '((message . "dismissed"))
@@ -511,9 +512,9 @@ shows typed answers in place of the option keys."
   (unless opencode-question--handled
     (opencode--question-save)
     (if (opencode-transient-suspended-p 'opencode-question-transient)
-        (message (substitute-command-keys "OpenCode question suspended; \\[opencode-respond] resumes it"))
+        (message "OpenCode question suspended; %s resumes it" (opencode-command-keys 'opencode-respond))
       (setq opencode--active-form nil)
-      (message (substitute-command-keys "OpenCode question deferred; \\[opencode-respond] resumes it")))))
+      (message "OpenCode question deferred; %s resumes it" (opencode-command-keys 'opencode-respond)))))
 
 (defun opencode--form-close-transient ()
   "Close the transient of the active form, resolved elsewhere."
@@ -585,7 +586,8 @@ A question transient suspended from this buffer is resumed instead."
 
 (defun opencode--form-provider ()
   "Describe this buffer's pending forms for `opencode-respond'."
-  (list :pending (opencode-open-forms)
+  (list :kind 'question
+        :pending (opencode-open-forms)
         :at-point (when-let* ((entry (opencode--form-at-point)))
                     (lambda () (opencode-respond-form entry)))
         :respond #'opencode-respond-form

@@ -216,9 +216,8 @@ The transient shows the full command, so the block stays collapsed."
                            :waiting-description
                            (opencode-permission-reasons-summary (plist-get permission :reasons)))
     (overlay-put overlay 'help-echo
-                 (substitute-command-keys
-                  (format "Permission pending: %s.  \\[opencode-respond] responds."
-                          (plist-get permission :title))))
+                 (format "Permission pending: %s.  %s responds."
+                         (plist-get permission :title) (opencode-command-keys 'opencode-respond)))
     overlay))
 
 (defun opencode--permission-clear-block (permission)
@@ -282,8 +281,8 @@ The transient shows the full command, so the block stays collapsed."
         (force-mode-line-update)
         (opencode-request-state-changed)
         (if (opencode-buffer-active-p (current-buffer))
-            (message (substitute-command-keys
-                      "OpenCode permission pending; \\[opencode-respond] answers it"))
+            (message "OpenCode permission pending; %s answers it"
+                     (opencode-command-keys 'opencode-respond))
           (opencode-notify-session "OpenCode permission request" (plist-get permission :title)
                                    'permission .id)
           (opencode-alert-session))))))
@@ -336,7 +335,7 @@ The transient shows the full command, so the block stays collapsed."
                  (force-mode-line-update))
                (message "OpenCode permission reply failed (%s); %s retries"
                         (opencode-error-describe error)
-                        (substitute-command-keys "\\[opencode-respond]")))))))
+                        (opencode-command-keys 'opencode-respond)))))))
 
 ;;;; Hand-off
 
@@ -455,10 +454,10 @@ The transient shows the full command, so the block stays collapsed."
   "Keep a dismissed request pending; only a suspended one stays active."
   (remove-hook 'transient-exit-hook #'opencode--permission-on-exit)
   (if (opencode-transient-suspended-p 'opencode-permission-transient)
-      (message (substitute-command-keys "OpenCode permission suspended; \\[opencode-respond] resumes it"))
+      (message "OpenCode permission suspended; %s resumes it" (opencode-command-keys 'opencode-respond))
     (when opencode--active-permission
       (setq opencode--active-permission nil)
-      (message (substitute-command-keys "OpenCode permission deferred; \\[opencode-respond] resumes it")))))
+      (message "OpenCode permission deferred; %s resumes it" (opencode-command-keys 'opencode-respond)))))
 
 (defun opencode--permission-close-transient ()
   "Close the permission transient because its request was resolved elsewhere."
@@ -503,7 +502,8 @@ A transient suspended from this buffer is resumed instead."
 
 (defun opencode--permission-provider ()
   "Describe this buffer's pending permissions for `opencode-respond'."
-  (list :pending opencode-pending-permissions
+  (list :kind 'permission
+        :pending opencode-pending-permissions
         :at-point (when-let* ((permission (opencode--permission-at-point)))
                     (lambda () (opencode-respond-permission permission)))
         :respond #'opencode-respond-permission

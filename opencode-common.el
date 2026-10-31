@@ -109,6 +109,38 @@ them avoids an expensive fallback search on every redisplay."
        (with-current-buffer ,buffer
          ,@body))))
 
+;;;; Key hints
+
+(defcustom opencode-command-keys-function nil
+  "Function returning the keys that run a command, for hints, or nil.
+It is called with the command, a symbol, in the buffer the hint is
+about, and returns the keys as a string in `key-description' form, such
+as \"C-\\=' A\", or nil when it binds none.  opencode.el binds few keys
+of its own and leaves its commands to packages such as drover, which
+set this so that hints name their keys, as in \"OpenCode question
+pending; C-\\=' A answers it\".  When this is nil or returns nil,
+`substitute-command-keys' finds the keys in the current keymaps, or,
+when none runs the command, gives \\[execute-extended-command] followed
+by its name."
+  :type '(choice (const :tag "Keymaps only" nil) function)
+  :group 'opencode)
+
+(defun opencode-command-keys (command &optional keymap)
+  "Return the keys that run COMMAND, as a string for a hint to the user.
+`opencode-command-keys-function' is asked first; else the keys come from
+KEYMAP, a variable holding a keymap, when given, or from the current
+buffer's keymaps, as `substitute-command-keys' finds them, which gives
+\\[execute-extended-command] followed by its name when no key runs it.
+Every hint naming a command goes through here."
+  (let ((keys (and opencode-command-keys-function
+                   (funcall opencode-command-keys-function command))))
+    (if (and (stringp keys) (not (string-empty-p keys)))
+        (if (get-text-property 0 'face keys)
+            keys
+          (propertize keys 'face 'help-key-binding))
+      (substitute-command-keys
+       (format "%s\\[%s]" (if keymap (format "\\<%s>" keymap) "") command)))))
+
 ;;;; Helpers
 
 (defun opencode--upcase-drive (name)

@@ -43,6 +43,8 @@ Other entry points: =opencode-select-project=, =opencode-select-session=, =openc
 
 opencode.el binds only the keys every Comint, special-mode or vtable user expects, and leaves its other commands unbound. [[https://github.com/vleonbonnet/drover][drover]] provides key maps for them: one-key session actions in session lists, and a transient (=drover-dispatch=) holding those, the prompt's commands and global ones. Without drover, call the commands with =M-x= or bind them yourself.
 
+Messages that tell which command to run, such as "OpenCode question pending; C-' A answers it", name its keys through =opencode-command-keys=. That asks =opencode-command-keys-function= first: a function of a command, called in the buffer the hint is about, returning the keys that run it as a string in =key-description= form, or nil. drover sets it to name the keys of its maps. When it is nil or returns nil, the keys come from the current keymaps as =substitute-command-keys= finds them, or the hint reads =M-x= and the command's name.
+
 * Session state
 
 Emacs keeps the live state of the recent sessions and of every running one, whether or not they have a buffer, in the registry =opencode-state=: whether a turn runs, the retry it waits for, the permission requests and questions waiting on you, and how the last turn ended. It follows the service's events, and rebuilds itself from the service every time the event stream connects, whoever opened it; =opencode-state-ensure= opens the stream for it. =opencode-state-recent-limit= sets how many recent unarchived sessions it loads.
@@ -93,6 +95,8 @@ The other commands act on the current session:
 
 The commands that edit the input (attaching, mentioning, slash commands) also work from other buffers, on the input of the last selected session buffer, and put what they insert at point when it is in the input, else at its end. =opencode-insert-slash-command= makes the text already typed the command's arguments, and replaces a command the input starts with.
 
+=opencode-fork-session= and =opencode-revert-to-point= cut after the prompt or answer at point: in a prompt they keep it and drop its answer, in an answer they keep it and drop from the next prompt on. A prompt typed here becomes part of the conversation when the service delivers it, at once for an idle session, at the next step of a running turn when steering, after the turn when queued, and only from then on can a cut be made at it. A prompt typed while a turn streams stays where it was typed, and the cut follows the conversation's order rather than the buffer's. A slash command's input cuts as the prompt the service made of it; a shell command (=!=) makes no prompt, so a cut in it falls at the next prompt.
+
 Images pasted with =yank-media= are attached to the next prompt.
 
 =M-x cd= in a session buffer moves the session to the chosen directory. The buffer's directory follows the server: it changes when the move takes effect, and stays at the last confirmed location while a request is pending or if it fails. Moves made by the agent or another client are reflected automatically, including after reconnecting.
@@ -102,6 +106,8 @@ The mode line shows the session's status, title, agent, model, variant, provider
 * Permissions and questions
 
 A permission request marks the tool call that asked and waits; it never takes focus. =opencode-respond= opens it: accept once (=o=), always (=a=), reject and stop (=n=), reject with feedback (=f=), or hand the task off to another primary agent (=h=). Rejection with feedback blocks the tool but lets the assistant continue using the text you enter; plain rejection stops the current execution. Questions from the question tool open as a form, one question at a time, with your own answer always possible. Requests of a subagent show on the parent session's block. An answer given in another client clears the request in Emacs.
+
+While a request waits, the agent's step waits with it, and a prompt sent then is not an answer: the service delivers a steering prompt or command at the agent's next step, which comes only once the request is answered or dismissed. So =RET= asks first when the session, or one of its subagents, waits on a request: answer it (=opencode-respond=, keeping the input), send anyway (the prompt waits for the request to be settled), or cancel (keeping the input). Queued input (=opencode-queue-input=) waits for the end of the turn anyway, and a shell command runs at once, so neither asks; neither do sends that run no check, such as scheduled ones through =opencode-session-send=, which wait the same way.
 
 * Edits
 

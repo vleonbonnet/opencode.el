@@ -6,7 +6,7 @@
 | Module                    | Responsibility                                                                                                          |
 |---------------------------+-------------------------------------------------------------------------------------------------------------------------|
 | =opencode.el=             | Entry point: loads every module, autoloads the commands and the desktop handler                                         |
-| =opencode-common.el=      | Groups, faces, shared state, directory normalization, identifiers, small helpers                                        |
+| =opencode-common.el=      | Groups, faces, shared state, key hints, directory normalization, identifiers, small helpers                             |
 | =opencode-service.el=     | Service discovery from =service.json=, probing, =opencode service start/restart=, version checks                        |
 | =opencode-http.el=        | =opencode-request=: authentication, location header, JSON, retries, error reporting                                     |
 | =opencode-events.el=      | The one SSE stream: frame scanning, queued dispatch, heartbeat watchdog, reconnection                                   |
@@ -15,7 +15,7 @@
 | =opencode-links.el=       | File, Org and Markdown links in the transcript                                                                          |
 | =opencode-blocks.el=      | Collapsible reasoning, tool and notice blocks, their summaries, fitting to the window                                   |
 | =opencode-session.el=     | Session buffers: opening, replay, live events, sending, attachments, agent and model, navigation; actions by session ID |
-| =opencode-requests.el=    | What permissions and questions share: providers, subagent propagation, transient helpers, answering by session ID       |
+| =opencode-requests.el=    | What permissions and questions share: providers, subagent propagation, transients, answering by session ID, send check  |
 | =opencode-permission.el=  | Permission requests, their transient and the hand-off to another agent                                                  |
 | =opencode-form.el=        | Question forms and other forms                                                                                          |
 | =opencode-notify.el=      | Notification log, filters and operating-system backends                                                                 |
@@ -60,6 +60,9 @@ Opening a session renders its projected messages; afterwards the event stream dr
 - Text and reasoning fragments are keyed by assistant message and per-type ordinal (=MSG/t/N=, =MSG/r/N=), tool calls by call ID, so a late event finds its block wherever the stream left the cursor.
 - Reasoning blocks are created on their first text, since encrypted reasoning arrives empty.
 - A prompt sent from Emacs carries an ID generated locally, in the service's ID layout, so its echo on the stream is recognized and not rendered twice; prompts of other clients render when the inbox delivers them, where replay places them.
+- A prompt typed here shows where it was typed, and its input gets its message ID, which revert and fork at point need, when the service delivers it: only then does the message exist, a steering prompt waiting for the next step and a queued one for the end of the turn. Markers keep the input while it waits, so output inserted meanwhile and several prompts waiting at once are no matter; a failed or cancelled prompt never gets the ID, and one whose input a reload erased renders on delivery like another client's.
+- Typed while a turn streams, a prompt sits before output that precedes it in the conversation. Where the transcript ended at its delivery is recorded, and cuts order messages by it, so they follow the conversation, as replay renders it, rather than the buffer.
+- A slash command's prompt gets an ID from the service, which only the stream reports, and text expanded from the command's template. The command carries a correlation key in its metadata, which the service passes on to that prompt, so its input gets the prompt's ID; the expanded prompt renders on delivery. A command run by a subagent prompts no message here, so the key is given up a minute after the command's request returned. A shell command makes no prompt: its shell message and result, like other messages between prompts, never start a cut.
 - The package tracks its own prompt start marker: =comint-last-prompt= would count the last line of output as the prompt.
 - Notices are inserted before the idle prompt, and a turn started elsewhere lifts the prompt first.
 - A background job's completion is a synthetic message, keyed by its message ID, which its inbox item shares. Its metadata makes it a block of the job's tool, and the element wrapping its text is removed only when it is exactly what the service writes, so an unexpected text shows whole.
@@ -72,9 +75,13 @@ Markdown is fontified by =markdown-ts-mode= as text streams in. Regions that mus
 
 Permission requests and questions mark the block of the tool call that raised them and never take focus. A request whose block has not been inserted yet prints a fallback line that the block replaces. Requests of a subagent mark its block in the parent session. Answers from any client resolve them through =permission.replied= and =form.replied= or =form.cancelled=.
 
+The service neither answers nor dismisses a request when a prompt arrives: it admits the prompt to the session's inbox, and delivers a steering one at the next step boundary, which a step waiting on its tool calls reaches only once the request is settled. A prompt sent then would wait unread, which looks like a lost =RET=, so a send check asks first, from the session buffer's requests, those of its subagents' buffers, and the registry's, which knows subagents without a buffer. Queued input, shell commands and sends without checks do not ask: their outcome is what was asked for.
+
 * Keys
 
 The package binds only what a Comint, special-mode or vtable user expects, plus =C-c C-o= to open links, as in Org, and the keys of its own transients, blocks, links and the desktop placeholder. Every other command is left unbound, so that one set of maps can cover several agent front ends: drover provides them, acting through functions that need no buffer (=opencode-session-delete=, =opencode-session-fork=, =opencode-session-compact=, =opencode-rename-session=, =opencode-session-list-id-at-point=) and commands that work from any key (=opencode-attach=, =opencode-mention-subagent=, =opencode-insert-slash-command=). The commands that edit the input act on the current buffer when it is a session buffer, and otherwise on the last selected one, since drover may run them in a session buffer that is not selected. =/= and =@= keep their electric meaning at the input, sharing the code of those commands; =opencode-insert-slash-command= puts a command at the start of the input from any key, the text already typed becoming its arguments, as typing =/= there does, and replaces a command the input already starts with rather than nest one in another's arguments.
+
+Hints that name a command, in messages, notices and tooltips, go through =opencode-command-keys=, which asks =opencode-command-keys-function= for the keys first, since with few keys of its own =substitute-command-keys= would mostly find none; drover answers with its own. Comint refusals name the keys of what to do instead the same way.
 
 A session buffer inherits =comint-mode-map=, whose keys show through once the package binds nothing over them. Its process is a pipe that runs nothing, so the commands meant for a subprocess are remapped, which keeps their keys and menu entries meaning what they mean in Comint: an OpenCode equivalent where there is one, else =opencode-comint-unsupported=, which refuses with the reason. The rest only move, search, copy or edit text, and stay.
 

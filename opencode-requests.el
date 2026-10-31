@@ -45,12 +45,12 @@
 
 (defvar opencode-request-providers nil
   "Functions describing the requests a session buffer waits on.
-Each returns, in the current buffer, nil or a plist with :pending (non-nil
-when a request awaits an answer), :at-point (a function answering the
-request at point, or nil), :respond (a function answering the oldest
-request) and :sync (a function reconciling the buffer's requests with
-the server, then calling the function it receives with no argument),
-tried in order.")
+Each returns, in the current buffer, nil or a plist with :kind (`question'
+or `permission'), :pending (the requests awaiting an answer, plists each
+with its :id), :at-point (a function answering the request at point, or
+nil), :respond (a function answering the oldest request) and :sync (a
+function reconciling the buffer's requests with the server, then calling
+the function it receives with no argument), tried in order.")
 
 (defvar-local opencode--pending-children nil
   "Child session IDs, oldest first, whose requests await the user.")
@@ -171,6 +171,113 @@ is shown again and answers."
                         (condition-case err
                             (opencode-respond)
                           (user-error (message "%s" (error-message-string err))))))))))))
+
+;;;; Sending while a request waits
+
+;; The service delivers a steering prompt or command at the agent's next
+;; step, and a queued one after the turn; a step waiting on a permission
+;; request or a question ends only once it is answered or dismissed.  A
+;; prompt sent meanwhile thus waits, unread, and is neither an answer nor
+;; a dismissal, so `opencode-send-input' asks first.
+
+(defun opencode--buffer-requests (&optional seen)
+  "Return the requests this session buffer and its subagents' buffers wait on.
+Each is a plist (:session ID :kind KIND :id REQUEST-ID).  SEEN holds the
+sessions already visited."
+  (let ((seen (or seen (make-hash-table :test #'equal)))
+        (requests nil))
+    (unless (gethash opencode-session-id seen)
+      (puthash opencode-session-id t seen)
+      (dolist (provider opencode-request-providers)
+        (let ((state (funcall provider)))
+          (dolist (request (plist-get state :pending))
+            (push (list :session opencode-session-id :kind (plist-get state :kind)
+                        :id (plist-get request :id))
+                  requests))))
+      (dolist (child opencode--pending-children)
+        (opencode-with-session-buffer child
+          (setq requests (append requests (opencode--buffer-requests seen))))))
+    requests))
+
+(defun opencode-awaited-requests ()
+  "Return the requests this session and its subagents wait on.
+Each is a plist (:session ID :kind KIND :id REQUEST-ID), KIND being
+`question' or `permission'.  They come from this buffer and those of its
+subagents, and from the session registry while it follows the service,
+which also knows the subagents that have no buffer."
+  (let* ((requests (opencode--buffer-requests))
+         (known (mapcar (lambda (request) (plist-get request :id)) requests)))
+    (when (and opencode-session-id (opencode-state-ready-p))
+      (dolist (entry (cons (opencode-state-get opencode-session-id)
+                           (opencode-state-descendants opencode-session-id)))
+        (dolist (request (plist-get entry :requests))
+          (unless (member (plist-get request :id) known)
+            (push (plist-get request :id) known)
+            (setq requests (append requests
+                                   (list (list :session (plist-get entry :id)
+                                               :kind (plist-get request :kind)
+                                               :id (plist-get request :id)))))))))
+    requests))
+
+(defun opencode--describe-requests (requests)
+  "Return a sentence saying that REQUESTS are pending.
+REQUESTS are plists as `opencode-awaited-requests' returns them."
+  (if (cdr requests)
+      (format "%d requests are pending" (length requests))
+    (let ((request (car requests)))
+      (format "A %s%s is pending"
+              (if (equal (plist-get request :session) opencode-session-id) "" "subagent's ")
+              (if (eq (plist-get request :kind) 'permission) "permission request" "question")))))
+
+(defun opencode--answer-awaited (requests)
+  "Answer the first of REQUESTS, as `opencode-awaited-requests' returns them.
+This buffer answers its own and its subagents' requests; a request only
+the registry knew of is fetched into its session's buffer first."
+  (if (opencode-pending-request-p)
+      (opencode-respond)
+    (let* ((id (plist-get (car requests) :session))
+           (buffer (gethash id opencode-session-buffers)))
+      (if (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (opencode--sync-requests
+             (lambda ()
+               ;; From a callback, a signal would only print "error in process filter".
+               (condition-case err
+                   (opencode-respond-session id)
+                 (user-error (message "%s" (error-message-string err)))))))
+        (opencode-respond-session id)))))
+
+(defvar opencode--send-cancel-quietly)
+
+(defun opencode-check-pending-requests (request)
+  "Ask what to do with input REQUEST while the session waits on the user.
+A send check (see `opencode-send-checks'): a prompt or command that
+steers this session while it, or one of its subagents, waits on a
+permission request or a question would wait unread until that is
+answered or dismissed.  Answering opens the request and keeps the input,
+as cancelling does; sending anyway sends it to wait.  Queued input
+\(`opencode-queue-input', or `opencode-prompt-delivery' set to `queue')
+waits for the end of the turn anyway, and shell commands run at once,
+so neither asks.  Sends that run no check, such as scheduled ones
+through `opencode-session-send', wait the same way."
+  (when-let* (((memq (plist-get request :kind) '(prompt command)))
+              ((not (eq opencode-prompt-delivery 'queue)))
+              (requests (opencode-awaited-requests)))
+    (pcase (car (read-multiple-choice
+                 (format "%s; the agent reads a prompt only once it is answered or dismissed."
+                         (opencode--describe-requests requests))
+                 '((?a "answer" "Answer it now; the input stays at the prompt")
+                   (?s "send anyway" "Send now; the agent reads it once the request is settled")
+                   (?c "cancel" "Keep the input at the prompt"))))
+      (?s nil)
+      (?a (opencode--answer-awaited requests)
+          ;; The request it opens says enough.
+          (setq opencode--send-cancel-quietly t)
+          'cancel)
+      (_ 'cancel))))
+
+;; First, so that no other check asks before this one.
+(add-hook 'opencode-send-checks #'opencode-check-pending-requests -50)
 
 ;;;; Subagent requests in their parents
 

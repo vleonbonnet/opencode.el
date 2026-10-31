@@ -82,12 +82,15 @@ command loop applies key remapping as typing them would."
           (with-current-buffer buffer (goto-char (point-max)))
           (let ((error (opencode-test-press buffer keys)))
             (should (eq (car error) 'user-error))
-            (should (equal (cadr error) (alist-get command opencode--comint-refusals))))
+            (should (equal (cadr error) (with-current-buffer buffer (opencode--comint-refusal command)))))
           (should-not opencode-test-requests)
           (should (equal (opencode-test-text buffer) transcript))
           (should (equal (opencode-test-input buffer) "typed")))
         ;; Commands only the menu offers are refused as well.
         (with-current-buffer buffer
+          ;; Refusals name the keys of what helps instead.
+          (should (equal (substring-no-properties (opencode--comint-refusal 'comint-stop-subjob))
+                         "An OpenCode turn cannot be suspended: C-c C-c stops it"))
           (dolist (command '(comint-continue-subjob comint-kill-subjob comint-delete-output))
             (let ((remapped (command-remapping command)))
               (should (eq remapped 'opencode-comint-unsupported))
@@ -308,6 +311,254 @@ command loop applies key remapping as typing them would."
         (should-not (opencode-test-press buffer "/"))
         (should (equal (opencode-test-input buffer) "/review a/"))
         (should (= asked 1))))))
+
+;;;; Message IDs of sent input
+
+(defun opencode-test-send-typed (text)
+  "Type TEXT at the end of the input and send it as RET does."
+  (goto-char (point-max))
+  (insert text)
+  (opencode-send-input))
+
+(defun opencode-test-sent-id ()
+  "Return the message ID of the latest prompt requested."
+  (alist-get 'id (plist-get (seq-find (lambda (request) (string-suffix-p "/prompt" (plist-get request :path)))
+                                      opencode-test-requests)
+                            :body)))
+
+(defun opencode-test-inbox-events (session id text &optional metadata)
+  "Return the events admitting, then delivering, prompt ID of SESSION with TEXT and METADATA."
+  `(((type . "session.inbox.enqueued")
+     (data (sessionID . ,session) (inboxID . ,id)
+           (item (type . "user") (delivery . "steer")
+                 (payload (text . ,text) ,@(when metadata `((metadata . ,metadata)))))))
+    ((type . "session.inbox.delivered") (data (sessionID . ,session) (inboxID . ,id)))))
+
+(defun opencode-test-answer (session message text)
+  "Stream TEXT as the answer of assistant MESSAGE in SESSION."
+  (let ((base `((sessionID . ,session) (assistantMessageID . ,message) (ordinal . 0))))
+    (opencode-test-dispatch
+     `(((type . "session.step.started") (data (sessionID . ,session) (assistantMessageID . ,message)))
+       ((type . "session.text.started") (data ,@base))
+       ((type . "session.text.delta") (data ,@base (delta . ,text)))
+       ((type . "session.text.ended") (data ,@base (text . ,text)))))))
+
+(defun opencode-test-turn (session event)
+  "Dispatch the execution EVENT of SESSION, such as \"started\"."
+  (opencode-test-dispatch `(((type . ,(concat "session.execution." event)) (data (sessionID . ,session))))))
+
+(defun opencode-test-find (text)
+  "Return the position of the first TEXT in the current buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (search-forward text)
+    (match-beginning 0)))
+
+(ert-deftest opencode-test-typed-prompt-gets-its-id ()
+  "A prompt typed and sent gets its message ID once delivered, for revert and fork."
+  (opencode-test-with-server
+    (let ((session (opencode-test-scenario "text")))
+      (with-current-buffer (opencode-test-open-empty session)
+        (opencode-test-send-typed "first question")
+        (let ((first (opencode-test-sent-id)))
+          ;; Admitted but not delivered: no message exists to cut at yet.
+          (opencode-test-dispatch (list (car (opencode-test-inbox-events session first "first question"))))
+          (should-not (opencode-message-at (opencode-test-find "first question")))
+          (opencode-test-dispatch (cdr (opencode-test-inbox-events session first "first question")))
+          ;; Shown once, as typed.
+          (should (= (how-many "first question" (point-min) (point-max)) 1))
+          (let ((prompt (opencode-test-find "first question")))
+            (should (equal (opencode-message-at prompt) first))
+            (should (equal (opencode-message-at (+ prompt (length "first question"))) first))
+            (opencode-test-turn session "started")
+            (opencode-test-answer session "msg_answer_one" "First answer.")
+            (opencode-test-turn session "succeeded")
+            ;; At the prompt, the cut keeps it and drops its answer.
+            (should (equal (opencode--message-boundary (opencode-test-find "first question")) "msg_answer_one"))
+            ;; In the answer, nothing follows yet to drop.
+            (should-not (opencode--message-boundary (opencode-test-find "First answer."))))
+          (opencode-test-send-typed "second question")
+          (let ((second (opencode-test-sent-id)))
+            (should-not (equal second first))
+            (opencode-test-dispatch (opencode-test-inbox-events session second "second question"))
+            ;; In the first answer, the next prompt starts what is dropped.
+            (should (equal (opencode--message-boundary (opencode-test-find "First answer.")) second))
+            (goto-char (opencode-test-find "First answer."))
+            (setq opencode-test-requests nil)
+            (opencode-revert-to-point)
+            (should (equal (opencode-test-requests-to 'post "/revert/stage")
+                           `(((messageID . ,second) (files . t)))))
+            (should (zerop (hash-table-count opencode--sent-inputs)))))))))
+
+(ert-deftest opencode-test-typed-prompt-delivered-before-reply ()
+  "A prompt delivered before the service answers its request gets its ID too."
+  (opencode-test-with-server
+    (let* ((session (opencode-test-scenario "text"))
+           (opencode-test-routes
+            (cons (list 'post "/prompt\\'"
+                        (lambda (request)
+                          (let ((body (plist-get request :body)))
+                            (opencode-test-dispatch
+                             (opencode-test-inbox-events session (alist-get 'id body) (alist-get 'text body)))
+                            `((data (id . ,(alist-get 'id body)))))))
+                  opencode-test-routes)))
+      (with-current-buffer (opencode-test-open-empty session)
+        (opencode-test-send-typed "quick one")
+        (should (equal (opencode-message-at (opencode-test-find "quick one")) (opencode-test-sent-id)))
+        (should (= (how-many "quick one" (point-min) (point-max)) 1))
+        (should (zerop (hash-table-count opencode--sent-inputs)))))))
+
+(ert-deftest opencode-test-steering-prompts-get-their-ids ()
+  "Prompts sent while a turn streams each get their ID, in any order, and cut in the conversation's order."
+  (opencode-test-with-server
+    (let ((session (opencode-test-scenario "text"))
+          (ids nil))
+      (with-current-buffer (opencode-test-open-empty session)
+        (opencode-test-send-typed "start working")
+        (push (opencode-test-sent-id) ids)
+        (opencode-test-dispatch (opencode-test-inbox-events session (car ids) "start working"))
+        (opencode-test-turn session "started")
+        (let ((base `((sessionID . ,session) (assistantMessageID . "msg_busy") (ordinal . 0))))
+          (opencode-test-dispatch
+           `(((type . "session.step.started") (data (sessionID . ,session) (assistantMessageID . "msg_busy")))
+             ((type . "session.text.started") (data ,@base))
+             ((type . "session.text.delta") (data ,@base (delta . "Working on it")))))
+          (dolist (text '("steer one" "steer two"))
+            (opencode-test-send-typed text)
+            (push (opencode-test-sent-id) ids)
+            ;; Output keeps streaming between the sends.
+            (opencode-test-dispatch `(((type . "session.text.delta") (data ,@base (delta . ,(concat " after " text)))))))
+          (opencode-test-dispatch
+           `(((type . "session.text.ended")
+              (data ,@base (text . "Working on it after steer one after steer two")))))
+          (pcase-let ((`(,two ,one ,start) ids))
+            (should (= (length (delete-dups (copy-sequence ids))) 3))
+            (should (= (hash-table-count opencode--sent-inputs) 2))
+            ;; The second one is reported delivered first.
+            (opencode-test-dispatch (cdr (opencode-test-inbox-events session two "steer two")))
+            (should (equal (opencode-message-at (opencode-test-find "steer two")) two))
+            (should-not (opencode-message-at (opencode-test-find "steer one")))
+            (opencode-test-dispatch (cdr (opencode-test-inbox-events session one "steer one")))
+            (should (equal (opencode-message-at (opencode-test-find "steer one")) one))
+            ;; Each ID covers its own input and nothing of the output around it.
+            (should (equal (opencode-message-at (opencode-test-find " after steer one")) "msg_busy"))
+            (should (equal (opencode-message-at (opencode-test-find " after steer two")) "msg_busy"))
+            (should-not (text-property-any (opencode-test-find "steer one")
+                                           (+ (opencode-test-find "steer one") (length "steer one"))
+                                           'opencode-message two))
+            (opencode-test-answer session "msg_next" "Next step.")
+            ;; The conversation reads: start, busy, two, one, next.
+            (should (equal (opencode--message-boundary (opencode-test-find "start working")) "msg_busy"))
+            (should (equal (opencode--message-boundary (opencode-test-find "steer two")) one))
+            (should (equal (opencode--message-boundary (opencode-test-find "steer one")) "msg_next"))
+            (dolist (answer '("Working on it" " after steer one" " after steer two"))
+              (should (equal (opencode--message-boundary (opencode-test-find answer)) two)))
+            (should-not (opencode--message-boundary (opencode-test-find "Next step.")))
+            (should (equal start (opencode-message-at (opencode-test-find "start working"))))))))))
+
+(ert-deftest opencode-test-failed-prompt-gets-no-id ()
+  "A prompt the service refused keeps no ID, even when an event names it later."
+  (opencode-test-with-server
+    (let ((session (opencode-test-scenario "text"))
+          (opencode-test-routes (cons (list 'post "/prompt\\'" (lambda (_) '(:error 500 "boom")))
+                                      opencode-test-routes)))
+      (with-current-buffer (opencode-test-open-empty session)
+        (opencode-test-send-typed "doomed")
+        (let ((id (opencode-test-sent-id)))
+          (should (string-match-p "boom" (buffer-string)))
+          (should-not (opencode-message-at (opencode-test-find "doomed")))
+          (should (zerop (hash-table-count opencode--sent-inputs)))
+          (should-not (gethash id opencode--own-inputs))
+          ;; Had the service taken it after all, its prompt shows as delivered, with its ID.
+          (opencode-test-dispatch (opencode-test-inbox-events session id "doomed"))
+          (should-not (opencode-message-at (opencode-test-find "doomed")))
+          (should (= (how-many "doomed" (point-min) (point-max)) 2)))))))
+
+(ert-deftest opencode-test-cancelled-prompt-gets-no-id ()
+  "A queued prompt cancelled before delivery keeps no ID."
+  (opencode-test-with-server
+    (let ((session (opencode-test-scenario "text")))
+      (with-current-buffer (opencode-test-open-empty session)
+        (goto-char (point-max))
+        (insert "later maybe")
+        (opencode-queue-input)
+        (let ((id (opencode-test-sent-id)))
+          (opencode-test-dispatch
+           (list (car (opencode-test-inbox-events session id "later maybe"))
+                 `((type . "session.inbox.cancelled") (data (sessionID . ,session) (inboxID . ,id)))))
+          (should (string-match-p "A queued prompt was cancelled" (buffer-string)))
+          (should-not (opencode-message-at (opencode-test-find "later maybe")))
+          (should (zerop (hash-table-count opencode--sent-inputs))))))))
+
+(ert-deftest opencode-test-reloaded-pending-prompt-shown-once-delivered ()
+  "A prompt whose input a reload erased before its delivery is shown when delivered."
+  (opencode-test-with-server
+    (let* ((session (opencode-test-scenario "text"))
+           (opencode-test-routes
+            (cons (list 'get "/message\\'" (lambda (_) '((data) (cursor)))) opencode-test-routes)))
+      (with-current-buffer (opencode-test-open-empty session)
+        (opencode-test-send-typed "survive the reload")
+        (let ((id (opencode-test-sent-id)))
+          (opencode-test-dispatch (list (car (opencode-test-inbox-events session id "survive the reload"))))
+          (opencode-session-reload)
+          (should-not (string-search "survive the reload" (buffer-string)))
+          (opencode-test-dispatch (cdr (opencode-test-inbox-events session id "survive the reload")))
+          (should (= (how-many "survive the reload" (point-min) (point-max)) 1))
+          (should (equal (opencode-message-at (opencode-test-find "survive the reload")) id))
+          (should (zerop (hash-table-count opencode--sent-inputs))))))))
+
+(ert-deftest opencode-test-typed-command-gets-its-prompt-id ()
+  "A slash command's input gets the ID of the prompt the service made for it."
+  (opencode-test-with-server
+    (let ((session (opencode-test-scenario "text")))
+      (with-current-buffer (opencode-test-open-empty session)
+        (opencode-test-send-typed "/review HEAD")
+        (let* ((metadata (alist-get 'metadata (car (opencode-test-requests-to 'post "/command"))))
+               (key (alist-get opencode--command-key metadata)))
+          (should (stringp key))
+          ;; Another client's prompt does not claim it.
+          (opencode-test-dispatch (opencode-test-inbox-events session "msg_other" "from the TUI"))
+          (should-not (opencode-message-at (opencode-test-find "/review HEAD")))
+          (opencode-test-dispatch
+           (opencode-test-inbox-events session "msg_review" "Review the changes of HEAD" metadata))
+          (should (equal (opencode-message-at (opencode-test-find "/review HEAD")) "msg_review"))
+          ;; The prompt the command expanded to shows too, as replay shows it.
+          (should (equal (opencode-message-at (opencode-test-find "Review the changes")) "msg_review"))
+          (opencode-test-turn session "started")
+          (opencode-test-answer session "msg_review_answer" "Looks fine.")
+          (should (equal (opencode--message-boundary (opencode-test-find "/review HEAD")) "msg_review_answer"))
+          (should (zerop (hash-table-count opencode--sent-inputs))))))))
+
+(ert-deftest opencode-test-command-without-prompt-forgotten ()
+  "A command whose prompt never comes, as one running a subagent, is forgotten in time."
+  (opencode-test-with-server
+    (let ((session (opencode-test-scenario "text")))
+      (with-current-buffer (opencode-test-open-empty session)
+        (opencode-test-send-typed "/delegate it")
+        (let ((key (alist-get opencode--command-key
+                              (alist-get 'metadata (car (opencode-test-requests-to 'post "/command"))))))
+          (should (plist-get (gethash key opencode--sent-inputs) :answered))
+          ;; Its prompt may still come.
+          (opencode-test-send-typed "first prompt")
+          (let ((first (opencode-test-sent-id)))
+            (should (gethash key opencode--sent-inputs))
+            ;; Its request returned longer ago than its prompt may take.
+            (plist-put (gethash key opencode--sent-inputs) :answered
+                       (- (float-time) opencode--command-wait 1))
+            (opencode-test-send-typed "next prompt")
+            (should-not (gethash key opencode--sent-inputs))
+            ;; Prompts wait for their delivery however long it takes.
+            (should (equal (sort (hash-table-keys opencode--sent-inputs) #'string<)
+                           (sort (list first (opencode-test-sent-id)) #'string<)))))))))
+
+(ert-deftest opencode-test-shell-input-gets-no-id ()
+  "A shell command makes no prompt, so its input gets no message ID."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
+      (opencode-test-send-typed "!ls")
+      (should (opencode-test-requests-to 'post "/shell"))
+      (should (zerop (hash-table-count opencode--sent-inputs)))
+      (should-not (opencode-message-at (opencode-test-find "!ls"))))))
 
 ;;;; Agents
 

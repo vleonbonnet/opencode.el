@@ -165,7 +165,10 @@ The fake service answers preflights with `opencode-test-reports'."
          '(((status . "hit") (staleThinking (count . 1) (reason . "earlier messages changed"))))))
     (opencode-test-with-guard t
       (opencode-test-type-and-send "/review")
-      (should (equal (alist-get 'metadata (opencode-test-sent-body "/command")) '((thinkingLoss . "accept")))))))
+      (let ((metadata (alist-get 'metadata (opencode-test-sent-body "/command"))))
+        (should (equal (alist-get 'thinkingLoss metadata) "accept"))
+        ;; Besides the key that recognizes the command's prompt.
+        (should (equal (mapcar #'car metadata) (list 'thinkingLoss opencode--command-key)))))))
 
 (ert-deftest opencode-test-cache-unsupported-service ()
   "A service without the preflight route is never asked again, nor the user."

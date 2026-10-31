@@ -85,7 +85,8 @@ They count from the moment the service is ready."
   (let ((inhibit-read-only t))
     (erase-buffer)
     (insert text "\n\n" (plist-get opencode--desktop-data :directory)
-            (substitute-command-keys "\nPress \\<opencode-desktop-pending-mode-map>\\[opencode-desktop-retry] to retry.\n"))
+            (format "\nPress %s to retry.\n"
+                    (opencode-command-keys 'opencode-desktop-retry 'opencode-desktop-pending-mode-map)))
     (goto-char (point-min))))
 
 (defun opencode--desktop-stop ()

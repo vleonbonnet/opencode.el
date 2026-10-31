@@ -234,5 +234,303 @@
           (opencode-test-dispatch (opencode-test-events id))
           (should (equal (cons scenario (opencode-test-text live)) (cons scenario replayed))))))))
 
+;;;; Sending while a request waits
+
+(defvar opencode-test-choices nil
+  "Keys `read-multiple-choice' answers under `opencode-test-choosing', in order.")
+
+(defvar opencode-test-asked nil
+  "Prompts `read-multiple-choice' showed under `opencode-test-choosing', newest first.")
+
+(defvar opencode-test-answered nil
+  "Answering commands called under `opencode-test-choosing', newest first.")
+
+(defmacro opencode-test-choosing (choices &rest body)
+  "Run BODY with `read-multiple-choice' answering CHOICES, keys in order.
+The prompts it shows go to `opencode-test-asked'; asking more often
+than CHOICES fails, and so do the answering commands, which are recorded
+in `opencode-test-answered' instead."
+  (declare (indent 1) (debug t))
+  `(let ((opencode-test-choices ,choices)
+         (opencode-test-asked nil)
+         (opencode-test-answered nil))
+     (cl-letf (((symbol-function 'read-multiple-choice)
+                (lambda (prompt choices &rest _)
+                  (push prompt opencode-test-asked)
+                  (or (assq (or (pop opencode-test-choices) (ert-fail "Asked once too often")) choices)
+                      (ert-fail "No such choice"))))
+               ((symbol-function 'opencode-respond)
+                (lambda () (interactive) (push (list 'respond (current-buffer)) opencode-test-answered)))
+               ((symbol-function 'opencode-respond-session)
+                (lambda (id &rest _) (push (list 'respond-session id) opencode-test-answered))))
+       ,@body)))
+
+(defun opencode-test-type (text)
+  "Type TEXT at the end of the input."
+  (goto-char (point-max))
+  (insert text))
+
+(defun opencode-test-typed ()
+  "Return the input typed at the current buffer's prompt."
+  (buffer-substring-no-properties (opencode-pmark) (point-max)))
+
+(defun opencode-test-sends ()
+  "Return the bodies of the prompts, commands and shell commands requested, oldest first."
+  (nreverse (delq nil (mapcar (lambda (request)
+                                (when (string-match "/\\(prompt\\|command\\|shell\\)\\'" (plist-get request :path))
+                                  (cons (intern (match-string 1 (plist-get request :path)))
+                                        (plist-get request :body))))
+                              opencode-test-requests))))
+
+(defun opencode-test-open-waiting (scenario event)
+  "Open SCENARIO's session as it streamed, up to its first EVENT; return its buffer."
+  (let* ((id (opencode-test-scenario scenario))
+         (buffer (opencode-test-open-empty id)))
+    (opencode-test-dispatch-until (opencode-test-events id) event)
+    (with-current-buffer buffer
+      (should (eq opencode-session-status 'busy))
+      (setq opencode-test-requests nil))
+    buffer))
+
+(ert-deftest opencode-test-send-while-question-asks ()
+  "Sending while a question waits asks first: answering or cancelling keeps the input."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-waiting "question" "form.created")
+      (should (opencode-open-forms))
+      (opencode-test-type "use red instead")
+      (opencode-test-choosing '(?c ?a ?s)
+        (opencode-send-input)
+        (should (equal (car opencode-test-asked)
+                       "A question is pending; the agent reads a prompt only once it is answered or dismissed."))
+        (should-not (opencode-test-sends))
+        (should (equal (opencode-test-typed) "use red instead"))
+        ;; Answering opens the question, keeping the input, and says nothing more.
+        (let ((messages nil))
+          (cl-letf (((symbol-function 'message)
+                     (lambda (format &rest arguments)
+                       (when format (push (apply #'format-message format arguments) messages)))))
+            (opencode-send-input))
+          (should-not (member "Not sent" messages)))
+        (should (equal opencode-test-answered `((respond ,(current-buffer)))))
+        (should-not (opencode-test-sends))
+        (should (equal (opencode-test-typed) "use red instead"))
+        ;; Sent anyway, it steers as usual.
+        (opencode-send-input)
+        (should (equal (length opencode-test-asked) 3))
+        (pcase-let ((`((prompt . ,body)) (opencode-test-sends)))
+          (should (equal (alist-get 'text body) "use red instead"))
+          (should (equal (alist-get 'delivery body) "steer")))
+        (should (equal (opencode-test-typed) ""))))))
+
+(ert-deftest opencode-test-empty-input-sends-nothing ()
+  "RET on an empty or blank input starts no turn."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-waiting "question" "form.created")
+      (dolist (input '("" "  \n "))
+        (opencode-test-type input)
+        (opencode-test-choosing nil
+          (opencode-send-input))
+        (should-not (opencode-test-sends))
+        (should (equal (opencode-test-typed) input))
+        (delete-region (opencode-pmark) (point-max))))))
+
+(ert-deftest opencode-test-send-while-permission-asks ()
+  "A command sent while a permission request waits asks too, naming the request."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-waiting "permission" "permission.asked")
+      (opencode-test-type "/review HEAD")
+      (opencode-test-choosing '(?s)
+        (opencode-send-input)
+        (should (string-prefix-p "A permission request is pending;" (car opencode-test-asked)))
+        (should (equal (mapcar #'car (opencode-test-sends)) '(command)))))))
+
+(ert-deftest opencode-test-send-while-waiting-without-asking ()
+  "Queued input, shell commands and sends without a check go out unasked, to wait."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-waiting "question" "form.created")
+      (opencode-test-choosing nil
+        (opencode-test-type "after this turn")
+        (opencode-queue-input)
+        (opencode-test-type "!ls")
+        (opencode-send-input)
+        ;; Scheduled sends call the function directly.
+        (opencode-session-send "scheduled" :show t)
+        (let ((opencode-prompt-delivery 'queue))
+          (opencode-test-type "queued by default")
+          (opencode-send-input))
+        (should-not opencode-test-asked)
+        (should (equal (mapcar (lambda (send) (list (car send) (or (alist-get 'delivery (cdr send))
+                                                                   (alist-get 'command (cdr send)))))
+                               (opencode-test-sends))
+                       '((prompt "queue") (shell "ls") (prompt "steer") (prompt "queue"))))))))
+
+(ert-deftest opencode-test-send-without-request-unasked ()
+  "With nothing waiting, sending never asks."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
+      (opencode-test-choosing nil
+        (opencode-test-type "hello")
+        (opencode-send-input)
+        (should-not opencode-test-asked)
+        (should (equal (mapcar #'car (opencode-test-sends)) '(prompt)))))))
+
+(ert-deftest opencode-test-send-while-subagent-asks ()
+  "A subagent's request makes its parent ask, and answering goes through the parent."
+  (opencode-test-with-server
+    (let* ((parent (opencode-test-scenario "subagent"))
+           (child (opencode-test-scenario "subagent-child"))
+           (buffer (opencode-test-open-empty parent)))
+      (opencode-test-dispatch-until
+       (seq-filter (lambda (event)
+                     (member (or (alist-get 'sessionID (alist-get 'data event))
+                                 (alist-get 'sessionID (alist-get 'form (alist-get 'data event))))
+                             (list parent child)))
+                   (opencode-test-events))
+       "permission.asked")
+      (should (buffer-live-p (gethash child opencode-session-buffers)))
+      (opencode--flush-sync)
+      (with-current-buffer buffer
+        (should (equal opencode--pending-children (list child)))
+        (setq opencode-test-requests nil)
+        (opencode-test-type "never mind")
+        (opencode-test-choosing '(?a)
+          (opencode-send-input)
+          (should (string-prefix-p "A subagent's permission request is pending;" (car opencode-test-asked)))
+          (should (equal opencode-test-answered `((respond ,buffer))))
+          (should-not (opencode-test-sends)))))))
+
+(ert-deftest opencode-test-send-while-registry-knows-request ()
+  "Requests the registry knows of subagents without a buffer count too, and are answered there."
+  (opencode-test-with-server
+    (let* ((parent (opencode-test-scenario "text"))
+           (buffer (opencode-test-open-empty parent))
+           (opencode-state--ready t)
+           (opencode-state--stream opencode-events--process))
+      (puthash parent (list :id parent :running t) opencode-state--sessions)
+      (puthash "ses_test_child" (list :id "ses_test_child" :parent-id parent :running t
+                                      :requests '((:kind question :id "frm_child" :time 1.0)))
+               opencode-state--sessions)
+      (puthash "ses_test_grandchild" (list :id "ses_test_grandchild" :parent-id "ses_test_child" :running t
+                                           :requests '((:kind permission :id "per_grandchild" :time 2.0)))
+               opencode-state--sessions)
+      (puthash "ses_test_other" (list :id "ses_test_other" :running t
+                                      :requests '((:kind question :id "frm_other" :time 3.0)))
+               opencode-state--sessions)
+      (with-current-buffer buffer
+        (should (equal (mapcar (lambda (request) (plist-get request :id)) (opencode-awaited-requests))
+                       '("frm_child" "per_grandchild")))
+        (opencode-test-type "go on")
+        (opencode-test-choosing '(?a)
+          (opencode-send-input)
+          (should (string-prefix-p "2 requests are pending;" (car opencode-test-asked)))
+          (should (equal opencode-test-answered '((respond-session "ses_test_child"))))
+          (should-not (opencode-test-sends))
+          (should (equal (opencode-test-typed) "go on")))
+        ;; A registry that no longer follows the service is not trusted.
+        (let ((opencode-state--ready nil))
+          (should-not (opencode-awaited-requests)))))))
+
+;;;; Key hints
+
+(defun opencode-test-drover-keys (command)
+  "Return keys a package binding COMMAND in its own maps would report, or nil."
+  (alist-get command '((opencode-respond . "C-' A") (opencode-revert-clear . "C-' R")
+                       (opencode-interrupt . "C-' k"))))
+
+(defmacro opencode-test-capturing-messages (&rest body)
+  "Run BODY and return the messages it showed, oldest first."
+  (declare (indent 0) (debug t))
+  `(let ((messages nil))
+     (cl-letf (((symbol-function 'message)
+                (lambda (format &rest arguments)
+                  (when format (push (apply #'format-message format arguments) messages)))))
+       ,@body)
+     (nreverse messages)))
+
+(ert-deftest opencode-test-command-keys ()
+  "Hints name the keys the function reports, else those of the keymaps, else M-x."
+  (with-temp-buffer
+    (let ((opencode-command-keys-function nil))
+      (should (equal (opencode-command-keys 'opencode-respond) "M-x opencode-respond"))
+      (should (equal (opencode-command-keys 'opencode-desktop-retry 'opencode-desktop-pending-mode-map) "g")))
+    (let* ((asked nil)
+           (opencode-command-keys-function
+            (lambda (command) (push (cons command (current-buffer)) asked) (opencode-test-drover-keys command))))
+      (let ((keys (opencode-command-keys 'opencode-respond)))
+        (should (equal keys "C-' A"))
+        (should (eq (get-text-property 0 'face keys) 'help-key-binding)))
+      (should (equal asked `((opencode-respond . ,(current-buffer)))))
+      ;; A command it knows no keys for falls back on the keymaps.
+      (should (equal (opencode-command-keys 'opencode-desktop-retry 'opencode-desktop-pending-mode-map) "g"))
+      (should (equal (opencode-command-keys 'opencode-select-model) "M-x opencode-select-model")))
+    (let ((opencode-command-keys-function (lambda (_) "")))
+      (should (equal (opencode-command-keys 'opencode-respond) "M-x opencode-respond")))
+    (let ((opencode-command-keys-function (lambda (_) (propertize "C-' A" 'face 'bold))))
+      (should (eq (get-text-property 0 'face (opencode-command-keys 'opencode-respond)) 'bold)))))
+
+(ert-deftest opencode-test-question-hints-name-keys ()
+  "Question hints name the keys of `opencode-command-keys-function'."
+  (opencode-test-with-server
+    (let* ((opencode-command-keys-function #'opencode-test-drover-keys)
+           (id (opencode-test-scenario "question"))
+           (buffer (opencode-test-open-empty id))
+           (messages (cl-letf (((symbol-function 'opencode-buffer-active-p) (lambda (_) t)))
+                       (opencode-test-capturing-messages
+                         (opencode-test-dispatch-until (opencode-test-events id) "form.created")))))
+      (should (member "OpenCode question pending; C-' A answers it" messages))
+      (with-current-buffer buffer
+        (let* ((entry (car opencode-pending-forms))
+               (overlay (opencode--form-block entry)))
+          (should (equal (overlay-get overlay 'help-echo) "Question pending.  C-' A answers it."))
+          (should (equal (opencode-test-capturing-messages
+                           (let ((opencode-question--handled nil))
+                             (opencode--question-on-exit)))
+                         '("OpenCode question deferred; C-' A resumes it")))
+          (let ((opencode-test-routes (cons (list 'post "/reply\\'" (lambda (_) '(:error 500 "busy")))
+                                            opencode-test-routes)))
+            (should (seq-some (lambda (message) (string-suffix-p "; C-' A retries" message))
+                              (opencode-test-capturing-messages (opencode-form-send entry))))))))))
+
+(ert-deftest opencode-test-permission-hints-name-keys ()
+  "Permission hints name the keys of `opencode-command-keys-function'."
+  (opencode-test-with-server
+    (let* ((opencode-command-keys-function #'opencode-test-drover-keys)
+           (id (opencode-test-scenario "permission"))
+           (buffer (opencode-test-open-empty id))
+           (messages (cl-letf (((symbol-function 'opencode-buffer-active-p) (lambda (_) t)))
+                       (opencode-test-capturing-messages
+                         (opencode-test-dispatch-until (opencode-test-events id) "permission.asked")))))
+      (should (member "OpenCode permission pending; C-' A answers it" messages))
+      (with-current-buffer buffer
+        (let ((permission (car opencode-pending-permissions)))
+          (should (equal (overlay-get (opencode--permission-block permission) 'help-echo)
+                         "Permission pending: Shell command: rm junk.txt.  C-' A responds."))
+          (should (equal (opencode-test-capturing-messages
+                           (let ((opencode--active-permission (list :buffer buffer :id (plist-get permission :id))))
+                             (opencode--permission-on-exit)))
+                         '("OpenCode permission deferred; C-' A resumes it")))
+          (let ((opencode-test-routes (cons (list 'post "/reply\\'" (lambda (_) '(:error 500 "busy")))
+                                            opencode-test-routes)))
+            (should (seq-some (lambda (message) (string-suffix-p "; C-' A retries" message))
+                              (opencode-test-capturing-messages
+                                (opencode-permission-reply permission 'once))))))))))
+
+(ert-deftest opencode-test-session-hints-name-keys ()
+  "The staged revert notice and Comint refusals name the keys of `opencode-command-keys-function'."
+  (opencode-test-with-server
+    (let ((opencode-command-keys-function #'opencode-test-drover-keys)
+          (id (opencode-test-scenario "text")))
+      (with-current-buffer (opencode-test-open-empty id)
+        (opencode-test-dispatch `(((type . "session.revert.staged")
+                                   (data (sessionID . ,id) (revert (messageID . "msg_cut"))))))
+        (should (string-search "A revert is staged: the next prompt drops everything after it, C-' R cancels it"
+                               (buffer-string)))
+        (should (equal (opencode--comint-refusal 'comint-quit-subjob)
+                       "An OpenCode session takes no quit signal: C-' k stops the turn"))
+        ;; What the function does not know comes from the keymaps.
+        (should (equal (substring-no-properties (opencode--comint-refusal 'comint-clear-buffer))
+                       (format "The transcript is the server's and cannot be cleared: %s renders it again"
+                               (substitute-command-keys "\\[revert-buffer]"))))))))
+
 (provide 'opencode-requests-test)
 ;;; opencode-requests-test.el ends here

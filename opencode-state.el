@@ -201,6 +201,27 @@ Archived sessions are included only when ARCHIVED is non-nil."
              opencode-state--sessions)
     (sort entries :key (lambda (entry) (or (plist-get entry :updated) 0)) :reverse t)))
 
+(defun opencode-state-descendants (id)
+  "Return the registry entries of the subagent sessions under session ID.
+Children of children are included, at any depth, parents before their
+children."
+  (let ((children (make-hash-table :test #'equal))
+        (seen (make-hash-table :test #'equal))
+        (descendants nil))
+    (maphash (lambda (child entry)
+               (when-let* ((parent (plist-get entry :parent-id)))
+                 (push child (gethash parent children))))
+             opencode-state--sessions)
+    (let ((queue (gethash id children)))
+      (puthash id t seen)
+      (while queue
+        (let ((child (pop queue)))
+          (unless (gethash child seen)
+            (puthash child t seen)
+            (push (gethash child opencode-state--sessions) descendants)
+            (setq queue (append queue (gethash child children)))))))
+    (nreverse descendants)))
+
 (defun opencode-state--entry (entry-or-id)
   "Return ENTRY-OR-ID's entry: itself, or the entry of that session ID."
   (if (stringp entry-or-id) (opencode-state-get entry-or-id) entry-or-id))
