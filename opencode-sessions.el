@@ -30,9 +30,9 @@
 ;; from each worktree's HEAD: asking the server would activate a location
 ;; for every directory listed, and running Git would cost a process per
 ;; directory.  Subagent sessions are hidden until `v' shows them, and
-;; archived ones are left out.  The first column shows each session's
-;; status from the session registry, `opencode-state', as an icon, and
-;; follows it.
+;; archived ones are left out.  An icon of each session's status, from
+;; the session registry `opencode-state', leads its title and changes
+;; with it.
 ;; Lists refresh when sessions are created, deleted, renamed, moved,
 ;; forked, archived or restored, and render again when their window's
 ;; width changes, since column limits are fractions of it.  Titles of
@@ -100,14 +100,16 @@
   :group 'opencode-faces)
 
 (defcustom opencode-session-status-icons
-  '((waiting "⚑" opencode-session-status-waiting)
-    (working "◐" opencode-session-status-working)
-    (retrying "↻" opencode-session-status-retrying)
-    (failed "✗" opencode-session-status-failed)
-    (done "✓" opencode-session-status-done)
-    (idle "·" opencode-session-status-idle))
+  '((waiting "\U000F02D7" opencode-session-status-waiting)   ; nf-md-help_circle
+    (working "\U000F051F" opencode-session-status-working)   ; nf-md-timer_sand
+    (retrying "\uf021" opencode-session-status-retrying)     ; nf-fa-refresh
+    (failed "\uf057" opencode-session-status-failed)         ; nf-fa-times_circle
+    (done "\U000F05E0" opencode-session-status-done)         ; nf-md-check_circle
+    (idle "\uf10c" opencode-session-status-idle))            ; nf-fa-circle_o
   "Session statuses, as `opencode-state-status' names them, with their icon and face.
-Session lists show the icon alone, and name the status in its tooltip."
+Session lists show the icon before the title, and name the status in its
+tooltip.  The default icons come from Nerd Fonts, which must be installed
+for them to show."
   :type '(alist :key-type (symbol :tag "Status")
                 :value-type (list (string :tag "Icon") (face :tag "Face")))
   :group 'opencode)
@@ -239,21 +241,67 @@ Its tooltip names the status; an unknown status is \"-\"."
     "-"))
 
 (defun opencode--session-list-status (info)
-  "Return the status cell of session INFO in a list.
+  "Return the status of session INFO in a list.
 The registry knows running sessions and their requests; a session it
 does not hold is idle, and its info tells whether that was seen."
-  (opencode-session-status-icon
-   (opencode-state-status (or (opencode-state-get (alist-get 'id info))
-                              (opencode-state--info-entry info)))))
+  (opencode-state-status (or (opencode-state-get (alist-get 'id info))
+                             (opencode-state--info-entry info))))
 
-(defun opencode--session-list-columns ()
-  "Return the columns of this list.
-The status column has no name, to stay as narrow as its icons; its
-width is fixed, so a row drawn again with a wider icon keeps the table
-aligned."
-  `((:name "" :width ,(seq-max (mapcar (lambda (entry) (string-width (cadr entry)))
-                                       opencode-session-status-icons)))
-    (:name "Title" :max-width "45%")
+(defun opencode--session-list-title-text (info)
+  "Return the title of session INFO in a list, its ID when it has none."
+  (let ((title (alist-get 'title info)))
+    (if (or (null title) (string-empty-p title)) (alist-get 'id info) title)))
+
+(defun opencode--session-list-title (info)
+  "Return the Title value of session INFO, which the column sorts by.
+It is the title, highlighted when the session has a live buffer, and
+carries the session's status as its `opencode-session-status' property
+for `opencode--session-list-title-cell' to show."
+  (apply #'propertize (opencode--session-list-title-text info)
+         'opencode-session-status (opencode--session-list-status info)
+         (when (buffer-live-p (gethash (alist-get 'id info) opencode-session-buffers))
+           '(face opencode-session-list-open-session))))
+
+(defun opencode--session-list-title-cell (title width table)
+  "Return the cell showing TITLE in WIDTH pixels of TABLE.
+The icon of the status TITLE carries comes first, then a space and the
+title, which an ellipsis ends when it is too long."
+  (let ((cell (concat (opencode-session-status-icon
+                       (get-text-property 0 'opencode-session-status title))
+                      " " title)))
+    (add-face-text-property 0 (length cell) (vtable-face table) t cell)
+    (truncate-string-pixelwise cell width (vtable-buffer table)
+                               (propertize (truncate-string-ellipsis) 'face (vtable-face table)))))
+
+(defun opencode--session-list-title-width (sessions)
+  "Return the width of the Title column showing SESSIONS, as a vtable spec.
+vtable sizes a column by its values, which leave out the icons, so the
+width is measured here, in the `vtable' face the lists' tables use: the
+widest title, plain or highlighted, after the widest icon and a space.
+A row drawn again with another status or highlight then still fits."
+  (cl-flet ((measure (string)
+              (let ((string (copy-sequence string)))
+                (add-face-text-property 0 (length string) 'vtable t string)
+                (string-pixel-width string (current-buffer)))))
+    (let* ((icons (cons (opencode-session-status-icon nil)
+                        (mapcar (lambda (entry) (opencode-session-status-icon (car entry)))
+                                opencode-session-status-icons)))
+           (titles (mapcan (lambda (info)
+                             (let ((title (opencode--session-list-title-text info)))
+                               (list title (propertize title 'face 'opencode-session-list-open-session))))
+                           sessions))
+           (width (+ (seq-max (mapcar #'measure icons))
+                     (measure " ")
+                     (seq-max (cons 0 (mapcar #'measure titles))))))
+      ;; Pixels on graphic displays and columns on terminals, as vtable stores a resized column.
+      (if (display-graphic-p) (format "%dpx" width) width))))
+
+(defun opencode--session-list-columns (sessions)
+  "Return the columns of this list showing SESSIONS.
+Each title follows its session's status icon in the same cell, and the
+column sorts by title."
+  `((:name "Title" :width ,(opencode--session-list-title-width sessions) :max-width "45%"
+           :displayer opencode--session-list-title-cell)
     ,@(when (eq opencode--session-list-scope 'all)
         '((:name "Project" :min-width 8 :max-width "12%")))
     (:name "Branch" :min-width 6 :max-width ,(if (eq opencode--session-list-scope 'all) "10%" "12%"))
@@ -261,13 +309,9 @@ aligned."
     (:name "Created" :width 10 :formatter opencode--session-list-age)))
 
 (defun opencode--session-list-value (info column table)
-  "Return the cell of session INFO in COLUMN of TABLE."
+  "Return the value of session INFO in COLUMN of TABLE."
   (pcase (vtable-column table column)
-    ("" (opencode--session-list-status info))
-    ("Title" (let ((title (or (alist-get 'title info) (alist-get 'id info))))
-               (if (buffer-live-p (gethash (alist-get 'id info) opencode-session-buffers))
-                   (propertize title 'face 'opencode-session-list-open-session)
-                 title)))
+    ("Title" (opencode--session-list-title info))
     ("Project" (or (gethash (alist-get 'projectID info) opencode--session-list-projects) "-"))
     ("Branch" (or (opencode-git-branch (opencode--session-directory info)) "-"))
     ("Last Updated" (opencode--session-list-time info 'updated))
@@ -287,7 +331,7 @@ aligned."
                     (format "No sessions in %s" (car opencode--session-list-scope))
                   "No sessions"))
       (make-vtable
-       :columns (opencode--session-list-columns)
+       :columns (opencode--session-list-columns sessions)
        :objects sessions
        :getter #'opencode--session-list-value
        :actions '("RET" opencode-session-list-open

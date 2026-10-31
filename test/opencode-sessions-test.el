@@ -69,6 +69,35 @@ and filters sent with it are ignored."
   "Return the column names of the table at point."
   (mapcar #'vtable-column-name (vtable-columns (vtable-current-table))))
 
+(defun opencode-test-list-title-cell (info)
+  "Return the Title cell of session INFO in the current list, with its properties.
+The space padding the cell to the column's width is left out."
+  (save-excursion
+    (goto-char (point-min))
+    (should (vtable-goto-object info))
+    (should (vtable-goto-column (seq-position (opencode-test-list-columns) "Title")))
+    (buffer-substring (point) (1- (next-single-property-change (point) 'vtable-column)))))
+
+(defun opencode-test-list-title-cell-width (info)
+  "Return the width the Title cell of session INFO takes, padding included."
+  (save-excursion
+    (goto-char (point-min))
+    (should (vtable-goto-object info))
+    (should (vtable-goto-column (seq-position (opencode-test-list-columns) "Title")))
+    (string-pixel-width (buffer-substring (point) (next-single-property-change (point) 'vtable-column))
+                        (current-buffer))))
+
+(defun opencode-test-list-objects ()
+  "Return the objects of the table at point in the order of its rows."
+  (save-excursion
+    (goto-char (point-min))
+    (let (objects)
+      (while (not (eobp))
+        (when-let* ((object (vtable-current-object)))
+          (push object objects))
+        (forward-line 1))
+      (nreverse objects))))
+
 (defun opencode-test-make-head (directory content &optional gitdir)
   "Write HEAD CONTENT for a repository at DIRECTORY, whose Git directory is GITDIR."
   (let ((gitdir (or gitdir (expand-file-name ".git" directory))))
@@ -168,12 +197,12 @@ and filters sent with it are ignored."
       (let ((text (buffer-string))
             (done (regexp-quote (opencode-session-status-icon 'done)))
             (child (regexp-quote (opencode-test-session-title (opencode-test-scenario "subagent-child")))))
-        ;; Finished turns nobody viewed show as done.
-        (should (string-match-p (concat "^" done " +history renamed ") text))
-        (should (string-match-p (concat "^" done " +reasoning ") text))
+        ;; Finished turns nobody viewed show as done, one space before their title.
+        (should (string-match-p (concat "^" done " history renamed ") text))
+        (should (string-match-p (concat "^" done " reasoning ") text))
         (should-not (string-match-p child text))
         (goto-char (point-min))
-        (should (equal (opencode-test-list-columns) '("" "Title" "Branch" "Last Updated" "Created")))
+        (should (equal (opencode-test-list-columns) '("Title" "Branch" "Last Updated" "Created")))
         (opencode-session-list-toggle-subagents)
         (should (string-match-p child (buffer-string))))
       (goto-char (point-min))
@@ -193,18 +222,16 @@ and filters sent with it are ignored."
                      (file-name-nondirectory (directory-file-name opencode-test-workspace))))
       ;; Narrow batch windows truncate the column to its 12%.
       (should (string-match-p (concat "^" (regexp-quote (opencode-session-status-icon 'done))
-                                      " +reasoning opencode")
+                                      " reasoning +opencode")
                               (buffer-string))))))
 
 (defun opencode-test-session-list-highlighted-p (info)
-  "Return non-nil when INFO's title is highlighted in the current list."
-  (save-excursion
-    (goto-char (point-min))
-    (let ((title (seq-position (opencode-test-list-columns) "Title")))
-      (should (vtable-goto-object info))
-      (should (vtable-goto-column title))
-      (memq 'opencode-session-list-open-session
-            (ensure-list (get-text-property (point) 'face))))))
+  "Return non-nil when INFO's title is highlighted in the current list.
+The title follows the status icon and a space, which are never highlighted."
+  (let ((cell (opencode-test-list-title-cell info)))
+    (should-not (memq 'opencode-session-list-open-session (ensure-list (get-text-property 0 'face cell))))
+    (should-not (memq 'opencode-session-list-open-session (ensure-list (get-text-property 1 'face cell))))
+    (memq 'opencode-session-list-open-session (ensure-list (get-text-property 2 'face cell)))))
 
 (ert-deftest opencode-test-session-list-follows-open-buffers ()
   "Open and close update both list scopes by ID, preserving table navigation."
@@ -306,7 +333,7 @@ and filters sent with it are ignored."
           (should opencode--session-list-sessions))))))
 
 (ert-deftest opencode-test-session-list-status ()
-  "The Status column shows the registry's status, and a change redraws only that row."
+  "Each title follows its status icon, and a change redraws only that row, as wide."
   (opencode-test-with-sessions
     (let ((timers nil)
           (opencode--session-list-refresh-timer nil)
@@ -323,19 +350,32 @@ and filters sent with it are ignored."
                        "false"))
         (opencode-test-dispatch '(((type . "server.connected") (data))))
         (should (opencode-state-ready-p))
-        (let* ((info (car (vtable-objects (vtable-current-table))))
-               (id (alist-get 'id info)))
+        (let* ((objects (vtable-objects (vtable-current-table)))
+               ;; A short title shows whole in the narrow batch window.
+               (info (seq-find (lambda (info) (< (length (alist-get 'title info)) 20)) objects))
+               (id (alist-get 'id info))
+               (widths (mapcar #'opencode-test-list-title-cell-width objects)))
           (should (opencode-state-get id))
-          (cl-flet ((status-cell (&optional (status 'done))
-                      (save-excursion
-                        (goto-char (point-min))
-                        (should (vtable-goto-object info))
-                        (should (vtable-goto-column 0))
-                        (list (string-trim (buffer-substring-no-properties
-                                            (point) (next-single-property-change (point) 'vtable-column)))
-                              (car (memq (get-text-property 0 'face (opencode-session-status-icon status))
-                                         (ensure-list (get-text-property (point) 'face))))))))
-            (should (equal (status-cell) (list (opencode-session-status-icon 'done) 'opencode-session-status-done)))
+          ;; Every row's Title cell takes the column's width, whatever its icon,
+          ;; and the widest title still shows whole after its icon.
+          (should (= (length (seq-uniq widths)) 1))
+          (dolist (object objects)
+            (should (string-suffix-p (concat " " (opencode--session-list-title-text object))
+                                     (substring-no-properties (opencode-test-list-title-cell object)))))
+          (cl-flet ((check (status)
+                      (let ((cell (opencode-test-list-title-cell info)))
+                        (should (equal (substring-no-properties cell)
+                                       (concat (opencode-session-status-icon status) " " (alist-get 'title info))))
+                        (should (memq (intern (format "opencode-session-status-%s" status))
+                                      (ensure-list (get-text-property 0 'face cell))))
+                        (should (equal (get-text-property 0 'help-echo cell) (symbol-name status)))
+                        ;; Neither the space nor the title takes the icon's face or tooltip.
+                        (dolist (position (list 1 2))
+                          (should-not (get-text-property position 'help-echo cell))
+                          (should-not (seq-find (lambda (face)
+                                                  (string-prefix-p "opencode-session-status-" (format "%s" face)))
+                                                (ensure-list (get-text-property position 'face cell))))))))
+            (check 'done)
             (cl-letf (((symbol-function 'run-with-timer)
                        (lambda (_delay _repeat function)
                          (let ((timer (timer-create)))
@@ -349,12 +389,61 @@ and filters sent with it are ignored."
               (funcall (timer--function (car timers)))
               ;; Only the row is drawn again; nothing is fetched.
               (should-not opencode-test-requests)
-              (should (equal (status-cell 'working)
-                             (list (opencode-session-status-icon 'working) 'opencode-session-status-working)))
+              (check 'working)
+              (should (equal (mapcar #'opencode-test-list-title-cell-width objects) widths))
               ;; Archiving or restoring a session refreshes the lists.
               (opencode-test-dispatch `(((type . "session.archived") (created . 2) (data (sessionID . ,id)))))
               (should (= (length timers) 2))
               (should (eq opencode--session-list-pending t)))))))))
+
+(ert-deftest opencode-test-session-list-sorts-by-title ()
+  "The Title column sorts by title, not by the icons before them."
+  (opencode-test-with-server
+    (let ((statuses '(("ses_a" . done) ("ses_b" . working) ("ses_c" . retrying))))
+      (cl-letf (((symbol-function 'opencode--session-list-status)
+                 (lambda (info) (cdr (assoc (alist-get 'id info) statuses)))))
+        (with-temp-buffer
+          (opencode-session-list-mode)
+          (setq opencode--session-list-scope (cons temporary-file-directory nil)
+                opencode--session-list-sessions
+                (mapcar (lambda (session)
+                          `((id . ,(car session)) (title . ,(cadr session))
+                            (location (directory . ,temporary-file-directory))
+                            (time (created . 1) (updated . ,(caddr session)))))
+                        '(("ses_a" "alpha" 1) ("ses_b" "beta" 2) ("ses_c" "gamma" 3))))
+          (opencode--session-list-render)
+          (cl-flet ((titles ()
+                      (mapcar (lambda (info) (alist-get 'title info)) (opencode-test-list-objects)))
+                    (sort-by-title ()
+                      (goto-char (point-min))
+                      (should (vtable-goto-column 0))
+                      (vtable-sort-by-current-column)))
+            ;; Newest first, which is also the order of the icons.
+            (should (equal (titles) '("gamma" "beta" "alpha")))
+            (should (string< (opencode-session-status-icon 'retrying) (opencode-session-status-icon 'working)))
+            (should (string< (opencode-session-status-icon 'working) (opencode-session-status-icon 'done)))
+            (sort-by-title)
+            (should (equal (titles) '("alpha" "beta" "gamma")))
+            (sort-by-title)
+            (should (equal (titles) '("gamma" "beta" "alpha")))
+            (should (string-match-p (concat "^" (regexp-quote (opencode-session-status-icon 'retrying)) " gamma ")
+                                    (buffer-string)))))))))
+
+(ert-deftest opencode-test-session-list-title-value ()
+  "A Title value is the title, or the ID when there is none, carrying the status."
+  (opencode-test-with-server
+    (cl-letf (((symbol-function 'opencode--session-list-status) (lambda (_info) 'working)))
+      (pcase-dolist (`(,info . ,shown) '((((id . "ses_x") (title . "Fix it")) . "Fix it")
+                                         (((id . "ses_x") (title . "")) . "ses_x")
+                                         (((id . "ses_x")) . "ses_x")))
+        (let ((value (opencode--session-list-title info)))
+          (should (equal (substring-no-properties value) shown))
+          (should (eq (get-text-property 0 'opencode-session-status value) 'working))
+          (should-not (get-text-property 0 'face value))))
+      (with-temp-buffer
+        (puthash "ses_x" (current-buffer) opencode-session-buffers)
+        (should (eq (get-text-property 0 'face (opencode--session-list-title '((id . "ses_x") (title . "T"))))
+                    'opencode-session-list-open-session))))))
 
 (ert-deftest opencode-test-session-status-icons ()
   "Every status has a one-glyph icon in its own face, named by its tooltip."
@@ -367,13 +456,101 @@ and filters sent with it are ignored."
       (should (equal (get-text-property 0 'help-echo icon) (symbol-name status)))))
   (should (equal (opencode-session-status-icon nil) "-")))
 
-(ert-deftest opencode-test-session-list-status-column-width ()
-  "The status column is unnamed and as wide as the widest icon, two columns for ⚑."
-  (let ((column (car (let ((opencode--session-list-scope 'all)) (opencode--session-list-columns)))))
-    (should (equal (plist-get column :name) ""))
-    (should (= (plist-get column :width) 2)))
-  (let ((opencode-session-status-icons '((done "✓" opencode-session-status-done))))
-    (should (= (plist-get (car (opencode--session-list-columns)) :width) 1))))
+(ert-deftest opencode-test-session-status-icons-default ()
+  "The icons default to the Nerd Font ones drover uses, one column wide each."
+  (let ((default (eval (car (get 'opencode-session-status-icons 'standard-value)) t)))
+    (should (equal (mapcar (lambda (entry) (cons (car entry) (cadr entry))) default)
+                   '((waiting . "\U000F02D7")     ; nf-md-help_circle
+                     (working . "\U000F051F")     ; nf-md-timer_sand
+                     (retrying . "\uf021")        ; nf-fa-refresh
+                     (failed . "\uf057")          ; nf-fa-times_circle
+                     (done . "\U000F05E0")        ; nf-md-check_circle
+                     (idle . "\uf10c"))))         ; nf-fa-circle_o
+    (dolist (entry default)
+      (should (= (char-width (string-to-char (cadr entry))) 1))
+      (should (eq (caddr entry) (intern (format "opencode-session-status-%s" (car entry))))))))
+
+(ert-deftest opencode-test-session-list-long-title ()
+  "A title too long for the column ends in an ellipsis, after its whole icon."
+  (opencode-test-with-server
+    (cl-letf (((symbol-function 'opencode--session-list-status) (lambda (_info) 'waiting)))
+      (with-temp-buffer
+        (opencode-session-list-mode)
+        (setq opencode--session-list-scope (cons temporary-file-directory nil)
+              opencode--session-list-sessions
+              (mapcar (lambda (session)
+                        `((id . ,(car session)) (title . ,(cdr session))
+                          (location (directory . ,temporary-file-directory))
+                          (time (created . 1) (updated . 1))))
+                      `(("ses_a" . ,(make-string 200 ?x)) ("ses_b" . "short"))))
+        (opencode--session-list-render)
+        (let* ((long (car opencode--session-list-sessions))
+               (cell (substring-no-properties (opencode-test-list-title-cell long)))
+               (prefix (concat (opencode-session-status-icon 'waiting) " x")))
+          (should (string-prefix-p prefix cell))
+          (should (string-suffix-p (truncate-string-ellipsis) cell))
+          (should (< (length cell) 200))
+          (should (= (opencode-test-list-title-cell-width long)
+                     (opencode-test-list-title-cell-width (cadr opencode--session-list-sessions)))))))))
+
+(ert-deftest opencode-test-session-list-title-fits-pixels ()
+  "On a graphic display, titles show whole after their icons, in aligned columns.
+The `vtable' face is proportional and icons may come from another font,
+so a status change must keep the columns where they were."
+  :tags '(gui)
+  (skip-unless (display-graphic-p))
+  (opencode-test-with-server
+    (let ((statuses (list (cons "ses_a" 'idle) (cons "ses_b" 'idle) (cons "ses_c" 'idle))))
+      (cl-letf (((symbol-function 'opencode--session-list-status)
+                 (lambda (info) (cdr (assoc (alist-get 'id info) statuses)))))
+        (with-temp-buffer
+          (set-window-buffer (selected-window) (current-buffer))
+          (opencode-session-list-mode)
+          (setq opencode--session-list-scope (cons temporary-file-directory nil)
+                opencode--session-list-sessions
+                (mapcar (lambda (session)
+                          `((id . ,(car session)) (title . ,(cdr session))
+                            (location (directory . ,temporary-file-directory))
+                            (time (created . 1) (updated . 1))))
+                        '(("ses_a" . "WWWW MMMM wide") ("ses_b" . "iiii llll") ("ses_c" . "Mixed Title 42"))))
+          (opencode--session-list-render)
+          (cl-flet ((check ()
+                      (redisplay t)
+                      (let ((branch (seq-position (opencode-test-list-columns) "Branch"))
+                            (starts nil))
+                        (dolist (info opencode--session-list-sessions)
+                          (should (equal (substring-no-properties (opencode-test-list-title-cell info))
+                                         (concat (opencode-session-status-icon
+                                                  (cdr (assoc (alist-get 'id info) statuses)))
+                                                 " " (alist-get 'title info))))
+                          (save-excursion
+                            (should (vtable-goto-object info))
+                            (should (vtable-goto-column branch))
+                            (push (car (posn-x-y (posn-at-point (point)))) starts)))
+                        (should (= (length (seq-uniq starts)) 1)))))
+            (check)
+            ;; Rows take every status, each a different one from the others.
+            (dotimes (turn (length opencode-session-status-icons))
+              (seq-do-indexed (lambda (entry row)
+                                (setcdr entry (car (nth (% (+ turn row) (length opencode-session-status-icons))
+                                                        opencode-session-status-icons)))
+                                (opencode--session-list-update-buffer (car entry)))
+                              statuses)
+              (check))))))))
+
+(ert-deftest opencode-test-session-list-title-width ()
+  "The Title column comes first, as wide as the widest title after the widest icon and a space."
+  (let ((sessions '(((id . "ses_a") (title . "ab")) ((id . "ses_b") (title . "abcdef")))))
+    (let ((columns (let ((opencode--session-list-scope 'all)) (opencode--session-list-columns sessions))))
+      (should (equal (mapcar (lambda (column) (plist-get column :name)) columns)
+                     '("Title" "Project" "Branch" "Last Updated" "Created")))
+      (should (= (plist-get (car columns) :width) (+ 1 1 6))))
+    ;; A two-column icon widens it.
+    (let ((opencode-session-status-icons '((done "⚑" opencode-session-status-done))))
+      (should (= (plist-get (car (opencode--session-list-columns sessions)) :width) (+ 2 1 6))))
+    ;; An untitled session shows its ID.
+    (should (= (plist-get (car (opencode--session-list-columns '(((id . "ses_0123456789"))))) :width)
+               (+ 1 1 14)))))
 
 (ert-deftest opencode-test-session-list-archive ()
   "A archives the session at point once confirmed."

@@ -49,6 +49,10 @@ The service does not record when an execution started, nor when it asked a reque
 
 Unread is the service's, shared by every client: a session is unread when its idle time is newer than its viewed watermark. The registry projects both as the service does: an end of execution sets the idle time to the later of the event's time and one millisecond past the previous idle time, and an interruption by the service shutting down changes neither, since the restarted service resumes the turn. An entry fetched after an event may already reflect it, so a held or queued end of execution is not counted again when the entry's idle time already reaches the event's: counted twice, the idle time would run one millisecond ahead of the service's, which ignores a view of an idle time newer than its own, and the session would stay unread. Posting the view only when unread, and once per watermark while it is in flight, keeps the selection hooks from flooding the service.
 
+* Session lists
+
+Session lists are vtables. A session's status icon leads its title in the Title cell rather than taking a column of its own, since vtable's separator and the column's width would leave a gap between them. The cell's value, which vtable sorts by, is the title alone, carrying the status as a text property, and the column's displayer puts the icon before it, so sorting by title ignores the icons. vtable sizes a column by its values, not by what its displayer shows, so the Title column's width is measured when the list renders: the widest title, plain or highlighted as open, after the widest icon and a space. A row drawn again when its status changes or its buffer opens or closes then fits the width it had, and the columns stay aligned.
+
 * Live rendering equals replay
 
 Opening a session renders its projected messages; afterwards the event stream drives the buffer. Both paths must produce the same text, which the tests check for every recorded scenario. That rule settled several choices:
