@@ -1901,15 +1901,18 @@ At the start of the input this is `opencode-insert-slash-command'."
   "Signal an error outside a session buffer."
   (unless opencode-session-id (user-error "Not in an OpenCode session")))
 
-(declare-function opencode-session-list-id-at-point "opencode-sessions")
+(declare-function opencode-read-project-session "opencode-sessions" (prompt &optional running))
 
-(defun opencode--session-id-here ()
-  "Return the session of this buffer, or of the session list row at point.
-Signal a `user-error' when there is none."
-  (or opencode-session-id
-      (and (fboundp 'opencode-session-list-id-at-point)
-           (opencode-session-list-id-at-point))
-      (user-error "No OpenCode session here")))
+(defun opencode--session-here (prompt &optional running)
+  "Return the info of this buffer's session, else of a picked one.
+Outside a session buffer, the session is read with PROMPT among those
+`opencode' offers, only those running a turn when RUNNING is non-nil.
+Signal a `user-error' when there is none or none is chosen."
+  (if opencode-session-id
+      (or opencode-session-info `((id . ,opencode-session-id)))
+    ;; The pickers' module requires this one, so it cannot be required at load time.
+    (require 'opencode-sessions)
+    (opencode-read-project-session prompt running)))
 
 (defun opencode--switch-failed (else)
   "Return the failure handler of a switch: ELSE, else one reporting the error."
@@ -2060,13 +2063,15 @@ With exactly two agents to choose from, switch to the other one at once."
                               (message "Nothing to interrupt")))))
 
 (defun opencode-interrupt ()
-  "Interrupt the running turn of this session, or of the list row at point."
+  "Interrupt the running turn of this session.
+Outside a session buffer, the session is picked among the running ones
+of the current project."
   (interactive)
-  (opencode-session-interrupt (opencode--session-id-here)))
+  (opencode-session-interrupt (alist-get 'id (opencode--session-here "Interrupt session: " t))))
 
 (defun opencode-session-archive (id &optional restore)
   "Archive session ID, or with RESTORE restore it from the archive.
-Archived sessions stay whole; session lists and `opencode-state-sessions'
+Archived sessions stay whole; pickers and `opencode-state-sessions'
 leave them out."
   (opencode-request 'patch (concat "/api/session/" id)
                     :directory (opencode-state--directory id) :buffer nil
@@ -2116,12 +2121,14 @@ there is no reply or the request fails."
 
 (defun opencode-rename-session (&optional id title)
   "Rename session ID to TITLE.
-ID defaults to this buffer's session, or the session list row at point.
-TITLE is read when nil, starting from the current title.  The session
-needs no buffer."
+ID defaults to this buffer's session; outside a session buffer, it is
+picked among the current project's.  TITLE is read when nil, starting
+from the current title.  The session needs no buffer."
   (interactive)
-  (let* ((id (or id (opencode--session-id-here)))
-         (title (or title (read-string "Title: " (opencode--session-title id)))))
+  (let* ((info (unless id (opencode--session-here "Rename session: ")))
+         (id (or id (alist-get 'id info)))
+         (title (or title (read-string "Title: " (or (opencode--session-title id)
+                                                     (alist-get 'title info))))))
     (opencode-request 'patch (concat "/api/session/" id)
                       :directory (opencode-state--directory id) :buffer nil
                       :body `((title . ,title)))))
@@ -2139,22 +2146,24 @@ The session needs no buffer."
 
 (defun opencode-delete-session (&optional id)
   "Delete session ID after confirmation.
-ID defaults to this buffer's session, or the session list row at point.
-See `opencode-session-delete'."
+ID defaults to this buffer's session; outside a session buffer, it is
+picked among the current project's.  See `opencode-session-delete'."
   (interactive)
-  (let ((id (or id (opencode--session-id-here))))
+  (let* ((info (unless id (opencode--session-here "Delete session: ")))
+         (id (or id (alist-get 'id info))))
     (when (yes-or-no-p (format "Delete the OpenCode session %s for good? "
-                               (or (opencode--session-title id) id)))
+                               (or (opencode--session-title id) (alist-get 'title info) id)))
       (opencode-session-delete id))))
 
 (defun opencode-archive-session (&optional id)
   "Archive session ID after confirmation.
-ID defaults to this buffer's session, or the session list row at point.
-See `opencode-session-archive'."
+ID defaults to this buffer's session; outside a session buffer, it is
+picked among the current project's.  See `opencode-session-archive'."
   (interactive)
-  (let ((id (or id (opencode--session-id-here))))
+  (let* ((info (unless id (opencode--session-here "Archive session: ")))
+         (id (or id (alist-get 'id info))))
     (when (y-or-n-p (format "Archive the OpenCode session %s? "
-                            (or (opencode--session-title id) id)))
+                            (or (opencode--session-title id) (alist-get 'title info) id)))
       (opencode-session-archive id))))
 
 (defun opencode-session-compact (id)
@@ -2297,29 +2306,6 @@ The files changed since are restored; the next prompt commits the revert."
       (opencode-session-open-by-id parent)
     (user-error "This session has no parent")))
 
-(defun opencode--select-session (prompt sessions)
-  "Open one of SESSIONS chosen with PROMPT, newest first."
-  (if (null sessions)
-      (message "No sessions")
-    (when-let* ((info (opencode-annotated-completion
-                       prompt
-                       (mapcar (lambda (info)
-                                 (let ((updated (alist-get 'updated (alist-get 'time info))))
-                                   (list (or (alist-get 'title info) (alist-get 'id info)) info
-                                         (opencode-format-time-ago (opencode-time-ago updated))
-                                         (- (or updated 0)))))
-                               sessions))))
-      (opencode-session-open info :other-window nil))))
-
-(defun opencode-select-child-session ()
-  "Open a subagent session of this session."
-  (interactive)
-  (opencode--require-session)
-  (opencode--select-session
-   "Subagent: "
-   (opencode-request-data
-    (opencode-request-sync 'get "/api/session" :query `((parentID . ,opencode-session-id))))))
-
 (defun opencode-scroll-to-last-response-start ()
   "Scroll to the start of the latest assistant text."
   (interactive)
@@ -2372,26 +2358,12 @@ The session shown in the selected window is marked viewed."
 
 ;;;; Navigating sessions
 
-(defun opencode-select-open-session ()
-  "Switch to an open session buffer."
-  (interactive)
-  (switch-to-buffer
-   (read-buffer "Session: " nil t
-                (lambda (entry)
-                  (let ((buffer (if (consp entry) (cdr entry) (get-buffer entry))))
-                    (and buffer (buffer-local-value 'opencode-session-id buffer)))))))
-
 (defun opencode-visit-last-idle ()
   "Open the session that most recently finished while not displayed."
   (interactive)
   (if opencode-alerted-sessions
       (opencode-session-open (pop opencode-alerted-sessions) :other-window nil)
     (message "No idle sessions")))
-
-(defun opencode-select-idle ()
-  "Open a session that finished while not displayed."
-  (interactive)
-  (opencode--select-session "Idle session: " opencode-alerted-sessions))
 
 (declare-function consult-line-multi "consult")
 

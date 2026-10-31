@@ -219,6 +219,7 @@ session registry starts empty and follows events once a test dispatches
      (let ((opencode-test-requests nil)
            (opencode-test-routes (opencode-test-default-routes))
            (opencode-session-buffers (make-hash-table :test #'equal))
+           (opencode--projects nil)
            (opencode--catalogs (make-hash-table :test #'equal))
            (opencode--catalog-waiters (make-hash-table :test #'equal))
            (opencode-last-session-buffer nil)

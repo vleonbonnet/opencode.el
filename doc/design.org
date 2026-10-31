@@ -20,7 +20,7 @@
 | =opencode-form.el=        | Question forms and other forms                                                                                          |
 | =opencode-notify.el=      | Notification log, filters and operating-system backends                                                                 |
 | =opencode-modeline.el=    | The session mode line and long-context pricing tiers                                                                    |
-| =opencode-sessions.el=    | Session lists and their status icons, projects, worktrees, MCP servers                                                  |
+| =opencode-sessions.el=    | Session pickers and their status icons, projects, worktree branches, worktrees, MCP servers                             |
 | =opencode-edits.el=       | Post-edit hooks, safe visiting and saving, indentation, Prettier, Flycheck                                              |
 | =opencode-desktop.el=     | Desktop saving and in-place restoring                                                                                   |
 | =opencode-convert.el=     | Markdown transcripts                                                                                                    |
@@ -41,7 +41,7 @@ A service starting on a database from OpenCode 1 imports that history in the bac
 
 * One registry of session state
 
-Session buffers know only their own session, so lists, dashboards and mode lines read the registry in =opencode-state.el= instead: one entry per session, with its live state, independent of buffers. It holds what the service reports and derives the status from it; nothing is decided locally, so another client's actions show up and nothing needs reconciling beyond what a reconnection does.
+Session buffers know only their own session, so pickers and other packages' lists and dashboards read the registry in =opencode-state.el= instead: one entry per session, with its live state, independent of buffers. It holds what the service reports and derives the status from it; nothing is decided locally, so another client's actions show up and nothing needs reconciling beyond what a reconnection does.
 
 Every time the stream connects, whoever opened it, the registry is rebuilt from REST: one page of the newest unarchived sessions, then the running ones, those older than the page fetched one by one, then the pending permission requests and forms of the running ones. The active list is fetched after the page, so a turn that ended in between shows as ended rather than running forever. Nothing is replayed after a reconnect, so events received before the requests are covered by their answers, and those received while they run are held and applied over the result. An event of a session the registry does not hold fetches that session first, holding its events meanwhile.
 
@@ -49,9 +49,17 @@ The service does not record when an execution started, nor when it asked a reque
 
 Unread is the service's, shared by every client: a session is unread when its idle time is newer than its viewed watermark. The registry projects both as the service does: an end of execution sets the idle time to the later of the event's time and one millisecond past the previous idle time, and an interruption by the service shutting down changes neither, since the restarted service resumes the turn. An entry fetched after an event may already reflect it, so a held or queued end of execution is not counted again when the entry's idle time already reaches the event's: counted twice, the idle time would run one millisecond ahead of the service's, which ignores a view of an idle time newer than its own, and the session would stay unread. Posting the view only when unread, and once per watermark while it is in flight, keeps the selection hooks from flooding the service.
 
-* Session lists
+* No session list
 
-Session lists are vtables. A session's status icon leads its title in the Title cell rather than taking a column of its own, since vtable's separator and the column's width would leave a gap between them. The cell's value, which vtable sorts by, is the title alone, carrying the status as a text property, and the column's displayer puts the icon before it, so sorting by title ignores the icons. vtable sizes a column by its values, not by what its displayer shows, so the Title column's width is measured when the list renders: the widest title, plain or highlighted as open, after the widest icon and a space. A row drawn again when its status changes or its buffer opens or closes then fits the width it had, and the columns stay aligned.
+opencode.el has no session list buffer. drover lists the sessions of every agent front end, this one's included, and one listing is maintained rather than two that drift apart: drover reads the registry, can fetch older sessions with =opencode-fetch-sessions=, names projects with =opencode-fetch-projects=, =opencode-project-for-directory= and =opencode-project-name=, and shows branches from =opencode-git-branch=. What opencode.el keeps is completion: =opencode= and the other pickers offer sessions in the minibuffer, and commands that act on a session pick one there when called outside a session buffer.
+
+* Session pickers
+
+Every picker goes through =opencode-annotated-completion=, with an affixation function. A session's status icon is the candidate's prefix and its project, branch and age the suffix, so neither is matched against the input nor sorted by: the candidate is the title alone. Completion returns a string, so a title given twice gets =<2>=, =<3>= and so on, in display order, and every session stays reachable. The project and branch columns are padded to their widest value among the candidates, and a column no candidate has a value for is left out.
+
+A picker receives session infos, fetched or kept in buffers and notifications, but shows what the registry knows when it holds the session: a buffer's info is not refreshed on every rename, move or turn, and only the registry knows that a turn runs. Projects name sessions only, so pickers name them from the projects last fetched rather than ask the service each time, and fetch them only when none were; a failure leaves the names out rather than the picker. Branches are read from HEAD, as =opencode-git-branch= does for drover.
+
+Outside a session buffer, renaming, archiving, deleting and interrupting pick among the current project's sessions, those =opencode= offers: drover's lists act on any other. Interrupting offers only the sessions =/api/session/active= reports running, which holds whether or not the registry was bootstrapped.
 
 * Live rendering equals replay
 
@@ -79,7 +87,7 @@ The service neither answers nor dismisses a request when a prompt arrives: it ad
 
 * Keys
 
-The package binds only what a Comint, special-mode or vtable user expects, plus =C-c C-o= to open links, as in Org, and the keys of its own transients, blocks, links and the desktop placeholder. Every other command is left unbound, so that one set of maps can cover several agent front ends: drover provides them, acting through functions that need no buffer (=opencode-session-delete=, =opencode-session-fork=, =opencode-session-compact=, =opencode-rename-session=, =opencode-session-list-id-at-point=) and commands that work from any key (=opencode-attach=, =opencode-mention-subagent=, =opencode-insert-slash-command=). The commands that edit the input act on the current buffer when it is a session buffer, and otherwise on the last selected one, since drover may run them in a session buffer that is not selected. =/= and =@= keep their electric meaning at the input, sharing the code of those commands; =opencode-insert-slash-command= puts a command at the start of the input from any key, the text already typed becoming its arguments, as typing =/= there does, and replaces a command the input already starts with rather than nest one in another's arguments.
+The package binds only what a Comint or special-mode user expects, plus =C-c C-o= to open links, as in Org, and the keys of its own transients, blocks, links and the desktop placeholder. Every other command is left unbound, so that one set of maps can cover several agent front ends: drover provides them, acting through functions that need no buffer (=opencode-session-delete=, =opencode-session-fork=, =opencode-session-compact=, =opencode-rename-session=) and commands that work from any key (=opencode-attach=, =opencode-mention-subagent=, =opencode-insert-slash-command=). The commands that edit the input act on the current buffer when it is a session buffer, and otherwise on the last selected one, since drover may run them in a session buffer that is not selected. =/= and =@= keep their electric meaning at the input, sharing the code of those commands; =opencode-insert-slash-command= puts a command at the start of the input from any key, the text already typed becoming its arguments, as typing =/= there does, and replaces a command the input already starts with rather than nest one in another's arguments.
 
 Hints that name a command, in messages, notices and tooltips, go through =opencode-command-keys=, which asks =opencode-command-keys-function= for the keys first, since with few keys of its own =substitute-command-keys= would mostly find none; drover answers with its own. Comint refusals name the keys of what to do instead the same way.
 
@@ -109,7 +117,7 @@ A session buffer inherits =comint-mode-map=, whose keys show through once the pa
 | =<mouse-2>=                                                               | =comint-insert-input=                                                                           | keep                                           | copies the clicked prompt to the input                                                                       |
 | =<delete>=, Completion menu                                               | =delete-forward-char=, file name completion                                                     | keep                                           | plain editing                                                                                                |
 
-Remapping rather than binding keeps the standard keys' standard meaning and covers the menus too. Session lists bind nothing beyond =special-mode=, vtable and the vtable action =RET=; =g= is =special-mode='s =revert-buffer=, which fetches the list again, and =revert-buffer= in a session buffer renders its transcript again.
+Remapping rather than binding keeps the standard keys' standard meaning and covers the menus too. =revert-buffer= in a session buffer renders its transcript again.
 
 * Edits only from live turns
 

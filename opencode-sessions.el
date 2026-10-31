@@ -1,4 +1,4 @@
-;;; opencode-sessions.el --- Session lists, projects and MCP servers  -*- lexical-binding: t; -*-
+;;; opencode-sessions.el --- Session pickers, projects and MCP servers  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2025  Scott Zimmermann
 ;; Copyright (C) 2026  Valentin Leon
@@ -22,55 +22,40 @@
 
 ;;; Commentary:
 
-;; `opencode' lists the sessions of the current project in a table, the
-;; session control panel; `opencode-list-all-sessions' lists those of
-;; every project, with a Project column.  The server keys a project by
-;; its repository, so a project's list includes the sessions of all its
-;; worktrees, and the Branch column tells them apart.  Branches are read
-;; from each worktree's HEAD: asking the server would activate a location
-;; for every directory listed, and running Git would cost a process per
-;; directory.  Subagent sessions are hidden until
-;; `opencode-session-list-toggle-subagents' shows them, and archived ones
-;; are left out.  An icon of each session's status, from the session
-;; registry `opencode-state', leads its title and changes with it.
-;; RET opens the session at point and `revert-buffer' fetches the list
-;; again; other packages act on the session at point through
-;; `opencode-session-list-id-at-point'.
-;; Lists refresh when sessions are created, deleted, renamed, moved,
-;; forked, archived or restored, and render again when their window's
-;; width changes, since column limits are fractions of it.  Titles of
-;; sessions with live buffers are highlighted, following local buffer
-;; opens and closes.
-;;
-;; OpenCode 2 reports no change summary with sessions, and its diff route
-;; runs Git over the turn's snapshots, so the lists have no column of
-;; changed files.
+;; opencode.el lists no sessions in a buffer of its own: drover lists
+;; those of every agent front end, this one's included, from the session
+;; registry `opencode-state'.  Sessions are picked with completion
+;; instead.  `opencode' offers the sessions of the current project, or
+;; starts one; `opencode-select-project' picks a project first.  The
+;; server keys a project by its repository, so a project's sessions
+;; include those of all its worktrees.  Every picker shows a session's
+;; status icon before its title, and its project, branch and age after
+;; it, newest first.  Branches are read from each worktree's HEAD: asking
+;; the server would activate a location for every directory offered, and
+;; running Git would cost a process per directory.  Commands acting on a
+;; session, such as `opencode-rename-session', pick one of the current
+;; project's when called outside a session buffer.
 
 ;;; Code:
 
 (require 'map)
 (require 'opencode-common)
-(require 'opencode-events)
 (require 'opencode-http)
 (require 'opencode-session)
 (require 'opencode-state)
 (require 'url-util)
-(require 'vtable)
 
 (defcustom opencode-worktree-directory "~/opencode_worktrees/"
   "Directory where `opencode-new-worktree' creates worktrees."
   :type 'directory
   :group 'opencode)
 
-(defcustom opencode-session-list-branch-ttl 30
-  "Seconds a worktree's branch is cached for the session lists."
+(define-obsolete-variable-alias 'opencode-session-list-branch-ttl 'opencode-git-branch-ttl "2.0.0")
+
+(defcustom opencode-git-branch-ttl 30
+  "Seconds `opencode-git-branch' caches the branch of a worktree."
   :type 'natnum
   :group 'opencode)
-
-(defface opencode-session-list-open-session
-  '((t :inherit success))
-  "Title of a session with a live buffer in a session list."
-  :group 'opencode-faces)
 
 (defface opencode-session-status-waiting
   '((t :inherit opencode-attention))
@@ -110,20 +95,25 @@
     (done "\U000F05E0" opencode-session-status-done)         ; nf-md-check_circle
     (idle "\uf10c" opencode-session-status-idle))            ; nf-fa-circle_o
   "Session statuses, as `opencode-state-status' names them, with their icon and face.
-Session lists show the icon before the title, and name the status in its
-tooltip.  The default icons come from Nerd Fonts, which must be installed
-for them to show."
+Session pickers show the icon before the title, and name the status in
+its tooltip.  The default icons come from Nerd Fonts, which must be
+installed for them to show."
   :type '(alist :key-type (symbol :tag "Status")
                 :value-type (list (string :tag "Icon") (face :tag "Face")))
   :group 'opencode)
 
 ;;;; Server data
 
+(defvar opencode--projects nil
+  "The projects `opencode-fetch-projects' last received, naming sessions in pickers.")
+
 (defun opencode-fetch-projects (callback &optional else)
   "Call CALLBACK with the projects the service knows.
 ELSE, when given, receives the `opencode-error' of a failed request."
   (opencode-request 'get "/api/project" :buffer nil :else else
-                    :then (lambda (response) (funcall callback response))))
+                    :then (lambda (response)
+                            (setq opencode--projects response)
+                            (funcall callback response))))
 
 (defun opencode-project-for-directory (projects directory)
   "Return the project of PROJECTS containing DIRECTORY, or nil.
@@ -187,53 +177,17 @@ Return nil outside Git.  HEAD is read directly, without running Git."
             ((looking-at "[0-9a-f]\\{7\\}") (match-string 0))))))
 
 (defun opencode-git-branch (directory)
-  "Return DIRECTORY's Git branch, cached for `opencode-session-list-branch-ttl'."
+  "Return DIRECTORY's Git branch, cached for `opencode-git-branch-ttl' seconds."
   (let ((entry (gethash directory opencode--branches))
         (now (float-time)))
-    (if (and entry (< (- now (cdr entry)) opencode-session-list-branch-ttl))
+    (if (and entry (< (- now (cdr entry)) opencode-git-branch-ttl))
         (car entry)
       (let ((branch (and (file-directory-p directory)
                          (ignore-errors (opencode--read-git-branch directory)))))
         (puthash directory (cons branch now) opencode--branches)
         branch))))
 
-;;;; List buffers
-
-(defvar-keymap opencode-session-list-mode-map
-  :parent special-mode-map)
-
-(define-derived-mode opencode-session-list-mode special-mode "Sessions"
-  "Major mode of OpenCode session lists.
-RET opens the session at point and \\[revert-buffer] fetches the list
-again.  Commands of other packages, such as drover, act on the session
-at point through `opencode-session-list-id-at-point'.
-\\{opencode-session-list-mode-map}"
-  (setq-local truncate-lines t
-              revert-buffer-function (lambda (&rest _) (opencode-session-list-refresh))))
-
-(defvar-local opencode--session-list-scope nil
-  "What this list shows: `all', or (DIRECTORY . PROJECT-ID-OR-NIL).")
-
-(defvar-local opencode--session-list-sessions nil
-  "Sessions this list last fetched.")
-
-(defvar-local opencode--session-list-projects nil
-  "Project IDs mapped to names, for the Project column.")
-
-(defvar-local opencode--session-list-subagents nil
-  "Non-nil when this list shows subagent sessions too.")
-
-(defvar-local opencode--session-list-width nil
-  "Body width of the window this list was rendered for, or nil when hidden.")
-
-(defun opencode--session-list-age (seconds)
-  "Format SECONDS since a change; unknown times are infinite and show as -."
-  (if (and (numberp seconds) (< seconds 1.0e+INF)) (opencode-format-time-ago seconds) "-"))
-
-(defun opencode--session-list-time (info key)
-  "Return the seconds since INFO's time KEY, infinite when unknown.
-A sortable number, never nil: vtable would propertize the name of nil."
-  (or (opencode-time-ago (alist-get key (alist-get 'time info))) 1.0e+INF))
+;;;; Session pickers
 
 (defun opencode-session-status-icon (status)
   "Return the icon of STATUS, a session status symbol, in its face.
@@ -242,174 +196,124 @@ Its tooltip names the status; an unknown status is \"-\"."
       (propertize (car display) 'face (cadr display) 'help-echo (symbol-name status))
     "-"))
 
-(defun opencode--session-list-status (info)
-  "Return the status of session INFO in a list.
-The registry knows running sessions and their requests; a session it
-does not hold is idle, and its info tells whether that was seen."
-  (opencode-state-status (or (opencode-state-get (alist-get 'id info))
-                             (opencode-state--info-entry info))))
+(defun opencode--session-entry (info)
+  "Return the registry entry of session INFO, else an entry made from INFO.
+The registry follows the service, so its title, directory and status
+are current where INFO, fetched earlier, may be stale.  An entry made
+from INFO knows whether its last turn was seen, but not whether one runs."
+  (or (opencode-state-get (alist-get 'id info))
+      (opencode-state--info-entry info)))
 
-(defun opencode--session-list-title-text (info)
-  "Return the title of session INFO in a list, its ID when it has none."
-  (let ((title (alist-get 'title info)))
-    (if (or (null title) (string-empty-p title)) (alist-get 'id info) title)))
+(defun opencode--session-project-name (entry)
+  "Return the name of the project of registry ENTRY, or nil when unknown.
+The project is looked up among `opencode--projects', by ID, else by
+directory."
+  (let ((id (plist-get entry :project-id))
+        (directory (plist-get entry :directory)))
+    (when-let* ((project (or (and id (seq-find (lambda (project) (equal (alist-get 'id project) id))
+                                               opencode--projects))
+                             (and directory (opencode-project-for-directory opencode--projects directory))))
+                ;; `opencode-project-name' needs one of them.
+                ((or (alist-get 'name project) (stringp (alist-get 'canonical project))))
+                (name (opencode-project-name project))
+                ((not (string-empty-p name))))
+      name)))
 
-(defun opencode--session-list-title (info)
-  "Return the Title value of session INFO, which the column sorts by.
-It is the title, highlighted when the session has a live buffer, and
-carries the session's status as its `opencode-session-status' property
-for `opencode--session-list-title-cell' to show."
-  (apply #'propertize (opencode--session-list-title-text info)
-         'opencode-session-status (opencode--session-list-status info)
-         (when (buffer-live-p (gethash (alist-get 'id info) opencode-session-buffers))
-           '(face opencode-session-list-open-session))))
+(defun opencode--session-candidates (sessions)
+  "Return the candidates of `opencode-annotated-completion' for SESSIONS.
+SESSIONS are session infos; each candidate's value is one of them.  Its
+prefix is the session's status icon, its name the title, or the ID of an
+untitled session, and its annotation the project, the branch and the
+time since the session last changed, in columns.  A column no session
+has a value for is left out.  The sort key puts the newest first."
+  (let* ((rows (mapcar (lambda (info)
+                         (let* ((entry (opencode--session-entry info))
+                                (directory (plist-get entry :directory)))
+                           (list info entry
+                                 (or (opencode--session-project-name entry) "")
+                                 (or (and directory (opencode-git-branch directory)) ""))))
+                       sessions))
+         (project-width (seq-max (cons 0 (mapcar (lambda (row) (string-width (nth 2 row))) rows))))
+         (branch-width (seq-max (cons 0 (mapcar (lambda (row) (string-width (nth 3 row))) rows)))))
+    (cl-flet ((column (text width)
+                (unless (zerop width) (concat (string-pad text width) "  "))))
+      (mapcar (pcase-lambda (`(,info ,entry ,project ,branch))
+                (let ((title (plist-get entry :title))
+                      (updated (plist-get entry :updated)))
+                  (list (if (or (null title) (string-empty-p title)) (plist-get entry :id) title)
+                        info
+                        (concat (column project project-width)
+                                (column branch branch-width)
+                                (opencode-format-time-ago (and updated (- (float-time) updated))))
+                        (- (or updated 0))
+                        (concat (opencode-session-status-icon (opencode-state-status entry)) " "))))
+              rows))))
 
-(defun opencode--session-list-title-cell (title width table)
-  "Return the cell showing TITLE in WIDTH pixels of TABLE.
-The icon of the status TITLE carries comes first, then a space and the
-title, which an ellipsis ends when it is too long."
-  (let ((cell (concat (opencode-session-status-icon
-                       (get-text-property 0 'opencode-session-status title))
-                      " " title)))
-    (add-face-text-property 0 (length cell) (vtable-face table) t cell)
-    (truncate-string-pixelwise cell width (vtable-buffer table)
-                               (propertize (truncate-string-ellipsis) 'face (vtable-face table)))))
-
-(defun opencode--session-list-title-width (sessions)
-  "Return the width of the Title column showing SESSIONS, as a vtable spec.
-vtable sizes a column by its values, which leave out the icons, so the
-width is measured here, in the `vtable' face the lists' tables use: the
-widest title, plain or highlighted, after the widest icon and a space.
-A row drawn again with another status or highlight then still fits."
-  (cl-flet ((measure (string)
-              (let ((string (copy-sequence string)))
-                (add-face-text-property 0 (length string) 'vtable t string)
-                (string-pixel-width string (current-buffer)))))
-    (let* ((icons (cons (opencode-session-status-icon nil)
-                        (mapcar (lambda (entry) (opencode-session-status-icon (car entry)))
-                                opencode-session-status-icons)))
-           (titles (mapcan (lambda (info)
-                             (let ((title (opencode--session-list-title-text info)))
-                               (list title (propertize title 'face 'opencode-session-list-open-session))))
-                           sessions))
-           (width (+ (seq-max (mapcar #'measure icons))
-                     (measure " ")
-                     (seq-max (cons 0 (mapcar #'measure titles))))))
-      ;; Pixels on graphic displays and columns on terminals, as vtable stores a resized column.
-      (if (display-graphic-p) (format "%dpx" width) width))))
-
-(defun opencode--session-list-columns (sessions)
-  "Return the columns of this list showing SESSIONS.
-Each title follows its session's status icon in the same cell, and the
-column sorts by title."
-  `((:name "Title" :width ,(opencode--session-list-title-width sessions) :max-width "45%"
-           :displayer opencode--session-list-title-cell)
-    ,@(when (eq opencode--session-list-scope 'all)
-        '((:name "Project" :min-width 8 :max-width "12%")))
-    (:name "Branch" :min-width 6 :max-width ,(if (eq opencode--session-list-scope 'all) "10%" "12%"))
-    (:name "Last Updated" :width 12 :formatter opencode--session-list-age :primary ascend)
-    (:name "Created" :width 10 :formatter opencode--session-list-age)))
-
-(defun opencode--session-list-value (info column table)
-  "Return the value of session INFO in COLUMN of TABLE."
-  (pcase (vtable-column table column)
-    ("Title" (opencode--session-list-title info))
-    ("Project" (or (gethash (alist-get 'projectID info) opencode--session-list-projects) "-"))
-    ("Branch" (or (opencode-git-branch (opencode--session-directory info)) "-"))
-    ("Last Updated" (opencode--session-list-time info 'updated))
-    ("Created" (opencode--session-list-time info 'created))))
-
-(defun opencode--session-list-render ()
-  "Render this buffer's sessions as a table sized to its window."
-  (let* ((inhibit-read-only t)
-         (at (ignore-errors (vtable-current-object)))
-         (sessions (if opencode--session-list-subagents
-                       opencode--session-list-sessions
-                     (seq-remove (lambda (info) (alist-get 'parentID info))
-                                 opencode--session-list-sessions))))
-    (erase-buffer)
-    (if (null sessions)
-        (insert (if (consp opencode--session-list-scope)
-                    (format "No sessions in %s" (car opencode--session-list-scope))
-                  "No sessions"))
-      (make-vtable
-       :columns (opencode--session-list-columns sessions)
-       :objects sessions
-       :getter #'opencode--session-list-value
-       :actions '("RET" opencode-session-list-open)
-       :separator-width 2
-       :keymap opencode-session-list-mode-map)
-      (if at
-          (ignore-errors (vtable-goto-object at))
-        (goto-char (point-min))))
-    (setq opencode--session-list-width
-          (when-let* ((window (get-buffer-window nil t)))
-            (window-body-width window)))))
-
-(defun opencode-session-list-refresh (&optional callback)
-  "Fetch this list's sessions again and render them, then call CALLBACK."
-  (interactive)
-  (let ((buffer (current-buffer))
-        (scope opencode--session-list-scope)
-        (pending 2)
-        sessions projects)
-    (cl-flet ((done ()
-                (when (and (zerop (cl-decf pending)) (buffer-live-p buffer))
-                  (with-current-buffer buffer
-                    (setq opencode--session-list-sessions sessions
-                          opencode--session-list-projects (make-hash-table :test #'equal))
-                    (dolist (project projects)
-                      (puthash (alist-get 'id project) (opencode-project-name project)
-                               opencode--session-list-projects))
-                    (opencode--session-list-render)
-                    (when callback (funcall callback))))))
-      (opencode-fetch-projects (lambda (data) (setq projects data) (done)))
-      (opencode-fetch-sessions
-       `(,@(pcase scope
-             ('all nil)
-             (`(,_directory . ,(and project (pred stringp))) `((project . ,project)))
-             (`(,directory . ,_) `((directory . ,(opencode-directory-name directory)))))
-         (archived . "false"))
-       (lambda (data) (setq sessions data) (done))))))
-
-(defun opencode--session-list-show (buffer)
-  "Display list BUFFER, rendering it again for its window's width."
-  (pop-to-buffer buffer)
-  (with-current-buffer buffer
-    (unless (equal opencode--session-list-width (window-body-width))
-      (opencode--session-list-render))))
-
-(defun opencode--session-list-open-buffer (name scope)
-  "Show the list buffer NAME of SCOPE, creating and fetching it when needed."
+(defun opencode-read-session (prompt sessions &optional new-directory)
+  "Read one of SESSIONS, session infos, with PROMPT and return it.
+Sessions are offered newest first, each after the icon of its status
+\(see `opencode-session-status-icons') and followed by its project, its
+branch when known and the time since it last changed.  The session
+registry `opencode-state' gives them when it holds the session.  With
+NEW-DIRECTORY, an entry starting a new session there is offered first,
+and choosing it returns the symbol `new'.  Return nil when nothing is
+chosen."
+  ;; Statuses come from the registry, which needs the event stream.
   (opencode-state-ensure)
-  (let ((buffer (get-buffer name)))
-    (if (buffer-live-p buffer)
-        (opencode--session-list-show buffer)
-      (setq buffer (get-buffer-create name))
-      (with-current-buffer buffer
-        (opencode-session-list-mode)
-        (setq opencode--session-list-scope scope
-              default-directory (if (consp scope) (car scope) (expand-file-name "~/")))
-        (opencode-session-list-refresh (lambda () (opencode--session-list-show buffer)))))))
+  (unless opencode--projects
+    ;; Project names only decorate the sessions.
+    (with-demoted-errors "OpenCode: cannot name the projects: %S"
+      (opencode-wait #'opencode-fetch-projects)))
+  (opencode-annotated-completion
+   prompt
+   (append (when new-directory
+             (list (list "New session" 'new (abbreviate-file-name new-directory)
+                         most-negative-fixnum "+ ")))
+           (opencode--session-candidates sessions))))
+
+(defun opencode--select-session (prompt sessions)
+  "Open one of SESSIONS, session infos, chosen with PROMPT."
+  (if (null sessions)
+      (message "No sessions")
+    (when-let* ((info (opencode-read-session prompt sessions)))
+      (opencode-session-open info :other-window nil))))
+
+(defun opencode--project-sessions (directory)
+  "Return the sessions of DIRECTORY's project, newest first, once fetched.
+They are those of every worktree of the project, subagents and archived
+sessions left out.  A directory in no project the service knows has its
+own sessions instead."
+  (let ((project (opencode-project-for-directory (opencode-wait #'opencode-fetch-projects) directory)))
+    (opencode-wait (lambda (then else)
+                     (opencode-fetch-sessions
+                      `((parentID . "null")
+                        (archived . "false")
+                        ,(if project
+                             `(project . ,(alist-get 'id project))
+                           `(directory . ,(opencode-directory-name directory))))
+                      then else)))))
 
 (defun opencode (&optional directory)
-  "List the sessions of DIRECTORY's project, the current one by default."
+  "Open a session of DIRECTORY's project, or start one in DIRECTORY.
+DIRECTORY defaults to the current project's root.  The project's
+sessions, from all its worktrees, are offered newest first, after an
+entry starting a new session; subagents and archived sessions are left
+out.  When the project has none, a session starts at once.
+See `opencode-read-session' for what each session shows."
   (interactive)
-  (let ((directory (opencode-project-directory directory)))
-    (opencode-fetch-projects
-     (lambda (projects)
-       (let ((project (opencode-project-for-directory projects directory)))
-         (opencode--session-list-open-buffer
-          (format "*OpenCode Sessions in %s*" (abbreviate-file-name directory))
-          (cons directory (alist-get 'id project))))))))
+  (let* ((directory (opencode-project-directory directory))
+         (sessions (opencode--project-sessions directory)))
+    (pcase (if sessions (opencode-read-session "Session: " sessions directory) 'new)
+      ('new (opencode-session-create :directory directory))
+      ('nil nil)
+      (info (opencode-session-open info :other-window nil)))))
 
-(defun opencode-list-all-sessions ()
-  "List the sessions of every project."
-  (interactive)
-  (opencode--session-list-open-buffer "*OpenCode All Sessions*" 'all))
+(defalias 'opencode-select-session #'opencode)
 
 (defun opencode-select-project ()
-  "List the sessions of a project the service knows, most recently active first."
+  "Pick a project the service knows, most recently active first, then a session.
+The session is picked among the project's, or started in its directory,
+as `opencode' does."
   (interactive)
   (when-let* ((project
                (opencode-annotated-completion
@@ -424,131 +328,59 @@ column sorts by title."
                                     (opencode-wait #'opencode-fetch-projects))))))
     (opencode (alist-get 'canonical project))))
 
-(defun opencode-select-session ()
-  "Open a session of the current project."
-  (interactive)
+(defun opencode--running-session-ids ()
+  "Return the IDs of the sessions running a turn, once fetched."
+  (opencode-wait (lambda (then else)
+                   (opencode-request 'get "/api/session/active" :directory nil :buffer nil
+                                     :then (lambda (response)
+                                             (funcall then (opencode-state--active-ids response)))
+                                     :else else))))
+
+(defun opencode-read-project-session (prompt &optional running)
+  "Read a session of the current project with PROMPT and return its info.
+The sessions are those `opencode' offers; RUNNING offers only those
+running a turn.  Signal a `user-error' when there is none or none is
+chosen."
   (let* ((directory (opencode-project-directory))
-         (project (opencode-project-for-directory (opencode-wait #'opencode-fetch-projects)
-                                                  directory)))
-    (opencode--select-session
-     "Session: "
-     (opencode-wait (lambda (then else)
-                      (opencode-fetch-sessions
-                       `((parentID . "null")
-                         ,(if project
-                              `(project . ,(alist-get 'id project))
-                            `(directory . ,(opencode-directory-name directory))))
-                       then else))))))
+         (active (and running (or (opencode--running-session-ids)
+                                  (user-error "No OpenCode session is running"))))
+         (sessions (seq-filter (lambda (info) (or (not running) (member (alist-get 'id info) active)))
+                               (opencode--project-sessions directory))))
+    (unless sessions
+      (user-error (if running "No OpenCode session is running in %s" "No OpenCode session in %s")
+                  (abbreviate-file-name directory)))
+    (or (opencode-read-session prompt sessions)
+        (user-error "No session chosen"))))
 
-(defun opencode-session-list-open (info)
-  "Open session INFO in the selected window."
-  (opencode-session-open info :other-window nil))
-
-(defun opencode-session-list-id-at-point ()
-  "Return the ID of the session on the row at point of a session list, or nil."
-  (when (derived-mode-p 'opencode-session-list-mode)
-    (alist-get 'id (ignore-errors (vtable-current-object)))))
-
-(defun opencode-session-list-new ()
-  "Create a session in this list's directory."
+(defun opencode-select-child-session ()
+  "Open a subagent session of this session."
   (interactive)
-  (opencode-session-create :directory default-directory))
+  (opencode--require-session)
+  (opencode--select-session
+   "Subagent: "
+   (opencode-request-data
+    (opencode-request-sync 'get "/api/session" :query `((parentID . ,opencode-session-id))))))
 
-(defun opencode-session-list-toggle-subagents ()
-  "Show or hide subagent sessions in this list."
+(defun opencode-select-open-session ()
+  "Switch to the buffer of a session open in Emacs, picked among their sessions."
   (interactive)
-  (setq opencode--session-list-subagents (not opencode--session-list-subagents))
-  (opencode--session-list-render)
-  (message (if opencode--session-list-subagents "Showing subagents" "Hiding subagents")))
+  (let ((infos nil))
+    (maphash (lambda (_id buffer)
+               (when-let* (((buffer-live-p buffer))
+                           (info (buffer-local-value 'opencode-session-info buffer)))
+                 (push info infos)))
+             opencode-session-buffers)
+    (if (null infos)
+        (message "No open sessions")
+      (when-let* ((info (opencode-read-session "Open session: " infos))
+                  (buffer (gethash (alist-get 'id info) opencode-session-buffers))
+                  ((buffer-live-p buffer)))
+        (switch-to-buffer buffer)))))
 
-(defun opencode--session-list-buffers ()
-  "Return the live session list buffers."
-  (seq-filter (lambda (buffer)
-                (eq (buffer-local-value 'major-mode buffer) 'opencode-session-list-mode))
-              (buffer-list)))
-
-(defun opencode--session-list-update-buffer (id)
-  "Update session ID's row in each list after its buffer opens or closes."
-  (dolist (buffer (opencode--session-list-buffers))
-    (with-current-buffer buffer
-      (let ((at (vtable-current-object))
-            (offset (- (point) (line-beginning-position))))
-        (save-excursion
-          (goto-char (point-min))
-          (when-let* ((table (vtable-current-table))
-                      (info (seq-find (lambda (info) (equal (alist-get 'id info) id))
-                                      (vtable-objects table))))
-            (vtable-update-object table info)))
-        (when at
-          (vtable-goto-object at)
-          (forward-char (min offset (- (line-end-position) (point)))))))))
-
-(defun opencode--session-list-buffer-changed (id)
-  "Schedule a local update of session ID's row in each list."
-  ;; `kill-buffer' restores an excursion that row replacement would collapse.
-  (when (opencode--session-list-buffers)
-    (run-at-time 0 nil #'opencode--session-list-update-buffer id)))
-
-(add-hook 'opencode-session-buffer-functions #'opencode--session-list-buffer-changed)
-
-(defvar opencode--session-list-refresh-timer nil
-  "Timer refreshing the session lists after sessions changed.")
-
-(defvar opencode--session-list-pending nil
-  "What the scheduled update of the session lists does.
-t fetches them again; otherwise it is the IDs of the sessions whose rows
-to draw again.")
-
-(defun opencode--session-list-update ()
-  "Run the update of the session lists scheduled by `opencode--session-list-schedule'."
-  (let ((pending opencode--session-list-pending))
-    (setq opencode--session-list-refresh-timer nil
-          opencode--session-list-pending nil)
-    (if (eq pending t)
-        (dolist (buffer (opencode--session-list-buffers))
-          (with-current-buffer buffer
-            (opencode-session-list-refresh)))
-      (dolist (id pending)
-        (opencode--session-list-update-buffer id)))))
-
-(defun opencode--session-list-schedule (what)
-  "Update every session list shortly, once a burst of changes ends.
-WHAT is t to fetch the lists again, or the ID of a session whose row
-only needs drawing again."
-  (when (opencode--session-list-buffers)
-    (setq opencode--session-list-pending
-          (if (or (eq what t) (eq opencode--session-list-pending t))
-              t
-            (cl-adjoin what opencode--session-list-pending :test #'equal)))
-    (when (timerp opencode--session-list-refresh-timer)
-      (cancel-timer opencode--session-list-refresh-timer))
-    (setq opencode--session-list-refresh-timer
-          (run-with-timer 1 nil #'opencode--session-list-update))))
-
-(defun opencode--session-list-changed (_event)
-  "Refresh every session list shortly, once a burst of session events ends."
-  (opencode--session-list-schedule t))
-
-(defun opencode--session-list-status-changed (id _old _new)
-  "Draw session ID's row again in every list once its status changed."
-  (opencode--session-list-schedule id))
-
-(dolist (type '("session.created" "session.deleted" "session.renamed" "session.moved" "session.forked"
-                "session.archived" "session.unarchived"))
-  (opencode-events-register type #'opencode--session-list-changed))
-(add-hook 'opencode-state-change-functions #'opencode--session-list-status-changed)
-
-(defun opencode--session-lists-resize (frame)
-  "Render the session lists shown in FRAME again where their width changed."
-  (dolist (window (window-list frame 'no-minibuffer))
-    (with-current-buffer (window-buffer window)
-      (when (and (derived-mode-p 'opencode-session-list-mode)
-                 opencode--session-list-sessions
-                 (not (equal (window-body-width window) opencode--session-list-width)))
-        (with-selected-window window
-          (opencode--session-list-render))))))
-
-(add-hook 'window-size-change-functions #'opencode--session-lists-resize)
+(defun opencode-select-idle ()
+  "Open a session that finished while not displayed."
+  (interactive)
+  (opencode--select-session "Idle session: " opencode-alerted-sessions))
 
 ;;;; Worktrees
 

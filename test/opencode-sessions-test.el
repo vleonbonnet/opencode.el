@@ -1,4 +1,4 @@
-;;; opencode-sessions-test.el --- Tests of session lists  -*- lexical-binding: t; -*-
+;;; opencode-sessions-test.el --- Tests of session pickers and projects  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026  Valentin Leon
 
@@ -47,8 +47,10 @@ and filters sent with it are ignored."
                   (matching (seq-filter (lambda (info)
                                           (and (or (not (alist-get 'project query))
                                                    (equal (alist-get 'projectID info) (alist-get 'project query)))
-                                               (or (not (equal (alist-get 'parentID query) "null"))
-                                                   (not (alist-get 'parentID info)))))
+                                               (pcase (alist-get 'parentID query)
+                                                 ('nil t)
+                                                 ("null" (not (alist-get 'parentID info)))
+                                                 (parent (equal (alist-get 'parentID info) parent)))))
                                         sessions)))
              `((data . ,(seq-take (nthcdr start matching) 2))
                ;; The server always offers a next page, even past the end.
@@ -65,44 +67,54 @@ and filters sent with it are ignored."
                                          opencode-test-routes)))
        ,@body)))
 
-(defun opencode-test-list-columns ()
-  "Return the column names of the table at point."
-  (mapcar #'vtable-column-name (vtable-columns (vtable-current-table))))
+(defun opencode-test-root-titles ()
+  "Return the titles of the recorded sessions other than subagents, newest first."
+  (seq-keep (lambda (info) (and (not (alist-get 'parentID info)) (alist-get 'title info)))
+            (opencode-test-recorded-sessions)))
 
-(defun opencode-test-list-title-cell (info)
-  "Return the Title cell of session INFO in the current list, with its properties.
-The space padding the cell to the column's width is left out."
-  (save-excursion
-    (goto-char (point-min))
-    (should (vtable-goto-object info))
-    (should (vtable-goto-column (seq-position (opencode-test-list-columns) "Title")))
-    (buffer-substring (point) (1- (next-single-property-change (point) 'vtable-column)))))
+(defun opencode-test-session-info (id)
+  "Return the recorded info of session ID."
+  (alist-get 'data (opencode-test-fixture (format "session-%s.json" id))))
 
-(defun opencode-test-list-title-cell-width (info)
-  "Return the width the Title cell of session INFO takes, padding included."
-  (save-excursion
-    (goto-char (point-min))
-    (should (vtable-goto-object info))
-    (should (vtable-goto-column (seq-position (opencode-test-list-columns) "Title")))
-    (string-pixel-width (buffer-substring (point) (next-single-property-change (point) 'vtable-column))
-                        (current-buffer))))
+(defvar opencode-test-offers nil
+  "What `completing-read' offered under `opencode-test-choosing', newest first.
+Each is a plist: :prompt, :names (the collection as given) and :rows,
+the candidates in display order as (NAME PREFIX SUFFIX).")
 
-(defun opencode-test-list-objects ()
-  "Return the objects of the table at point in the order of its rows."
-  (save-excursion
-    (goto-char (point-min))
-    (let (objects)
-      (while (not (eobp))
-        (when-let* ((object (vtable-current-object)))
-          (push object objects))
-        (forward-line 1))
-      (nreverse objects))))
+(defmacro opencode-test-choosing (chooser &rest body)
+  "Run BODY answering `completing-read' with CHOOSER.
+CHOOSER receives the rows of the offer, see `opencode-test-offers', and
+returns the name chosen.  The offer is displayed as completion UIs do:
+sorted by its display sort function, then affixed."
+  (declare (indent 1) (debug t))
+  `(let ((opencode-test-offers nil))
+     (cl-letf (((symbol-function 'completing-read)
+                (lambda (prompt collection &rest _)
+                  (let* ((sort (plist-get completion-extra-properties :display-sort-function))
+                         (affix (plist-get completion-extra-properties :affixation-function))
+                         (rows (funcall affix (if sort (funcall sort (copy-sequence collection)) collection))))
+                    (push (list :prompt prompt :names collection :rows rows) opencode-test-offers)
+                    (funcall ,chooser rows)))))
+       ,@body)))
+
+(defun opencode-test-choose (name)
+  "Return a chooser of `opencode-test-choosing' picking NAME, which must be offered."
+  (lambda (rows)
+    (should (assoc name rows))
+    name))
+
+(defun opencode-test-offered-names (&optional offer)
+  "Return the names OFFER displayed, the last offer by default, without properties."
+  (mapcar (lambda (row) (substring-no-properties (car row)))
+          (plist-get (or offer (car opencode-test-offers)) :rows)))
 
 (defun opencode-test-make-head (directory content &optional gitdir)
   "Write HEAD CONTENT for a repository at DIRECTORY, whose Git directory is GITDIR."
   (let ((gitdir (or gitdir (expand-file-name ".git" directory))))
     (make-directory gitdir t)
     (with-temp-file (expand-file-name "HEAD" gitdir) (insert content))))
+
+;;;; Server data
 
 (ert-deftest opencode-test-git-branch-from-head ()
   "Branches are read from HEAD, in repositories and in linked worktrees."
@@ -133,8 +145,14 @@ The space padding the cell to the column's width is left out."
           (opencode-test-make-head nil "ref: refs/heads/renamed\n"
                                    (expand-file-name ".git/worktrees/linked" main))
           (should (equal (opencode-git-branch linked) "side"))
-          (let ((opencode-session-list-branch-ttl 0))
+          (let ((opencode-git-branch-ttl 0))
             (should (equal (opencode-git-branch linked) "renamed")))
+          ;; The TTL's former name still sets it.
+          (opencode-test-make-head nil "ref: refs/heads/again\n"
+                                   (expand-file-name ".git/worktrees/linked" main))
+          (with-suppressed-warnings ((obsolete opencode-session-list-branch-ttl))
+            (let ((opencode-session-list-branch-ttl 0))
+              (should (equal (opencode-git-branch linked) "again"))))
           (should-not (opencode-git-branch (expand-file-name "missing/" root))))
       (delete-directory root t))))
 
@@ -157,6 +175,12 @@ The space padding the cell to the column's width is left out."
             (should-not (opencode-project-for-directory projects temporary-file-directory))))
       (delete-directory root t))))
 
+(ert-deftest opencode-test-project-name ()
+  "A project is named by its name, else by its canonical directory."
+  (should (equal (opencode-project-name '((name . "Named") (canonical . "/a/b"))) "Named"))
+  (should (equal (opencode-project-name '((canonical . "/a/repo"))) "repo"))
+  (should (equal (opencode-project-name '((canonical . "/a/repo/"))) "repo")))
+
 (ert-deftest opencode-test-fetch-sessions-pages ()
   "Every page is fetched until one comes back empty."
   (opencode-test-with-sessions
@@ -175,275 +199,54 @@ The space padding the cell to the column's width is left out."
         (dolist (page (cdr pages))
           (should (equal (mapcar #'car (plist-get page :query)) '(limit cursor))))))))
 
-(ert-deftest opencode-test-opencode-lists-the-project ()
-  "`opencode' lists the project of the current directory by its ID."
+(ert-deftest opencode-test-fetch-projects-remembered ()
+  "Fetched projects are remembered for naming sessions; a failure keeps the last ones."
   (opencode-test-with-sessions
-    (let (opened)
-      (cl-letf (((symbol-function 'opencode--session-list-open-buffer)
-                 (lambda (name scope) (setq opened (list name scope)))))
-        (opencode opencode-test-workspace)
-        (should (string-prefix-p "*OpenCode Sessions in " (car opened)))
-        (should (equal (cdr (cadr opened)) opencode-test-project-id))
-        (opencode temporary-file-directory)
-        (should (equal (cdr (cadr opened)) "other"))))))
+    (let (result failure)
+      (opencode-fetch-projects (lambda (projects) (setq result projects)))
+      (should (equal result (opencode-test-projects)))
+      (should (equal opencode--projects result))
+      (let ((opencode-test-routes (cons (list 'get "\\`/api/project\\'" (lambda (_) '(:error 500 "down")))
+                                        opencode-test-routes)))
+        (opencode-fetch-projects (lambda (_) (ert-fail "Succeeded")) (lambda (error) (setq failure error))))
+      (should (eql (opencode-error-status failure) 500))
+      (should (equal opencode--projects result)))))
 
-(ert-deftest opencode-test-session-list-render ()
-  "A list shows its sessions' titles and hides subagents until asked."
-  (opencode-test-with-sessions
-    (with-temp-buffer
-      (opencode-session-list-mode)
-      (setq opencode--session-list-scope (cons opencode-test-workspace opencode-test-project-id))
-      (opencode-session-list-refresh)
-      (let ((text (buffer-string))
-            (done (regexp-quote (opencode-session-status-icon 'done)))
-            (child (regexp-quote (opencode-test-session-title (opencode-test-scenario "subagent-child")))))
-        ;; Finished turns nobody viewed show as done, one space before their title.
-        (should (string-match-p (concat "^" done " history renamed ") text))
-        (should (string-match-p (concat "^" done " reasoning ") text))
-        (should-not (string-match-p child text))
-        (goto-char (point-min))
-        (should (equal (opencode-test-list-columns) '("Title" "Branch" "Last Updated" "Created")))
-        (opencode-session-list-toggle-subagents)
-        (should (string-match-p child (buffer-string))))
-      (goto-char (point-min))
-      (forward-line 1)
-      (should (alist-get 'id (vtable-current-object))))))
+;;;; Completion
 
-(ert-deftest opencode-test-session-list-all-projects ()
-  "The all-projects list names each session's project."
-  (opencode-test-with-sessions
-    (with-temp-buffer
-      (opencode-session-list-mode)
-      (setq opencode--session-list-scope 'all)
-      (opencode-session-list-refresh)
-      (goto-char (point-min))
-      (should (member "Project" (opencode-test-list-columns)))
-      (should (equal (gethash opencode-test-project-id opencode--session-list-projects)
-                     (file-name-nondirectory (directory-file-name opencode-test-workspace))))
-      ;; Narrow batch windows truncate the column to its 12%.
-      (should (string-match-p (concat "^" (regexp-quote (opencode-session-status-icon 'done))
-                                      " reasoning +opencode")
-                              (buffer-string))))))
+(ert-deftest opencode-test-annotated-completion ()
+  "Candidates are sorted by key, affixed with aligned annotations, and all choosable."
+  (let ((candidates `(("b" 2 "two" 2)
+                      ("a" 1 "one" 1 "* ")
+                      ("a" 3 ,(propertize "three" 'face 'bold) 3)
+                      ("c" 4))))
+    (opencode-test-choosing (opencode-test-choose "a<2>")
+      (should (eql (opencode-annotated-completion "Pick: " candidates) 3))
+      (let ((offer (car opencode-test-offers)))
+        (should (equal (plist-get offer :prompt) "Pick: "))
+        ;; Prefixes and annotations are not matched against the input.
+        (should (equal (mapcar #'substring-no-properties (plist-get offer :names)) '("a" "b" "a<2>" "c")))
+        (should (equal (opencode-test-offered-names) '("a" "b" "a<2>" "c")))
+        (pcase-let ((`((,_ ,a-prefix ,a-suffix) (,_ ,b-prefix ,b-suffix) (,_ ,_ ,three) (,_ ,_ ,c-suffix))
+                     (plist-get offer :rows)))
+          (should (equal a-prefix "* "))
+          (should (equal b-prefix ""))
+          ;; Four spaces after the widest name, \"a<2>\".
+          (should (equal (substring-no-properties a-suffix) (concat (make-string 7 ?\s) "one")))
+          (should (equal (substring-no-properties b-suffix) (concat (make-string 7 ?\s) "two")))
+          (should (equal (substring-no-properties c-suffix) (make-string 7 ?\s)))
+          (should (eq (get-text-property 0 'face a-suffix) 'completions-annotations))
+          ;; An annotation's own face comes first.
+          (should (equal (get-text-property (- (length three) 1) 'face three) '(bold completions-annotations))))))
+    (opencode-test-choosing (opencode-test-choose "a")
+      (should (eql (opencode-annotated-completion "Pick: " candidates) 1)))
+    ;; Without sort keys, the order is kept.
+    (opencode-test-choosing (opencode-test-choose "y")
+      (should (eq (opencode-annotated-completion "Pick: " '(("z" z) ("y" y))) 'y))
+      (should (equal (opencode-test-offered-names) '("z" "y"))))
+    (should-not (opencode-annotated-completion "Pick: " nil))))
 
-(defun opencode-test-session-list-highlighted-p (info)
-  "Return non-nil when INFO's title is highlighted in the current list.
-The title follows the status icon and a space, which are never highlighted."
-  (let ((cell (opencode-test-list-title-cell info)))
-    (should-not (memq 'opencode-session-list-open-session (ensure-list (get-text-property 0 'face cell))))
-    (should-not (memq 'opencode-session-list-open-session (ensure-list (get-text-property 1 'face cell))))
-    (memq 'opencode-session-list-open-session (ensure-list (get-text-property 2 'face cell)))))
-
-(ert-deftest opencode-test-session-list-follows-open-buffers ()
-  "Open and close update both list scopes by ID, preserving table navigation."
-  (opencode-test-with-sessions
-    (dolist (scope (list 'all (cons opencode-test-workspace opencode-test-project-id)))
-      (with-temp-buffer
-        (opencode-session-list-mode)
-        (setq opencode--session-list-scope scope)
-        (opencode-session-list-refresh)
-        (let* ((id (opencode-test-scenario "text"))
-               (info (seq-find (lambda (info) (equal (alist-get 'id info) id))
-                               opencode--session-list-sessions))
-               (other (seq-find (lambda (info) (equal (alist-get 'id info)
-                                                      (opencode-test-scenario "reasoning")))
-                                opencode--session-list-sessions)))
-          ;; Equal titles must not make both rows look open.
-          (setf (alist-get 'title info) "Same title"
-                (alist-get 'title other) "Same title")
-          (opencode--session-list-render)
-          (vtable-sort-by-current-column)
-          (vtable-narrow-current-column)
-          (let* ((table (vtable-current-table))
-                 (sort (copy-tree (vtable-sort-by table)))
-                 (width (vtable-column-width (car (vtable-columns table)))))
-            (should-not (opencode-test-session-list-highlighted-p info))
-            (vtable-goto-object other)
-            (forward-char 3)
-            (setq opencode-test-requests nil)
-            (let ((buffer (opencode-test-open id)))
-              (accept-process-output nil 0.01)
-              (should-not (get-buffer-window buffer t))
-              (with-current-buffer buffer (rename-buffer "*renamed session*" t))
-              (should (eq (vtable-current-object) other))
-              (should (= (- (point) (line-beginning-position)) 3))
-              (should (opencode-test-session-list-highlighted-p info))
-              (should-not (opencode-test-session-list-highlighted-p other))
-              (should-not (text-properties-at 0 (alist-get 'title info)))
-              (should-not (seq-find (lambda (request)
-                                     (member (plist-get request :path) '("/api/session" "/api/project")))
-                                   opencode-test-requests))
-              (vtable-goto-object info)
-              (forward-char 2)
-              (setq opencode-test-requests nil)
-              (kill-buffer buffer)
-              (accept-process-output nil 0.01)
-              (should-not opencode-test-requests)
-              (should (eq (vtable-current-object) info))
-              (should (= (- (point) (line-beginning-position)) 2))
-              (should-not (opencode-test-session-list-highlighted-p info)))
-            (should (eq (vtable-current-table) table))
-            (should (equal (vtable-sort-by table) sort))
-            (should (equal (vtable-column-width (car (vtable-columns table))) width))))))))
-
-(ert-deftest opencode-test-session-list-existing-and-dead-buffers ()
-  "Initial rendering highlights live buffers, including ID-only titles, not dead ones."
-  (opencode-test-with-sessions
-    (let* ((id (opencode-test-scenario "text"))
-           (open (opencode-test-open id)))
-      (with-temp-buffer
-        (opencode-session-list-mode)
-        (setq opencode--session-list-scope 'all)
-        (opencode-session-list-refresh)
-        (let* ((info (seq-find (lambda (info) (equal (alist-get 'id info) id))
-                               opencode--session-list-sessions))
-               (other (seq-find (lambda (info) (not (equal (alist-get 'id info) id)))
-                                (vtable-objects (vtable-current-table)))))
-          (puthash (alist-get 'id other) (with-temp-buffer (current-buffer)) opencode-session-buffers)
-          (setf (alist-get 'title info) nil)
-          (opencode--session-list-render)
-          (should (opencode-test-session-list-highlighted-p info))
-          (should-not (opencode-test-session-list-highlighted-p other))
-          (opencode-session-list-toggle-subagents)
-          (should (opencode-test-session-list-highlighted-p info))
-          (kill-buffer open)
-          (accept-process-output nil 0.01)
-          (should-not (opencode-test-session-list-highlighted-p info)))))))
-
-(ert-deftest opencode-test-session-list-refreshes-after-events ()
-  "A burst of session events refreshes the open lists once."
-  (opencode-test-with-sessions
-    (let ((timers nil)
-          (opencode--session-list-refresh-timer nil))
-      (with-temp-buffer
-        (opencode-session-list-mode)
-        (setq opencode--session-list-scope 'all)
-        (cl-letf (((symbol-function 'run-with-timer)
-                   (lambda (_delay _repeat function) (let ((timer (timer-create)))
-                                                       (timer-set-function timer function)
-                                                       (push timer timers)
-                                                       timer))))
-          (opencode-test-dispatch '(((type . "session.created") (data (sessionID . "ses_a")))
-                                    ((type . "session.renamed") (data (sessionID . "ses_a")))))
-          (should (= (length timers) 2))
-          (should (eq opencode--session-list-refresh-timer (car timers)))
-          (setq opencode-test-requests nil)
-          (funcall (timer--function (car timers)))
-          (should (seq-find (lambda (request) (equal (plist-get request :path) "/api/session"))
-                            opencode-test-requests))
-          (should opencode--session-list-sessions))))))
-
-(ert-deftest opencode-test-session-list-status ()
-  "Each title follows its status icon, and a change redraws only that row, as wide."
-  (opencode-test-with-sessions
-    (let ((timers nil)
-          (opencode--session-list-refresh-timer nil)
-          (opencode--session-list-pending nil))
-      (with-temp-buffer
-        (opencode-session-list-mode)
-        (setq opencode--session-list-scope 'all)
-        (opencode-session-list-refresh)
-        ;; Archived sessions are left out; later pages carry the filter in their cursor.
-        (should (equal (alist-get 'archived (plist-get (seq-find (lambda (request)
-                                                                    (equal (plist-get request :path) "/api/session"))
-                                                                  (reverse opencode-test-requests))
-                                                        :query))
-                       "false"))
-        (opencode-test-dispatch '(((type . "server.connected") (data))))
-        (should (opencode-state-ready-p))
-        (let* ((objects (vtable-objects (vtable-current-table)))
-               ;; A short title shows whole in the narrow batch window.
-               (info (seq-find (lambda (info) (< (length (alist-get 'title info)) 20)) objects))
-               (id (alist-get 'id info))
-               (widths (mapcar #'opencode-test-list-title-cell-width objects)))
-          (should (opencode-state-get id))
-          ;; Every row's Title cell takes the column's width, whatever its icon,
-          ;; and the widest title still shows whole after its icon.
-          (should (= (length (seq-uniq widths)) 1))
-          (dolist (object objects)
-            (should (string-suffix-p (concat " " (opencode--session-list-title-text object))
-                                     (substring-no-properties (opencode-test-list-title-cell object)))))
-          (cl-flet ((check (status)
-                      (let ((cell (opencode-test-list-title-cell info)))
-                        (should (equal (substring-no-properties cell)
-                                       (concat (opencode-session-status-icon status) " " (alist-get 'title info))))
-                        (should (memq (intern (format "opencode-session-status-%s" status))
-                                      (ensure-list (get-text-property 0 'face cell))))
-                        (should (equal (get-text-property 0 'help-echo cell) (symbol-name status)))
-                        ;; Neither the space nor the title takes the icon's face or tooltip.
-                        (dolist (position (list 1 2))
-                          (should-not (get-text-property position 'help-echo cell))
-                          (should-not (seq-find (lambda (face)
-                                                  (string-prefix-p "opencode-session-status-" (format "%s" face)))
-                                                (ensure-list (get-text-property position 'face cell))))))))
-            (check 'done)
-            (cl-letf (((symbol-function 'run-with-timer)
-                       (lambda (_delay _repeat function)
-                         (let ((timer (timer-create)))
-                           (timer-set-function timer function)
-                           (push timer timers)
-                           timer))))
-              (opencode-test-dispatch `(((type . "session.execution.started") (created . 1)
-                                         (data (sessionID . ,id)))))
-              (should (= (length timers) 1))
-              (setq opencode-test-requests nil)
-              (funcall (timer--function (car timers)))
-              ;; Only the row is drawn again; nothing is fetched.
-              (should-not opencode-test-requests)
-              (check 'working)
-              (should (equal (mapcar #'opencode-test-list-title-cell-width objects) widths))
-              ;; Archiving or restoring a session refreshes the lists.
-              (opencode-test-dispatch `(((type . "session.archived") (created . 2) (data (sessionID . ,id)))))
-              (should (= (length timers) 2))
-              (should (eq opencode--session-list-pending t)))))))))
-
-(ert-deftest opencode-test-session-list-sorts-by-title ()
-  "The Title column sorts by title, not by the icons before them."
-  (opencode-test-with-server
-    (let ((statuses '(("ses_a" . done) ("ses_b" . working) ("ses_c" . retrying))))
-      (cl-letf (((symbol-function 'opencode--session-list-status)
-                 (lambda (info) (cdr (assoc (alist-get 'id info) statuses)))))
-        (with-temp-buffer
-          (opencode-session-list-mode)
-          (setq opencode--session-list-scope (cons temporary-file-directory nil)
-                opencode--session-list-sessions
-                (mapcar (lambda (session)
-                          `((id . ,(car session)) (title . ,(cadr session))
-                            (location (directory . ,temporary-file-directory))
-                            (time (created . 1) (updated . ,(caddr session)))))
-                        '(("ses_a" "alpha" 1) ("ses_b" "beta" 2) ("ses_c" "gamma" 3))))
-          (opencode--session-list-render)
-          (cl-flet ((titles ()
-                      (mapcar (lambda (info) (alist-get 'title info)) (opencode-test-list-objects)))
-                    (sort-by-title ()
-                      (goto-char (point-min))
-                      (should (vtable-goto-column 0))
-                      (vtable-sort-by-current-column)))
-            ;; Newest first, which is also the order of the icons.
-            (should (equal (titles) '("gamma" "beta" "alpha")))
-            (should (string< (opencode-session-status-icon 'retrying) (opencode-session-status-icon 'working)))
-            (should (string< (opencode-session-status-icon 'working) (opencode-session-status-icon 'done)))
-            (sort-by-title)
-            (should (equal (titles) '("alpha" "beta" "gamma")))
-            (sort-by-title)
-            (should (equal (titles) '("gamma" "beta" "alpha")))
-            (should (string-match-p (concat "^" (regexp-quote (opencode-session-status-icon 'retrying)) " gamma ")
-                                    (buffer-string)))))))))
-
-(ert-deftest opencode-test-session-list-title-value ()
-  "A Title value is the title, or the ID when there is none, carrying the status."
-  (opencode-test-with-server
-    (cl-letf (((symbol-function 'opencode--session-list-status) (lambda (_info) 'working)))
-      (pcase-dolist (`(,info . ,shown) '((((id . "ses_x") (title . "Fix it")) . "Fix it")
-                                         (((id . "ses_x") (title . "")) . "ses_x")
-                                         (((id . "ses_x")) . "ses_x")))
-        (let ((value (opencode--session-list-title info)))
-          (should (equal (substring-no-properties value) shown))
-          (should (eq (get-text-property 0 'opencode-session-status value) 'working))
-          (should-not (get-text-property 0 'face value))))
-      (with-temp-buffer
-        (puthash "ses_x" (current-buffer) opencode-session-buffers)
-        (should (eq (get-text-property 0 'face (opencode--session-list-title '((id . "ses_x") (title . "T"))))
-                    'opencode-session-list-open-session))))))
+;;;; Session pickers
 
 (ert-deftest opencode-test-session-status-icons ()
   "Every status has a one-glyph icon in its own face, named by its tooltip."
@@ -470,171 +273,320 @@ The title follows the status icon and a space, which are never highlighted."
       (should (= (char-width (string-to-char (cadr entry))) 1))
       (should (eq (caddr entry) (intern (format "opencode-session-status-%s" (car entry))))))))
 
-(ert-deftest opencode-test-session-list-long-title ()
-  "A title too long for the column ends in an ellipsis, after its whole icon."
-  (opencode-test-with-server
-    (cl-letf (((symbol-function 'opencode--session-list-status) (lambda (_info) 'waiting)))
+(ert-deftest opencode-test-read-session-annotations ()
+  "A picker shows each session's status icon, title, project, branch and age, newest first."
+  (let* ((root (file-name-as-directory (make-temp-file "opencode-picker-" t)))
+         (repo (expand-file-name "repo/" root))
+         (opencode--branches (make-hash-table :test #'equal))
+         (now (float-time)))
+    (unwind-protect
+        (opencode-test-with-server
+          (opencode-test-make-head repo "ref: refs/heads/topic\n")
+          (setq opencode--projects
+                `(((id . "repo") (name . "My repo") (canonical . ,(directory-file-name repo)) (sandboxes))
+                  ((id . "other") (canonical . ,(directory-file-name temporary-file-directory)) (sandboxes))))
+          (cl-flet ((info (id title directory project updated &optional idle viewed)
+                      `((id . ,id) (title . ,title) (projectID . ,project)
+                        (location (directory . ,(directory-file-name directory)))
+                        (time (created . 1) (updated . ,(round (* 1000 updated)))
+                              ,@(when idle `((idle . ,(round (* 1000 idle)))))
+                              ,@(when viewed `((viewed . ,(round (* 1000 viewed)))))))))
+            (let* ((older (info "ses_1" "Older" repo "repo" (- now 3600) (- now 3600)))
+                   (untitled (info "ses_2" "" temporary-file-directory "other" (- now 120)
+                                   (- now 120) (- now 100)))
+                   (stale (info "ses_3" "Old title" temporary-file-directory "other" (- now 7200)))
+                   ;; Found by its directory: its project's ID is unknown.
+                   (moved (info "ses_4" "Moved" repo "gone" (- now 86400))))
+              ;; The registry knows ses_3 better than its fetched info.
+              (puthash "ses_3" (opencode-state--make-entry
+                                :id "ses_3" :title "Renamed" :directory (opencode-normalize-directory repo)
+                                :project-id "repo" :running t :updated (- now 10))
+                       opencode-state--sessions)
+              (opencode-test-choosing (opencode-test-choose "Renamed")
+                (should (eq (opencode-read-session "Session: " (list older untitled stale moved) root)
+                            stale))
+                (should (equal (plist-get (car opencode-test-offers) :prompt) "Session: "))
+                (should (equal (opencode-test-offered-names) '("New session" "Renamed" "ses_2" "Older" "Moved")))
+                (let ((rows (plist-get (car opencode-test-offers) :rows)))
+                  (should (equal (mapcar (lambda (row) (substring-no-properties (cadr row))) rows)
+                                 (list "+ "
+                                       (concat (opencode-session-status-icon 'working) " ")
+                                       (concat (opencode-session-status-icon 'idle) " ")
+                                       (concat (opencode-session-status-icon 'done) " ")
+                                       (concat (opencode-session-status-icon 'idle) " "))))
+                  ;; The icon keeps its face and tooltip.
+                  (should (eq (get-text-property 0 'face (cadr (nth 1 rows))) 'opencode-session-status-working))
+                  (should (string-suffix-p (abbreviate-file-name root) (caddr (car rows))))
+                  (let ((other (file-name-nondirectory (directory-file-name temporary-file-directory))))
+                    (pcase-dolist (`(,name ,project ,branch ,age)
+                                   `(("Renamed" "My repo" "topic" 10)
+                                     ("ses_2" ,other "" 120)
+                                     ("Older" "My repo" "topic" 3600)
+                                     ("Moved" "My repo" "topic" 86400)))
+                      (let ((suffix (substring-no-properties (caddr (assoc name rows)))))
+                        (should (string-match
+                                 (concat "\\` +" (regexp-quote project) " +" (regexp-quote branch)
+                                         " +\\(.+\\)\\'")
+                                 suffix))
+                        (should (equal (match-string 1 suffix) (opencode-format-time-ago age))))))
+                  ;; The columns line up, whatever the widths of titles and projects.
+                  (cl-flet ((aligned (regexp)
+                              (= 1 (length (seq-uniq
+                                            (seq-keep (lambda (row)
+                                                        (let ((suffix (substring-no-properties (caddr row))))
+                                                          (when (string-match regexp suffix)
+                                                            (+ (string-width (car row)) (match-beginning 0)))))
+                                                      (cdr rows)))))))
+                    (should (aligned "topic"))
+                    (should (aligned "[^ ]+\\'")))))
+              ;; Without a new entry, sessions alone are offered; choosing one returns its info.
+              (opencode-test-choosing (opencode-test-choose "Older")
+                (should (eq (opencode-read-session "Session: " (list older untitled)) older))
+                (should (equal (opencode-test-offered-names) '("ses_2" "Older"))))
+              ;; No session has a branch: the column is left out.
+              (opencode-test-choosing (opencode-test-choose "ses_2")
+                (opencode-read-session "Session: " (list untitled))
+                (should (string-match-p (concat "\\` +" (regexp-quote (file-name-nondirectory
+                                                                       (directory-file-name temporary-file-directory)))
+                                                "  [^ ]+\\'")
+                                        (substring-no-properties
+                                         (caddr (car (plist-get (car opencode-test-offers) :rows)))))))
+              (opencode-test-choosing (opencode-test-choose "New session")
+                (should (eq (opencode-read-session "Session: " (list older) root) 'new)))
+              ;; Choosing nothing returns nil.
+              (opencode-test-choosing (lambda (_) "")
+                (should-not (opencode-read-session "Session: " (list older) root))))))
+      (delete-directory root t))))
+
+(ert-deftest opencode-test-read-session-fetches-projects ()
+  "A picker fetches the projects it names sessions by when none were fetched yet."
+  (opencode-test-with-sessions
+    (let ((info (opencode-test-session-info (opencode-test-scenario "text")))
+          (project (file-name-nondirectory (directory-file-name opencode-test-workspace))))
+      (opencode-test-choosing (opencode-test-choose "text")
+        (opencode-read-session "Session: " (list info))
+        (should (= 1 (length (opencode-test-requests-to 'get "/api/project"))))
+        (should (string-match-p (regexp-quote project)
+                                (caddr (car (plist-get (car opencode-test-offers) :rows)))))
+        (opencode-read-session "Session: " (list info))
+        (should (= 1 (length (opencode-test-requests-to 'get "/api/project")))))
+      ;; Names only decorate: without them, the sessions are still offered.
+      (setq opencode--projects nil)
+      (let ((opencode-test-routes (cons (list 'get "\\`/api/project\\'" (lambda (_) '(:error 500 "down")))
+                                        opencode-test-routes)))
+        (opencode-test-choosing (opencode-test-choose "text")
+          (should (eq (opencode-read-session "Session: " (list info)) info))
+          (should-not (string-match-p (regexp-quote project)
+                                      (caddr (car (plist-get (car opencode-test-offers) :rows))))))))))
+
+(ert-deftest opencode-test-opencode-offers-project-sessions ()
+  "`opencode' offers the project's sessions newest first, or starts one."
+  (opencode-test-with-sessions
+    (let ((opened nil)
+          (created nil))
+      (cl-letf (((symbol-function 'opencode-session-open)
+                 (lambda (info &rest arguments) (setq opened (cons info arguments))))
+                ((symbol-function 'opencode-session-create)
+                 (lambda (&rest arguments) (setq created arguments))))
+        (opencode-test-choosing (opencode-test-choose "text")
+          (opencode opencode-test-workspace)
+          (should (equal (opencode-test-offered-names) (cons "New session" (opencode-test-root-titles))))
+          (should (equal (alist-get 'id (car opened)) (opencode-test-scenario "text")))
+          (should (equal (cdr opened) '(:other-window nil))))
+        ;; The project's sessions, by its ID, without subagents nor archived ones.
+        (let ((query (plist-get (seq-find (lambda (request) (equal (plist-get request :path) "/api/session"))
+                                          (reverse opencode-test-requests))
+                                :query)))
+          (should (equal (alist-get 'project query) opencode-test-project-id))
+          (should (equal (alist-get 'parentID query) "null"))
+          (should (equal (alist-get 'archived query) "false")))
+        (opencode-test-choosing (opencode-test-choose "New session")
+          (setq opened nil)
+          (opencode opencode-test-workspace)
+          (should-not opened)
+          (should (equal created (list :directory (opencode-normalize-directory opencode-test-workspace)))))
+        ;; A project without sessions starts one at once.
+        (setq created nil)
+        (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+          (opencode temporary-file-directory))
+        (should (equal created (list :directory (opencode-normalize-directory temporary-file-directory))))
+        ;; Choosing nothing does nothing.
+        (setq created nil opened nil)
+        (opencode-test-choosing (lambda (_) "")
+          (opencode opencode-test-workspace))
+        (should-not (or created opened))
+        ;; The command's former name is the same command.
+        (should (eq (indirect-function 'opencode-select-session) (indirect-function 'opencode)))))))
+
+(ert-deftest opencode-test-select-project ()
+  "`opencode-select-project' picks a project, then one of its sessions or a new one."
+  (opencode-test-with-sessions
+    (let ((created nil)
+          (answers (list (abbreviate-file-name (directory-file-name opencode-test-workspace)) "New session")))
+      (cl-letf (((symbol-function 'opencode-session-create)
+                 (lambda (&rest arguments) (setq created arguments))))
+        (opencode-test-choosing (lambda (_) (pop answers))
+          (opencode-select-project)
+          (should (equal (mapcar (lambda (offer) (plist-get offer :prompt)) (reverse opencode-test-offers))
+                         '("Project: " "Session: ")))
+          ;; Most recently active first.
+          (should (equal (opencode-test-offered-names (cadr opencode-test-offers))
+                         (mapcar (lambda (project) (abbreviate-file-name (alist-get 'canonical project)))
+                                 (opencode-test-projects))))
+          (should (equal (opencode-test-offered-names) (cons "New session" (opencode-test-root-titles))))
+          (should (equal created (list :directory (opencode-normalize-directory opencode-test-workspace)))))))))
+
+(ert-deftest opencode-test-commands-pick-outside-session-buffers ()
+  "Renaming, archiving and deleting outside a session buffer pick a session of the project."
+  (opencode-test-with-sessions
+    (let ((id (opencode-test-scenario "reasoning"))
+          (questions nil))
       (with-temp-buffer
-        (opencode-session-list-mode)
-        (setq opencode--session-list-scope (cons temporary-file-directory nil)
-              opencode--session-list-sessions
-              (mapcar (lambda (session)
-                        `((id . ,(car session)) (title . ,(cdr session))
-                          (location (directory . ,temporary-file-directory))
-                          (time (created . 1) (updated . 1))))
-                      `(("ses_a" . ,(make-string 200 ?x)) ("ses_b" . "short"))))
-        (opencode--session-list-render)
-        (let* ((long (car opencode--session-list-sessions))
-               (cell (substring-no-properties (opencode-test-list-title-cell long)))
-               (prefix (concat (opencode-session-status-icon 'waiting) " x")))
-          (should (string-prefix-p prefix cell))
-          (should (string-suffix-p (truncate-string-ellipsis) cell))
-          (should (< (length cell) 200))
-          (should (= (opencode-test-list-title-cell-width long)
-                     (opencode-test-list-title-cell-width (cadr opencode--session-list-sessions)))))))))
-
-(ert-deftest opencode-test-session-list-title-fits-pixels ()
-  "On a graphic display, titles show whole after their icons, in aligned columns.
-The `vtable' face is proportional and icons may come from another font,
-so a status change must keep the columns where they were."
-  :tags '(gui)
-  (skip-unless (display-graphic-p))
-  (opencode-test-with-server
-    (let ((statuses (list (cons "ses_a" 'idle) (cons "ses_b" 'idle) (cons "ses_c" 'idle))))
-      (cl-letf (((symbol-function 'opencode--session-list-status)
-                 (lambda (info) (cdr (assoc (alist-get 'id info) statuses)))))
-        (with-temp-buffer
-          (set-window-buffer (selected-window) (current-buffer))
-          (opencode-session-list-mode)
-          (setq opencode--session-list-scope (cons temporary-file-directory nil)
-                opencode--session-list-sessions
-                (mapcar (lambda (session)
-                          `((id . ,(car session)) (title . ,(cdr session))
-                            (location (directory . ,temporary-file-directory))
-                            (time (created . 1) (updated . 1))))
-                        '(("ses_a" . "WWWW MMMM wide") ("ses_b" . "iiii llll") ("ses_c" . "Mixed Title 42"))))
-          (opencode--session-list-render)
-          (cl-flet ((check ()
-                      (redisplay t)
-                      (let ((branch (seq-position (opencode-test-list-columns) "Branch"))
-                            (starts nil))
-                        (dolist (info opencode--session-list-sessions)
-                          (should (equal (substring-no-properties (opencode-test-list-title-cell info))
-                                         (concat (opencode-session-status-icon
-                                                  (cdr (assoc (alist-get 'id info) statuses)))
-                                                 " " (alist-get 'title info))))
-                          (save-excursion
-                            (should (vtable-goto-object info))
-                            (should (vtable-goto-column branch))
-                            (push (car (posn-x-y (posn-at-point (point)))) starts)))
-                        (should (= (length (seq-uniq starts)) 1)))))
-            (check)
-            ;; Rows take every status, each a different one from the others.
-            (dotimes (turn (length opencode-session-status-icons))
-              (seq-do-indexed (lambda (entry row)
-                                (setcdr entry (car (nth (% (+ turn row) (length opencode-session-status-icons))
-                                                        opencode-session-status-icons)))
-                                (opencode--session-list-update-buffer (car entry)))
-                              statuses)
-              (check))))))))
-
-(ert-deftest opencode-test-session-list-title-width ()
-  "The Title column comes first, as wide as the widest title after the widest icon and a space."
-  (let ((sessions '(((id . "ses_a") (title . "ab")) ((id . "ses_b") (title . "abcdef")))))
-    (let ((columns (let ((opencode--session-list-scope 'all)) (opencode--session-list-columns sessions))))
-      (should (equal (mapcar (lambda (column) (plist-get column :name)) columns)
-                     '("Title" "Project" "Branch" "Last Updated" "Created")))
-      (should (= (plist-get (car columns) :width) (+ 1 1 6))))
-    ;; A two-column icon widens it.
-    (let ((opencode-session-status-icons '((done "⚑" opencode-session-status-done))))
-      (should (= (plist-get (car (opencode--session-list-columns sessions)) :width) (+ 2 1 6))))
-    ;; An untitled session shows its ID.
-    (should (= (plist-get (car (opencode--session-list-columns '(((id . "ses_0123456789"))))) :width)
-               (+ 1 1 14)))))
-
-(ert-deftest opencode-test-session-list-keys ()
-  "Rows open with RET and refresh with g; the row at point names its session."
-  (opencode-test-with-sessions
-    (with-temp-buffer
-      (should-not (opencode-session-list-id-at-point))
-      (opencode-session-list-mode)
-      (setq opencode--session-list-scope 'all)
-      (should-not (opencode-session-list-id-at-point))
-      (opencode-session-list-refresh)
-      (goto-char (point-min))
-      (let ((info (vtable-current-object))
-            (opened nil))
-        (should (equal (opencode-session-list-id-at-point) (alist-get 'id info)))
-        (forward-line 1)
-        (should (equal (opencode-session-list-id-at-point) (alist-get 'id (vtable-current-object))))
-        (goto-char (point-min))
-        (dolist (key '("o" "x" "A" "R" "r" "n" "M" "v"))
-          (should (memq (key-binding (kbd key)) (quote (nil undefined)))))
-        (should (eq (key-binding (kbd "g")) 'revert-buffer))
-        (setq opencode-test-requests nil)
-        (call-interactively (key-binding (kbd "g")))
-        (should (seq-find (lambda (request) (equal (plist-get request :path) "/api/session"))
-                          opencode-test-requests))
-        (cl-letf (((symbol-function 'opencode-session-open) (lambda (info &rest _) (setq opened info))))
-          (call-interactively (key-binding (kbd "RET"))))
-        (should (equal (alist-get 'id opened) (alist-get 'id info)))))))
-
-(ert-deftest opencode-test-session-list-row-commands ()
-  "Renaming, archiving and deleting from a list act on the row at point."
-  (opencode-test-with-sessions
-    (with-temp-buffer
-      (opencode-session-list-mode)
-      (setq opencode--session-list-scope 'all)
-      (opencode-session-list-refresh)
-      (goto-char (point-min))
-      (forward-line 1)
-      (let ((id (opencode-session-list-id-at-point)))
-        (should id)
-        (cl-letf (((symbol-function 'y-or-n-p) #'always)
-                  ((symbol-function 'yes-or-no-p) #'always))
+        (setq default-directory opencode-test-workspace)
+        (cl-letf (((symbol-function 'y-or-n-p) (lambda (prompt) (push prompt questions) t))
+                  ((symbol-function 'yes-or-no-p) (lambda (prompt) (push prompt questions) t))
+                  ((symbol-function 'read-string) (lambda (_prompt initial) (push initial questions) "Typed")))
+          (opencode-test-choosing (opencode-test-choose "reasoning")
+            (opencode-rename-session nil "Renamed")
+            (opencode-archive-session)
+            (opencode-delete-session)
+            (opencode-rename-session)
+            (should (equal (mapcar (lambda (offer) (plist-get offer :prompt)) (reverse opencode-test-offers))
+                           '("Rename session: " "Archive session: " "Delete session: " "Rename session: ")))
+            ;; No entry starting a session.
+            (dolist (offer opencode-test-offers)
+              (should (equal (opencode-test-offered-names offer) (opencode-test-root-titles)))))
+          ;; The registry does not hold the session: its picked info names it.
+          (should (equal (reverse questions)
+                         '("Archive the OpenCode session reasoning? "
+                           "Delete the OpenCode session reasoning for good? "
+                           "reasoning")))
+          (should (equal (seq-keep (lambda (request)
+                                     (and (equal (plist-get request :path) (concat "/api/session/" id))
+                                          (list (plist-get request :method) (plist-get request :body))))
+                                   (reverse opencode-test-requests))
+                         '((patch ((title . "Renamed"))) (patch ((archived . t))) (delete nil)
+                           (patch ((title . "Typed"))))))
+          ;; An explicit ID asks nothing.
           (setq opencode-test-requests nil)
-          (opencode-rename-session nil "Renamed")
-          (opencode-archive-session)
-          (opencode-interrupt)
-          (opencode-delete-session))
-        (should (opencode-test-requests-to 'post (format "/api/session/%s/interrupt" id)))
-        (let ((paths (mapcar (lambda (request) (list (plist-get request :method) (plist-get request :path)))
-                             (reverse opencode-test-requests))))
-          (should (equal (seq-filter (lambda (entry) (equal (cadr entry) (concat "/api/session/" id))) paths)
-                         (list (list 'patch (concat "/api/session/" id))
-                               (list 'patch (concat "/api/session/" id))
-                               (list 'delete (concat "/api/session/" id))))))
-        (should (equal (alist-get 'archived (plist-get (seq-find (lambda (request) (assq 'archived (plist-get request :body)))
-                                                                 opencode-test-requests)
-                                                       :body))
-                       t)))))
-  (with-temp-buffer
-    (should-error (opencode-archive-session) :type 'user-error)))
+          (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+            (opencode-rename-session id "Again"))
+          (should (opencode-test-requests-to 'patch (concat "/api/session/" id)))
+          (opencode-test-choosing (lambda (_) "")
+            (should-error (opencode-archive-session) :type 'user-error)))))))
 
-(ert-deftest opencode-test-session-lists-capital-drive ()
-  "Lists of a directory outside any project filter on it with a capital drive letter."
+(ert-deftest opencode-test-commands-act-on-the-buffer-session ()
+  "In a session buffer, commands act on its session without asking."
+  (opencode-test-with-sessions
+    (let ((id (opencode-test-scenario "text")))
+      (with-current-buffer (opencode-test-open id)
+        (setq opencode-test-requests nil)
+        (cl-letf (((symbol-function 'y-or-n-p) #'always))
+          (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+            (opencode-rename-session nil "Renamed")
+            (opencode-archive-session)
+            (opencode-interrupt)))
+        (should (= 2 (length (opencode-test-requests-to 'patch (concat "/api/session/" id)))))
+        (should (opencode-test-requests-to 'post (format "/api/session/%s/interrupt" id)))))))
+
+(ert-deftest opencode-test-interrupt-picks-a-running-session ()
+  "Outside a session buffer, interrupting picks among the project's running sessions."
+  (opencode-test-with-sessions
+    (let* ((id (opencode-test-scenario "steer"))
+           (active nil)
+           (opencode-test-routes
+            (cons (list 'get "\\`/api/session/active\\'"
+                        (lambda (_) `((data . ,(mapcar (lambda (id) (list (intern id) '(status . "running")))
+                                                       active)))))
+                  opencode-test-routes)))
+      (with-temp-buffer
+        (setq default-directory opencode-test-workspace)
+        (setq active (list id "ses_elsewhere"))
+        (opencode-test-choosing (opencode-test-choose "steer")
+          (opencode-interrupt)
+          (should (equal (plist-get (car opencode-test-offers) :prompt) "Interrupt session: "))
+          (should (equal (opencode-test-offered-names) '("steer"))))
+        (should (opencode-test-requests-to 'post (format "/api/session/%s/interrupt" id)))
+        (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+          ;; Running sessions of other projects only.
+          (setq active (list "ses_elsewhere"))
+          (should (string-match-p "No OpenCode session is running in"
+                                  (cadr (should-error (opencode-interrupt) :type 'user-error))))
+          (setq active nil opencode-test-requests nil)
+          (should (equal (cadr (should-error (opencode-interrupt) :type 'user-error))
+                         "No OpenCode session is running"))
+          ;; Nothing running: the project's sessions are not even fetched.
+          (should-not (seq-find (lambda (request) (equal (plist-get request :path) "/api/session"))
+                                opencode-test-requests)))))))
+
+(ert-deftest opencode-test-commands-without-sessions ()
+  "A command picking a session in a project without one says so."
+  (opencode-test-with-sessions
+    (with-temp-buffer
+      (setq default-directory temporary-file-directory)
+      (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+        (should (string-match-p "\\`No OpenCode session in "
+                                (cadr (should-error (opencode-rename-session) :type 'user-error))))))))
+
+(ert-deftest opencode-test-select-open-session ()
+  "The open sessions are picked by session, annotated, and their buffer shown."
+  (opencode-test-with-sessions
+    (let* ((first (opencode-test-open (opencode-test-scenario "text")))
+           (second (opencode-test-open (opencode-test-scenario "reasoning")))
+           (shown nil))
+      (cl-letf (((symbol-function 'switch-to-buffer) (lambda (buffer &rest _) (setq shown buffer))))
+        (opencode-test-choosing (opencode-test-choose "text")
+          (opencode-select-open-session)
+          (should (eq shown first))
+          (should (equal (opencode-test-offered-names) '("reasoning" "text")))
+          (should (equal (substring-no-properties (cadr (car (plist-get (car opencode-test-offers) :rows))))
+                         (concat (opencode-session-status-icon 'done) " "))))
+        (kill-buffer first)
+        (kill-buffer second)
+        (setq shown nil)
+        (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+          (opencode-select-open-session))
+        (should-not shown)))))
+
+(ert-deftest opencode-test-select-idle-and-child-sessions ()
+  "The idle and subagent pickers are annotated session pickers too."
+  (opencode-test-with-sessions
+    (let ((opened nil))
+      (cl-letf (((symbol-function 'opencode-session-open) (lambda (info &rest _) (setq opened info))))
+        (let ((opencode-alerted-sessions (mapcar #'opencode-test-session-info
+                                                 (list (opencode-test-scenario "text")
+                                                       (opencode-test-scenario "steer")))))
+          (opencode-test-choosing (opencode-test-choose "text")
+            (opencode-select-idle)
+            (should (equal (plist-get (car opencode-test-offers) :prompt) "Idle session: "))
+            (should (equal (opencode-test-offered-names) '("steer" "text")))
+            (should (equal (alist-get 'id opened) (opencode-test-scenario "text")))))
+        (let ((opencode-alerted-sessions nil))
+          (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+            (opencode-select-idle))))
+      (let ((child (opencode-test-session-info (opencode-test-scenario "subagent-child"))))
+        (with-current-buffer (opencode-test-open (opencode-test-scenario "subagent"))
+          (cl-letf (((symbol-function 'opencode-session-open) (lambda (info &rest _) (setq opened info))))
+            (opencode-test-choosing (opencode-test-choose (alist-get 'title child))
+              (opencode-select-child-session)
+              (should (equal (opencode-test-offered-names) (list (alist-get 'title child))))
+              (should (equal (alist-get 'id opened) (alist-get 'id child))))))))))
+
+(ert-deftest opencode-test-sessions-capital-drive ()
+  "Sessions of a directory outside any project are asked for with a capital drive letter."
   (skip-unless (memq system-type '(windows-nt ms-dos)))
   (opencode-test-with-sessions
     (let ((outside (opencode-test-lowercase-drive
                     (file-name-directory (directory-file-name temporary-file-directory)))))
-      ;; Requests are recorded newest first; later pages carry only the cursor.
-      (cl-flet ((filtered ()
-                  (alist-get 'directory
-                             (plist-get (seq-find (lambda (request)
-                                                    (equal (plist-get request :path) "/api/session"))
-                                                  (reverse opencode-test-requests))
-                                        :query))))
-        (with-temp-buffer
-          (opencode-session-list-mode)
-          (setq opencode--session-list-scope (cons outside nil))
-          (setq opencode-test-requests nil)
-          (opencode-session-list-refresh)
-          (should (opencode-test-capital-drive-p (filtered))))
-        (setq opencode-test-requests nil)
-        (cl-letf (((symbol-function 'opencode-project-directory) (lambda () outside))
-                  ((symbol-function 'opencode--select-session) #'ignore))
-          (opencode-select-session))
-        (should (opencode-test-capital-drive-p (filtered)))))))
+      (opencode--project-sessions outside)
+      (should (opencode-test-capital-drive-p
+               (alist-get 'directory
+                          (plist-get (seq-find (lambda (request)
+                                                 (equal (plist-get request :path) "/api/session"))
+                                               (reverse opencode-test-requests))
+                                     :query)))))))
+
+;;;; Worktrees and MCP servers
 
 (ert-deftest opencode-test-toggle-mcp ()
   "A connected server is disconnected and a disabled one connected."

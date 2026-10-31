@@ -60,13 +60,11 @@
 ;; Entry points load this file, so that every module is in place.
 
 ;;;###autoload
-(autoload 'opencode "opencode" "List the sessions of the current project." t)
+(autoload 'opencode "opencode" "Open or start a session of the current project." t)
 ;;;###autoload
-(autoload 'opencode-list-all-sessions "opencode" "List the sessions of every project." t)
+(autoload 'opencode-select-session "opencode" "Open or start a session of the current project." t)
 ;;;###autoload
-(autoload 'opencode-select-project "opencode" "List the sessions of a project." t)
-;;;###autoload
-(autoload 'opencode-select-session "opencode" "Open a session of the current project." t)
+(autoload 'opencode-select-project "opencode" "Open or start a session of a project." t)
 ;;;###autoload
 (autoload 'opencode-new-session "opencode" "Create a session in the current project." t)
 ;;;###autoload

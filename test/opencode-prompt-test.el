@@ -59,8 +59,6 @@ command loop applies key remapping as typing them would."
                              "<remap> <comint-quit-subjob>" "<remap> <comint-send-eof>"
                              "<remap> <comint-stop-subjob>")
                        #'string<)))
-  (should-not (opencode-test-own-keys opencode-session-list-mode-map))
-  (should (eq (keymap-parent opencode-session-list-mode-map) special-mode-map))
   (should (equal (opencode-test-own-keys opencode-desktop-pending-mode-map) '("g"))))
 
 (ert-deftest opencode-test-comint-keys-in-sessions ()

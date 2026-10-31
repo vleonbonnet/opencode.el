@@ -243,36 +243,53 @@ parents of a directory each time to find its project was measurable.")
 
 (defun opencode-annotated-completion (prompt candidates)
   "Read one of CANDIDATES with PROMPT and return its value.
-CANDIDATES is a list of (NAME VALUE ANNOTATION SORT-KEY); ANNOTATION
-and SORT-KEY are optional.  Candidates with a SORT-KEY are presented in
-ascending key order."
+CANDIDATES is a list of (NAME VALUE ANNOTATION SORT-KEY PREFIX); all but
+NAME and VALUE are optional.  ANNOTATION follows NAME, aligned with the
+other annotations, and PREFIX, such as an icon, precedes it; neither is
+matched against the input.  Candidates with a SORT-KEY are presented in
+ascending key order.  A NAME given more than once is followed by <2>,
+<3> and so on after its first occurrence, in that order, so that every
+candidate can be chosen."
   (if (null candidates)
       (progn (message "%sNo completion candidates" prompt) nil)
-    (let* ((width (seq-max (mapcar (lambda (candidate) (string-width (car candidate)))
-                                   candidates)))
+    (let* ((sorted (seq-some #'cadddr candidates))
+           (candidates (if sorted
+                           (sort candidates :key (lambda (candidate)
+                                                   (or (nth 3 candidate) most-positive-fixnum)))
+                         candidates))
+           (seen (make-hash-table :test #'equal))
+           (names (mapcar (lambda (candidate)
+                            (let* ((name (car candidate))
+                                   (count (cl-incf (gethash name seen 0))))
+                              (if (= count 1) name (format "%s<%d>" name count))))
+                          candidates))
+           (width (seq-max (mapcar #'string-width names)))
+           ;; Keyed by name: completion styles may return copies of the strings.
            (values (make-hash-table :test #'equal))
-           (sorted (seq-some #'cadddr candidates))
-           (strings
-            (cl-loop for (name value annotation sort-key) in candidates
-                     for string = (propertize
-                                   name
-                                   'opencode-annotation
-                                   (concat (make-string (+ 4 (- width (string-width name))) ?\s)
-                                           (or annotation ""))
-                                   'opencode-sort-key sort-key)
-                     do (puthash string value values)
-                     collect string))
-           (completion-extra-properties
-            `(:annotation-function
-              ,(lambda (candidate) (get-text-property 0 'opencode-annotation candidate))
-              :display-sort-function
-              ,(when sorted
-                 (lambda (strings)
-                   (sort strings
-                         :key (lambda (string)
-                                (or (get-text-property 0 'opencode-sort-key string)
-                                    most-positive-fixnum))))))))
-      (gethash (completing-read prompt strings nil t) values))))
+           (affixes (make-hash-table :test #'equal))
+           (keys (make-hash-table :test #'equal)))
+      (cl-loop for name in names
+               for (_ value annotation sort-key prefix) in candidates
+               do (puthash name value values)
+               (puthash name sort-key keys)
+               (puthash name
+                        (list (or prefix "")
+                              (let ((suffix (concat (make-string (+ 4 (- width (string-width name))) ?\s)
+                                                    (or annotation ""))))
+                                (add-face-text-property 0 (length suffix) 'completions-annotations t suffix)
+                                suffix))
+                        affixes))
+      (let ((completion-extra-properties
+             `(:affixation-function
+               ,(lambda (strings)
+                  (mapcar (lambda (string) (cons string (gethash string affixes '("" ""))))
+                          strings))
+               :display-sort-function
+               ,(when sorted
+                  (lambda (strings)
+                    (sort strings :key (lambda (string)
+                                         (or (gethash string keys) most-positive-fixnum))))))))
+        (gethash (completing-read prompt names nil t) values)))))
 
 (defun opencode-buffer-active-p (buffer)
   "Return non-nil when BUFFER is shown in the selected window of a focused frame."

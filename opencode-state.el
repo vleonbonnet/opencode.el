@@ -23,8 +23,9 @@
 ;; A registry of every known session's live state, independent of
 ;; session buffers: whether an execution runs, the retry it waits for,
 ;; the permission requests and questions it waits on, how its last turn
-;; ended and whether anyone saw that.  Session lists and dashboards read
-;; it instead of asking the service.
+;; ended and whether anyone saw that.  Session pickers, the send check
+;; and other packages' lists and dashboards, such as drover's, read it
+;; instead of asking the service.
 ;;
 ;; The service is authoritative.  Whenever the event stream (re)opens,
 ;; whoever opened it, the registry is rebuilt from REST: the newest
