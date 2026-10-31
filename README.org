@@ -35,20 +35,13 @@ On its first start, the service imports the sessions of OpenCode 1 in the backgr
 
 * Sessions
 
-=M-x opencode= lists the sessions of the current project, including those of its worktrees, with their branch. =M-x opencode-list-all-sessions= lists every project's. Archived sessions are left out. An icon of each session's status (see [[*Session state][Session state]]) leads its title, names the status in its tooltip, and changes with it: =nf-md-help_circle= waiting for you, =nf-md-timer_sand= working, =nf-fa-refresh= retrying, =nf-fa-times_circle= failed and =nf-md-check_circle= done while unseen, =nf-fa-circle_o= idle. These are [[https://www.nerdfonts.com][Nerd Font]] icons, so a Nerd Font must be installed for them to show; =opencode-session-status-icons= sets the icon and face of each. The Title column sorts by title, whatever the icons. Titles of sessions open in a buffer use =opencode-session-list-open-session= (inheriting =success=), even when the buffer is hidden; the highlight follows buffers opening and closing. In a list:
+=M-x opencode= lists the sessions of the current project, including those of its worktrees, with their branch. =M-x opencode-list-all-sessions= lists every project's. Archived sessions are left out, and subagent sessions are hidden until =opencode-session-list-toggle-subagents= shows them. An icon of each session's status (see [[*Session state][Session state]]) leads its title, names the status in its tooltip, and changes with it: =nf-md-help_circle= waiting for you, =nf-md-timer_sand= working, =nf-fa-refresh= retrying, =nf-fa-times_circle= failed and =nf-md-check_circle= done while unseen, =nf-fa-circle_o= idle. These are [[https://www.nerdfonts.com][Nerd Font]] icons, so a Nerd Font must be installed for them to show; =opencode-session-status-icons= sets the icon and face of each. The Title column sorts by title, whatever the icons. Titles of sessions open in a buffer use =opencode-session-list-open-session= (inheriting =success=), even when the buffer is hidden; the highlight follows buffers opening and closing.
 
-| Key        | Action                              |
-|------------+-------------------------------------|
-| =RET=, =o= | open the session                    |
-| =x=        | delete the session                  |
-| =A=        | archive the session                 |
-| =R=        | rename the session                  |
-| =n=        | new session in this directory       |
-| =v=        | show or hide subagent sessions      |
-| =M=        | connect or disconnect an MCP server |
-| =g=, =r=   | refresh                             |
+A list binds only standard keys: =RET= opens the session at point, =g= (=revert-buffer=) fetches the list again, and the keys of =special-mode= and vtable apply (=q= quits, =S= sorts by the column at point, ={= and =}= narrow and widen it). =opencode-session-list-id-at-point= returns the session on the row at point, for commands of other packages. =opencode-rename-session=, =opencode-archive-session=, =opencode-delete-session= and =opencode-interrupt= act on the row at point in a list, as they act on the buffer's session in a session buffer.
 
-Other entry points: =opencode-select-project=, =opencode-select-session=, =opencode-new-session=, =opencode-new-worktree= (a new branch in a worktree under =opencode-worktree-directory=, with a session in it), =opencode-select-open-session=, =opencode-consult-sessions=, and =opencode-visit-last-idle= or =opencode-select-idle= for sessions that finished or started waiting while not displayed.
+Other entry points: =opencode-select-project=, =opencode-select-session=, =opencode-new-session=, =opencode-session-list-new= (a session in the list's directory), =opencode-new-worktree= (a new branch in a worktree under =opencode-worktree-directory=, with a session in it), =opencode-select-open-session=, =opencode-consult-sessions=, =opencode-toggle-mcp= (connect or disconnect an MCP server), and =opencode-visit-last-idle= or =opencode-select-idle= for sessions that finished or started waiting while not displayed.
+
+opencode.el binds only the keys every Comint, special-mode or vtable user expects, and leaves its other commands unbound. [[https://github.com/vleonbonnet/drover][drover]] provides key maps for them: one-key session actions in session lists, and a transient (=drover-dispatch=) holding those, the prompt's commands and global ones. Without drover, call the commands with =M-x= or bind them yourself.
 
 * Session state
 
@@ -58,32 +51,47 @@ A session's status, from =opencode-state-status=, is =waiting= while a request a
 
 Whether a finished turn was seen is the service's read marker, shared by every client. Showing a session's buffer in the selected window of a focused frame, or a turn ending while it is shown there, marks the session viewed (=opencode-session-view=), for the TUI and the desktop app too; a session viewed in another client is no longer done in Emacs either.
 
-Archiving a session (=A= in a list, or =opencode-session-archive=) hides it from the lists and from =opencode-state-sessions= without deleting it; =opencode-session-archive= with a non-nil RESTORE argument brings it back. =opencode-session-interrupt=, =opencode-session-last-reply= and =opencode-respond-session= also act on a session by its ID, with or without a buffer.
+Archiving a session (=opencode-session-archive=) hides it from the lists and from =opencode-state-sessions= without deleting it; =opencode-session-archive= with a non-nil RESTORE argument brings it back. These functions also act on a session by its ID, with or without a buffer: =opencode-session-interrupt=, =opencode-session-last-reply=, =opencode-respond-session=, =opencode-rename-session= (ID and TITLE), =opencode-session-delete= (without confirmation; it kills the session's buffer), =opencode-session-fork= (the whole session, or what precedes a message ID; the fork is shown) and =opencode-session-compact=.
 
 * Session buffers
 
-Prompts are typed at the bottom. A prompt sent while a turn runs steers it (=opencode-prompt-delivery=); =C-c RET= queues it for after the turn instead. =/= at the start of the prompt picks a slash command, =!= runs a shell command, and =@= mentions a subagent.
+Prompts are typed at the bottom. A prompt sent while a turn runs steers it (=opencode-prompt-delivery=); =opencode-queue-input= queues it for after the turn instead. =/= at the start of the input picks a slash command, =!= runs a shell command, and =@= mentions a subagent. The keys:
 
-| Key                         | Action                                                             |
-|-----------------------------+--------------------------------------------------------------------|
-| =RET=                       | send                                                               |
-| =C-c RET=                   | send after the running turn                                        |
-| =M-p=, =M-n=                | previous or next input at the prompt, else previous or next button |
-| =TAB=                       | expand or collapse the block at point, else next button            |
-| =C-c TAB=                   | next primary agent                                                 |
-| =C-c C-a=, =C-c m=, =C-c v= | choose the agent, model or variant                                 |
-| =C-c C-q=                   | answer the pending permission request or question                  |
-| =C-c C-c=                   | interrupt the turn                                                 |
-| =C-c f=, =C-c b=            | attach a file, or a buffer or region                               |
-| =C-c F=                     | fork the session at point                                          |
-| =C-c R=, =C-c U=            | stage a revert after point, cancel it                              |
-| =C-c C=                     | compact the conversation                                           |
-| =C-c c=, =C-c p=            | open a subagent session, the parent session                        |
-| =C-c C-o=                   | open the link or file reference at point                           |
-| =C-c C-y=, =C-c Y=          | copy the code block at point, the whole conversation as Markdown   |
-| =C-c t=                     | go to the start of the last answer                                 |
-| =C-c r=, =C-c x=, =C-c n=   | rename, delete, new session                                        |
-| =C-c g=                     | reload the transcript                                              |
+| Key                           | Action                                                             |
+|-------------------------------+--------------------------------------------------------------------|
+| =RET=                         | send                                                               |
+| =M-p=, =M-n=                  | previous or next input at the prompt, else previous or next button |
+| =TAB=                         | expand or collapse the block at point, else next button            |
+| =<backtab>=                   | previous button                                                    |
+| =/= at the start of the input | pick a slash command                                               |
+| =@= in the input              | mention a subagent                                                 |
+| =C-c C-o=                     | open the link or file reference at point                           |
+| =RET=, =TAB=, click           | on a block summary, expand or collapse it; on a link, follow it    |
+
+Comint's other keys keep their meaning, such as =C-c C-n= and =C-c C-p= between prompts or =M-r= through the input history, except those meant for a subprocess, since a session runs none: =C-c C-c= interrupts the turn (=opencode-interrupt=), =C-d= only deletes characters, never sending an end of file, and =C-c C-d=, =C-c C-z=, =C-c C-\=, =C-c M-o= and the Signals menu are refused, as is the In/Out menu's deletion of output: the transcript is the server's. =revert-buffer= (=opencode-session-reload=) renders the transcript again, keeping the input.
+
+The other commands act on the current session:
+
+| Command                                                                      | Action                                                                      |
+|------------------------------------------------------------------------------+-----------------------------------------------------------------------------|
+| =opencode-queue-input=                                                       | send after the running turn                                                 |
+| =opencode-attach=                                                            | attach the region, else a file of the project or a buffer, offered together |
+| =opencode-add-file=, =opencode-add-buffer-dwim=, =opencode-add-region=       | attach a file (a directory with a prefix argument), a buffer, the region    |
+| =opencode-insert-slash-command=                                              | put a slash command at the start of the input                               |
+| =opencode-mention-subagent=                                                  | mention a subagent                                                          |
+| =opencode-select-agent=, =opencode-cycle-agent=                              | choose the agent (the other one when there are two), the next agent         |
+| =opencode-select-model=, =opencode-select-variant=                           | choose the model, the variant                                               |
+| =opencode-respond=                                                           | answer the pending permission request or question                           |
+| =opencode-interrupt=                                                         | interrupt the turn                                                          |
+| =opencode-fork-session=                                                      | fork the session at point                                                   |
+| =opencode-revert-to-point=, =opencode-revert-clear=                          | stage a revert after point, cancel it                                       |
+| =opencode-compact-session=                                                   | compact the conversation                                                    |
+| =opencode-select-child-session=, =opencode-open-parent=                      | open a subagent session, the parent session                                 |
+| =opencode-yank-code-block=, =opencode-copy-conversation=                     | copy the code block at point, the whole conversation as Markdown            |
+| =opencode-scroll-to-last-response-start=                                     | go to the start of the last answer                                          |
+| =opencode-rename-session=, =opencode-archive-session=, =opencode-delete-session=, =opencode-new-session= | rename, archive, delete, new session                         |
+
+The commands that edit the input (attaching, mentioning, slash commands) also work from other buffers, on the input of the last selected session buffer, and put what they insert at point when it is in the input, else at its end. =opencode-insert-slash-command= makes the text already typed the command's arguments, and replaces a command the input starts with.
 
 Images pasted with =yank-media= are attached to the next prompt.
 
@@ -93,7 +101,7 @@ The mode line shows the session's status, title, agent, model, variant, provider
 
 * Permissions and questions
 
-A permission request marks the tool call that asked and waits; it never takes focus. =C-c C-q= opens it: accept once (=o=), always (=a=), reject and stop (=n=), reject with feedback (=f=), or hand the task off to another primary agent (=h=). Rejection with feedback blocks the tool but lets the assistant continue using the text you enter; plain rejection stops the current execution. Questions from the question tool open as a form, one question at a time, with your own answer always possible. Requests of a subagent show on the parent session's block. An answer given in another client clears the request in Emacs.
+A permission request marks the tool call that asked and waits; it never takes focus. =opencode-respond= opens it: accept once (=o=), always (=a=), reject and stop (=n=), reject with feedback (=f=), or hand the task off to another primary agent (=h=). Rejection with feedback blocks the tool but lets the assistant continue using the text you enter; plain rejection stops the current execution. Questions from the question tool open as a form, one question at a time, with your own answer always possible. Requests of a subagent show on the parent session's block. An answer given in another client clears the request in Emacs.
 
 * Edits
 

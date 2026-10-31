@@ -59,8 +59,6 @@
 (require 'savehist)
 (require 'yank-media)
 
-(declare-function opencode-copy-conversation "opencode-convert" ())
-
 (defcustom opencode-prompt-delivery 'steer
   "How a prompt sent while a turn runs is delivered.
 `steer' joins the running turn at its next step; `queue' waits for the
@@ -308,34 +306,52 @@ first selectable entry of the cached catalog."
 (defvar-keymap opencode-session-mode-map
   :parent comint-mode-map
   "RET" #'opencode-send-input
-  "C-c RET" #'opencode-queue-input
   "M-p" #'opencode-previous-input-or-button
   "M-n" #'opencode-next-input-or-button
   "TAB" #'opencode-tab-dwim
   "<backtab>" #'backward-button
-  "C-c TAB" #'opencode-cycle-agent
-  "C-c C-a" #'opencode-select-agent
-  "C-c m" #'opencode-select-model
-  "C-c v" #'opencode-select-variant
-  "C-c C-c" #'opencode-interrupt
+  ;; C-c C-o opens links, as in Org, instead of deleting the last output.
   "C-c C-o" #'opencode-open-link-at-point
-  "C-c C-y" #'opencode-yank-code-block
-  "C-c Y" #'opencode-copy-conversation
-  "C-c x" #'opencode-delete-session
-  "C-c r" #'opencode-rename-session
-  "C-c n" #'opencode-new-session
-  "C-c c" #'opencode-select-child-session
-  "C-c C" #'opencode-compact-session
-  "C-c t" #'opencode-scroll-to-last-response-start
-  "C-c p" #'opencode-open-parent
-  "C-c f" #'opencode-add-file
-  "C-c b" #'opencode-add-buffer-dwim
-  "C-c F" #'opencode-fork-session
-  "C-c R" #'opencode-revert-to-point
-  "C-c U" #'opencode-revert-clear
-  "C-c g" #'opencode-session-reload
-  "/" #'opencode-insert-slash-command
-  "@" #'opencode-add-subagent)
+  "/" #'opencode-electric-slash
+  "@" #'opencode-add-subagent
+  ;; The pipe runs no subprocess: signals, end of file and erasing output
+  ;; either have an OpenCode meaning or are refused.
+  "<remap> <comint-interrupt-subjob>" #'opencode-interrupt
+  "<remap> <comint-delchar-or-maybe-eof>" #'delete-char
+  "<remap> <comint-send-eof>" #'opencode-comint-unsupported
+  "<remap> <comint-stop-subjob>" #'opencode-comint-unsupported
+  "<remap> <comint-continue-subjob>" #'opencode-comint-unsupported
+  "<remap> <comint-quit-subjob>" #'opencode-comint-unsupported
+  "<remap> <comint-kill-subjob>" #'opencode-comint-unsupported
+  "<remap> <comint-delete-output>" #'opencode-comint-unsupported
+  "<remap> <comint-clear-buffer>" #'opencode-comint-unsupported)
+
+(defconst opencode--comint-refusals
+  '((comint-send-eof
+     . "An OpenCode session takes no end of file: kill the buffer to close it")
+    (comint-stop-subjob
+     . "An OpenCode turn cannot be suspended: `opencode-interrupt' stops it")
+    (comint-continue-subjob
+     . "An OpenCode turn is never suspended, so there is nothing to continue")
+    (comint-quit-subjob
+     . "An OpenCode session takes no quit signal: `opencode-interrupt' stops the turn")
+    (comint-kill-subjob
+     . "An OpenCode session has no process to kill: `opencode-interrupt' stops the turn")
+    (comint-delete-output
+     . "The transcript is the server's and cannot be deleted: `revert-buffer' renders it again")
+    (comint-clear-buffer
+     . "The transcript is the server's and cannot be cleared: `revert-buffer' renders it again"))
+  "Comint commands that session buffers refuse, with the reason given.")
+
+(defun opencode-comint-unsupported ()
+  "Refuse the Comint command remapped to this one, saying why.
+Session buffers run no subprocess: Comint's signals and end of file
+would act on the input instead, sending it or marking it as sent without
+sending it, and erasing output would desynchronize the transcript from
+the server."
+  (interactive)
+  (user-error "%s" (or (alist-get this-original-command opencode--comint-refusals)
+                       (format "`%s' does not apply to OpenCode sessions" this-original-command))))
 
 (defun opencode--session-cleanup ()
   "Release this buffer's process, registration and temporary files."
@@ -351,10 +367,14 @@ first selectable entry of the cached catalog."
 
 (define-derived-mode opencode-session-mode comint-mode "OpenCode"
   "Major mode of an OpenCode session buffer.
+Only standard keys are bound.  Comint commands meant for a subprocess
+interrupt the turn or are refused (`opencode-comint-unsupported'), and
+`revert-buffer' renders the transcript again.
 \\{opencode-session-mode-map}"
   (setq-local comint-use-prompt-regexp nil
               comint-input-sender #'opencode--send-input
               comint-highlight-input nil
+              revert-buffer-function #'opencode--session-revert
               left-margin-width (1+ left-margin-width))
   ;; Output never prompts for a password.
   (setq-local comint-output-filter-functions
@@ -572,9 +592,13 @@ ELSE, when given, receives the `opencode-error' of a failed request."
                   (when callback (funcall callback))))))
      else)))
 
+(defun opencode--session-revert (&rest _)
+  "Reload the transcript, as `revert-buffer' does in a session buffer."
+  (opencode-session-reload))
+
 (defun opencode-session-reload ()
   "Render this session's transcript again from the server.
-Input typed at the prompt is kept."
+Input typed at the prompt is kept.  `revert-buffer' does this too."
   (interactive)
   (unless opencode-session-id (user-error "Not in an OpenCode session"))
   (let ((input (and (get-buffer-process (current-buffer))
@@ -1471,18 +1495,30 @@ Input that did not go through `opencode-send-input' is checked here."
     (overlay-put overlay 'modification-hooks '(opencode--remove-attachment))
     overlay))
 
-(defmacro opencode--with-last-session (&rest body)
-  "Run BODY at the prompt of the last selected session buffer."
-  `(if (buffer-live-p opencode-last-session-buffer)
-       (with-current-buffer opencode-last-session-buffer
-         (unless (comint-after-pmark-p) (goto-char (point-max)))
-         ,@body)
-     (user-error "Open an OpenCode session first")))
+(defun opencode--prompt-buffer ()
+  "Return the session buffer whose input prompt commands edit.
+That is this buffer when it is a session buffer, so commands run in it
+from elsewhere act on its own session; otherwise the last selected one."
+  (cond ((and opencode-session-id (get-buffer-process (current-buffer))) (current-buffer))
+        ((buffer-live-p opencode-last-session-buffer) opencode-last-session-buffer)
+        (t (user-error "Open an OpenCode session first"))))
+
+(defmacro opencode--with-prompt (buffer &rest body)
+  "Run BODY in session BUFFER, with point in its input.
+Point stays where it is when already in the input, else moves to its end."
+  (declare (indent 1) (debug (form body)))
+  `(with-current-buffer ,buffer
+     (unless (comint-after-pmark-p) (goto-char (point-max)))
+     ,@body))
 
 (defun opencode--file-uri (file)
   "Return the file URI of FILE."
   (concat "file://" (if (string-prefix-p "/" (expand-file-name file)) "" "/")
           (url-hexify-string (expand-file-name file) url-path-allowed-chars)))
+
+(defun opencode--data-uri (text)
+  "Return a data URI holding TEXT as UTF-8 plain text."
+  (concat "data:text/plain;base64," (base64-encode-string (encode-coding-string text 'utf-8) t)))
 
 (defun opencode--attach-file (file &optional name)
   "Attach FILE to the next prompt, shown as NAME."
@@ -1491,11 +1527,21 @@ Input that did not go through `opencode-send-input' is checked here."
      name (list :file `((uri . ,(opencode--file-uri file)) (name . ,name))))
     (insert " ")))
 
+(defun opencode--attach-buffer (buffer target)
+  "Attach the text of BUFFER to the next prompt of session buffer TARGET."
+  (let ((name (buffer-name buffer))
+        (text (with-current-buffer buffer (buffer-substring-no-properties (point-min) (point-max)))))
+    (opencode--with-prompt target
+      (opencode--insert-attachment name (list :file `((uri . ,(opencode--data-uri text)) (name . ,name))))
+      (insert " "))))
+
 (defun opencode-add-file (&optional file directories)
   "Attach FILE, or a file of the current project, to the next prompt.
-With prefix argument DIRECTORIES, offer project directories."
+With prefix argument DIRECTORIES, offer project directories.  The prompt
+is this session buffer's, else the last selected session's."
   (interactive (list nil current-prefix-arg))
-  (let* ((project (project-current t))
+  (let* ((target (opencode--prompt-buffer))
+         (project (project-current t))
          (root (project-root project))
          (files (project-files project))
          (file (or file
@@ -1506,32 +1552,103 @@ With prefix argument DIRECTORIES, offer project directories."
                                                         (mapcar #'file-name-directory files))))
                       files)
                     nil 'file-name-history))))
-    (opencode--with-last-session (opencode--attach-file (expand-file-name file root)))))
+    (opencode--with-prompt target (opencode--attach-file (expand-file-name file root)))))
 
 (defun opencode-add-buffer-dwim ()
   "Attach a buffer's text to the next prompt.
-From a session buffer prompt for the buffer, elsewhere attach the current one."
+From a session buffer prompt for the buffer, elsewhere attach the current
+one to the last selected session."
   (interactive)
-  (let* ((name (if opencode-session-id (read-buffer "Attach buffer: " nil t) (buffer-name)))
-         (text (with-current-buffer name (buffer-substring-no-properties (point-min) (point-max))))
-         (uri (concat "data:text/plain;base64,"
-                      (base64-encode-string (encode-coding-string text 'utf-8) t))))
-    (opencode--with-last-session
-     (opencode--insert-attachment name (list :file `((uri . ,uri) (name . ,name))))
-     (insert " "))))
+  (let ((target (opencode--prompt-buffer)))
+    (opencode--attach-buffer (if (eq target (current-buffer))
+                                 (get-buffer (read-buffer "Attach buffer: " nil t))
+                               (current-buffer))
+                             target)))
 
 (defun opencode-add-region ()
-  "Attach the active region to the next prompt."
+  "Attach the active region to the next prompt.
+The prompt is this session buffer's, else the last selected session's."
   (interactive)
   (unless (use-region-p) (user-error "No active region"))
-  (let* ((text (buffer-substring-no-properties (region-beginning) (region-end)))
-         (name (format "region of %s" (buffer-name)))
-         (uri (concat "data:text/plain;base64,"
-                      (base64-encode-string (encode-coding-string text 'utf-8) t))))
-    (opencode--with-last-session
-     (opencode--insert-attachment (format "region: %s" (truncate-string-to-width text 24 nil nil "…"))
-                                  (list :file `((uri . ,uri) (name . ,name))))
-     (insert " "))))
+  (let* ((target (opencode--prompt-buffer))
+         (text (buffer-substring-no-properties (region-beginning) (region-end)))
+         (name (format "region of %s" (buffer-name))))
+    (opencode--with-prompt target
+      (opencode--insert-attachment (format "region: %s" (truncate-string-to-width text 24 nil nil "…"))
+                                   (list :file `((uri . ,(opencode--data-uri text)) (name . ,name))))
+      (insert " "))))
+
+(defconst opencode--attach-buffer-prefix "buffer:"
+  "Prefix of the buffers `opencode-attach' offers, telling them from files.")
+
+(defun opencode--attachment-group (candidate transform)
+  "Return the group of `opencode-attach' CANDIDATE, or with TRANSFORM its display."
+  (let ((buffer (string-prefix-p opencode--attach-buffer-prefix candidate)))
+    (cond ((not transform) (if buffer "Buffers" "Files"))
+          (buffer (substring candidate (length opencode--attach-buffer-prefix)))
+          (t candidate))))
+
+(defun opencode--attachment-candidates (exclude)
+  "Return a hash table of what `opencode-attach' offers, and its keys in order.
+Keys are file names relative to the current project's root, or to
+`default-directory' outside a project, whose files only are offered
+then, and live buffer names after `opencode--attach-buffer-prefix';
+values are (file . ABSOLUTE-NAME) or (buffer . BUFFER).  Buffers come
+first, most recently used first.  Internal buffers and EXCLUDE are left
+out."
+  (let* ((project (project-current))
+         (root (if project (project-root project) default-directory))
+         (table (make-hash-table :test #'equal))
+         (keys nil))
+    (dolist (buffer (buffer-list))
+      (unless (or (eq buffer exclude) (string-prefix-p " " (buffer-name buffer)))
+        (let ((key (concat opencode--attach-buffer-prefix (buffer-name buffer))))
+          (puthash key (cons 'buffer buffer) table)
+          (push key keys))))
+    (dolist (file (if project
+                      (project-files project)
+                    (seq-filter #'file-regular-p
+                                (directory-files root t directory-files-no-dot-files-regexp))))
+      (let* ((file (expand-file-name file root))
+             (key (file-relative-name file root)))
+        ;; A file name that reads as a buffer gets the prefix of a relative name.
+        (when (string-prefix-p opencode--attach-buffer-prefix key)
+          (setq key (concat "./" key)))
+        (puthash key (cons 'file file) table)
+        (push key keys)))
+    (list table (nreverse keys))))
+
+(defun opencode--read-attachment (exclude)
+  "Read a file of the current project or a live buffer other than EXCLUDE.
+Return (file . ABSOLUTE-NAME), (buffer . BUFFER), or nil for no choice."
+  (pcase-let* ((`(,table ,keys) (opencode--attachment-candidates exclude))
+               (annotate (lambda (key)
+                           (pcase (gethash key table)
+                             (`(buffer . ,buffer)
+                              (concat "  " (symbol-name (buffer-local-value 'major-mode buffer)))))))
+               (collection (lambda (string predicate action)
+                             (if (eq action 'metadata)
+                                 `(metadata (category . opencode-attachment)
+                                            (group-function . opencode--attachment-group)
+                                            (annotation-function . ,annotate))
+                               (complete-with-action action keys string predicate)))))
+    (gethash (completing-read "Attach: " collection nil t) table)))
+
+(defun opencode-attach ()
+  "Attach the active region, else a file or a buffer, to the next prompt.
+Without a region, the files of the current project and the live buffers
+are offered together, in two groups; buffer names start with
+\"buffer:\".  A file is attached by reference, a buffer by its text, as
+`opencode-add-file' and `opencode-add-buffer-dwim' do; `opencode-add-file'
+also attaches directories.  The prompt is this session buffer's, else the
+last selected session's."
+  (interactive)
+  (if (use-region-p)
+      (opencode-add-region)
+    (let ((target (opencode--prompt-buffer)))
+      (pcase (opencode--read-attachment target)
+        (`(file . ,file) (opencode--with-prompt target (opencode--attach-file file)))
+        (`(buffer . ,buffer) (opencode--attach-buffer buffer target))))))
 
 (defun opencode--yank-image (type data)
   "Attach pasted image DATA of MIME TYPE to the next prompt."
@@ -1543,36 +1660,73 @@ From a session buffer prompt for the buffer, elsewhere attach the current one."
     (opencode--insert-attachment name (list :file `((uri . ,uri) (name . ,name))))
     (insert " ")))
 
+(defun opencode--read-subagent ()
+  "Read a subagent of this session's directory; nil when it has none.
+Subagents are the agents of mode `subagent' or `all' that are not hidden."
+  (when-let* ((subagents (seq-filter (lambda (agent)
+                                       (and (member (alist-get 'mode agent) '("subagent" "all"))
+                                            (not (alist-get 'hidden agent))))
+                                     (opencode-catalog-wait 'agent))))
+    (opencode-annotated-completion
+     "Subagent: "
+     (mapcar (lambda (agent)
+               (list (alist-get 'id agent) (alist-get 'id agent) (alist-get 'description agent)))
+             subagents))))
+
+(defun opencode--insert-mention (name)
+  "Insert a mention of subagent NAME at point, sent with the next prompt."
+  (opencode--insert-attachment (concat "@" name) (list :agent name)))
+
 (defun opencode-add-subagent ()
-  "Insert a subagent mention at the prompt."
+  "Insert @, then offer the subagents when at the input.
+The chosen subagent's mention replaces the @; without a choice it stays.
+This is what @ does in a session buffer; `opencode-mention-subagent'
+works from any key."
   (interactive)
   (call-interactively #'self-insert-command)
   (when (comint-after-pmark-p)
-    (let ((subagents (seq-filter (lambda (agent)
-                                   (and (member (alist-get 'mode agent) '("subagent" "all"))
-                                        (not (alist-get 'hidden agent))))
-                                 (opencode-catalog-wait 'agent))))
-      (when subagents
-        (when-let* ((name (opencode-annotated-completion
-                           "Subagent: "
-                           (mapcar (lambda (agent)
-                                     (list (alist-get 'id agent) (alist-get 'id agent)
-                                           (alist-get 'description agent)))
-                                   subagents))))
-          (delete-char -1)
-          (opencode--insert-attachment (concat "@" name) (list :agent name)))))))
+    (when-let* ((name (opencode--read-subagent)))
+      (delete-char -1)
+      (opencode--insert-mention name))))
+
+(defun opencode-mention-subagent ()
+  "Choose a subagent and mention it in the next prompt.
+The mention goes at point when it is in the input, else at the input's
+end.  The prompt is this session buffer's, else the last selected
+session's."
+  (interactive)
+  (opencode--with-prompt (opencode--prompt-buffer)
+    (opencode--insert-mention (or (opencode--read-subagent)
+                                  (user-error "This session has no subagent to mention")))))
+
+(defun opencode--read-command ()
+  "Read a slash command of this session's directory; nil when it has none."
+  (opencode-annotated-completion
+   "Command: "
+   (mapcar (lambda (command)
+             (list (alist-get 'name command) (alist-get 'name command) (alist-get 'description command)))
+           (opencode-catalog-wait 'command))))
 
 (defun opencode-insert-slash-command ()
-  "Insert a slash command at the start of the prompt, else insert a slash."
+  "Choose a slash command and put it at the start of the input.
+Text already typed becomes the command's arguments, except a command
+the input starts with already, which the chosen one replaces.  Point
+ends after the command.  The prompt is this session buffer's, else the
+last selected session's."
+  (interactive)
+  (opencode--with-prompt (opencode--prompt-buffer)
+    (when-let* ((name (opencode--read-command)))
+      (goto-char (opencode-pmark))
+      (when (looking-at "/[^ \t\n]*[ \t]?")
+        (delete-region (match-beginning 0) (match-end 0)))
+      (insert "/" name " "))))
+
+(defun opencode-electric-slash ()
+  "Choose a slash command when typed at the start of the input, else insert /.
+At the start of the input this is `opencode-insert-slash-command'."
   (interactive)
   (if (and (comint-after-pmark-p) (= (point) (opencode-pmark)))
-      (when-let* ((name (opencode-annotated-completion
-                         "Command: "
-                         (mapcar (lambda (command)
-                                   (list (alist-get 'name command) (alist-get 'name command)
-                                         (alist-get 'description command)))
-                                 (opencode-catalog-wait 'command)))))
-        (insert "/" name " "))
+      (opencode-insert-slash-command)
     (call-interactively #'self-insert-command)))
 
 ;;;; Agent and model
@@ -1580,6 +1734,16 @@ From a session buffer prompt for the buffer, elsewhere attach the current one."
 (defun opencode--require-session ()
   "Signal an error outside a session buffer."
   (unless opencode-session-id (user-error "Not in an OpenCode session")))
+
+(declare-function opencode-session-list-id-at-point "opencode-sessions")
+
+(defun opencode--session-id-here ()
+  "Return the session of this buffer, or of the session list row at point.
+Signal a `user-error' when there is none."
+  (or opencode-session-id
+      (and (fboundp 'opencode-session-list-id-at-point)
+           (opencode-session-list-id-at-point))
+      (user-error "No OpenCode session here")))
 
 (defun opencode--switch-failed (else)
   "Return the failure handler of a switch: ELSE, else one reporting the error."
@@ -1665,17 +1829,24 @@ A missing variant is the model's default, as the service compares them."
                (message "No agent to switch to")))))))))
 
 (defun opencode-select-agent ()
-  "Choose this session's primary agent."
+  "Choose this session's primary agent.
+With exactly two agents to choose from, switch to the other one at once."
   (interactive)
   (opencode--require-session)
   (opencode-catalog-wait 'agent)
-  (when-let* ((agent (opencode-annotated-completion
-                      "Agent: "
-                      (mapcar (lambda (agent)
-                                (list (alist-get 'id agent) (alist-get 'id agent)
-                                      (alist-get 'description agent)))
-                              (opencode-primary-agents)))))
-    (opencode-switch-agent agent)))
+  (let* ((agents (opencode-primary-agents))
+         (ids (mapcar (lambda (agent) (alist-get 'id agent)) agents))
+         ;; A session that never chose runs the default agent.
+         (current (or opencode-session-agent (opencode-default-agent))))
+    (if (and (= (length ids) 2) (member current ids))
+        (opencode-switch-agent (car (remove current ids)))
+      (when-let* ((agent (opencode-annotated-completion
+                          "Agent: "
+                          (mapcar (lambda (agent)
+                                    (list (alist-get 'id agent) (alist-get 'id agent)
+                                          (alist-get 'description agent)))
+                                  agents))))
+        (opencode-switch-agent agent)))))
 
 (defun opencode-select-model ()
   "Choose this session's model."
@@ -1723,10 +1894,9 @@ A missing variant is the model's default, as the service compares them."
                               (message "Nothing to interrupt")))))
 
 (defun opencode-interrupt ()
-  "Interrupt the running turn of this session."
+  "Interrupt the running turn of this session, or of the list row at point."
   (interactive)
-  (opencode--require-session)
-  (opencode-session-interrupt opencode-session-id))
+  (opencode-session-interrupt (opencode--session-id-here)))
 
 (defun opencode-session-archive (id &optional restore)
   "Archive session ID, or with RESTORE restore it from the archive.
@@ -1771,29 +1941,70 @@ there is no reply or the request fails."
                                  (funcall callback nil))))))))
       (page nil))))
 
+(defun opencode--session-title (id)
+  "Return the title of session ID as the registry or its buffer knows it, or nil."
+  (or (plist-get (opencode-state-get id) :title)
+      (when-let* ((buffer (gethash id opencode-session-buffers))
+                  ((buffer-live-p buffer)))
+        (alist-get 'title (buffer-local-value 'opencode-session-info buffer)))))
+
 (defun opencode-rename-session (&optional id title)
-  "Rename session ID, this one by default, to TITLE."
+  "Rename session ID to TITLE.
+ID defaults to this buffer's session, or the session list row at point.
+TITLE is read when nil, starting from the current title.  The session
+needs no buffer."
   (interactive)
-  (let* ((id (or id opencode-session-id (user-error "Not in an OpenCode session")))
-         (title (or title (read-string "Title: " (alist-get 'title opencode-session-info)))))
-    (opencode-request 'patch (concat "/api/session/" id) :body `((title . ,title)))))
+  (let* ((id (or id (opencode--session-id-here)))
+         (title (or title (read-string "Title: " (opencode--session-title id)))))
+    (opencode-request 'patch (concat "/api/session/" id)
+                      :directory (opencode-state--directory id) :buffer nil
+                      :body `((title . ,title)))))
+
+(defun opencode-session-delete (id)
+  "Delete session ID for good, without confirmation, and kill its buffer.
+The session needs no buffer."
+  (let ((buffer (gethash id opencode-session-buffers)))
+    (opencode-request 'delete (concat "/api/session/" id)
+                      :directory (opencode-state--directory id) :buffer nil
+                      :then (lambda (_)
+                              ;; The deletion event may have unregistered the buffer already.
+                              (dolist (buffer (list buffer (gethash id opencode-session-buffers)))
+                                (when (buffer-live-p buffer) (kill-buffer buffer)))))))
 
 (defun opencode-delete-session (&optional id)
-  "Delete session ID, this one by default, after confirmation."
+  "Delete session ID after confirmation.
+ID defaults to this buffer's session, or the session list row at point.
+See `opencode-session-delete'."
   (interactive)
-  (let ((id (or id opencode-session-id (user-error "Not in an OpenCode session")))
-        (buffer (and (null id) (current-buffer))))
-    (when (yes-or-no-p "Delete this OpenCode session for good? ")
-      (opencode-request 'delete (concat "/api/session/" id)
-                        :then (lambda (_)
-                                (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+  (let ((id (or id (opencode--session-id-here))))
+    (when (yes-or-no-p (format "Delete the OpenCode session %s for good? "
+                               (or (opencode--session-title id) id)))
+      (opencode-session-delete id))))
+
+(defun opencode-archive-session (&optional id)
+  "Archive session ID after confirmation.
+ID defaults to this buffer's session, or the session list row at point.
+See `opencode-session-archive'."
+  (interactive)
+  (let ((id (or id (opencode--session-id-here))))
+    (when (y-or-n-p (format "Archive the OpenCode session %s? "
+                            (or (opencode--session-title id) id)))
+      (opencode-session-archive id))))
+
+(defun opencode-session-compact (id)
+  "Compact the conversation of session ID; the session needs no buffer.
+The service picks the model, the session's own unless the compaction
+agent pins one, and steers a running turn: compaction runs at its next
+step."
+  (opencode-request 'post (format "/api/session/%s/compact" id)
+                    :directory (opencode-state--directory id) :buffer nil
+                    :body (opencode-empty-object)))
 
 (defun opencode-compact-session ()
   "Compact this session's conversation."
   (interactive)
   (opencode--require-session)
-  (opencode-request 'post (format "/api/session/%s/compact" opencode-session-id)
-                    :body (opencode-empty-object)))
+  (opencode-session-compact opencode-session-id))
 
 (defun opencode--block-message (overlay)
   "Return the ID of the message block OVERLAY belongs to, or nil.
@@ -1849,16 +2060,23 @@ everything."
             (setq found (opencode-message-at pos))))
         found)))))
 
+(defun opencode-session-fork (id &optional message-id)
+  "Fork session ID into a new session and show it in the selected window.
+The fork holds the whole conversation, or what precedes MESSAGE-ID.
+Session ID needs no buffer."
+  (opencode-request 'post (format "/api/session/%s/fork" id)
+                    :directory (opencode-state--directory id) :buffer nil
+                    :body (if message-id `((before . ,message-id)) (opencode-empty-object))
+                    :then (lambda (response)
+                            (opencode-session-open (opencode-request-data response)
+                                                   :other-window nil))))
+
 (defun opencode-fork-session ()
-  "Fork this session through the content at point into a new session."
+  "Fork this session through the content at point into a new session.
+At the input, the fork holds the whole conversation."
   (interactive)
   (opencode--require-session)
-  (let ((before (opencode--message-boundary (point))))
-    (opencode-request 'post (format "/api/session/%s/fork" opencode-session-id)
-                      :body (if before `((before . ,before)) (opencode-empty-object))
-                      :then (lambda (response)
-                              (opencode-session-open (opencode-request-data response)
-                                                     :other-window nil)))))
+  (opencode-session-fork opencode-session-id (opencode--message-boundary (point))))
 
 (defun opencode-revert-to-point ()
   "Stage a revert dropping everything after the content at point.

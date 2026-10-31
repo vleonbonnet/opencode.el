@@ -735,7 +735,8 @@ Each receives the block data and returns a string, or nil to defer.")
 
 (defun opencode-tab-dwim ()
   "Toggle the block at point, follow the button at point, or go to the next block.
-Never switches the session agent; that is \\[opencode-cycle-agent]."
+Never switches the session agent, as TAB does in the TUI; that is
+`opencode-cycle-agent'."
   (interactive)
   (if-let* ((summary (opencode-block-at (point))))
       (progn

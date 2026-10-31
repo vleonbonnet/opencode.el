@@ -29,10 +29,13 @@
 ;; worktrees, and the Branch column tells them apart.  Branches are read
 ;; from each worktree's HEAD: asking the server would activate a location
 ;; for every directory listed, and running Git would cost a process per
-;; directory.  Subagent sessions are hidden until `v' shows them, and
-;; archived ones are left out.  An icon of each session's status, from
-;; the session registry `opencode-state', leads its title and changes
-;; with it.
+;; directory.  Subagent sessions are hidden until
+;; `opencode-session-list-toggle-subagents' shows them, and archived ones
+;; are left out.  An icon of each session's status, from the session
+;; registry `opencode-state', leads its title and changes with it.
+;; RET opens the session at point and `revert-buffer' fetches the list
+;; again; other packages act on the session at point through
+;; `opencode-session-list-id-at-point'.
 ;; Lists refresh when sessions are created, deleted, renamed, moved,
 ;; forked, archived or restored, and render again when their window's
 ;; width changes, since column limits are fractions of it.  Titles of
@@ -197,14 +200,13 @@ Return nil outside Git.  HEAD is read directly, without running Git."
 ;;;; List buffers
 
 (defvar-keymap opencode-session-list-mode-map
-  :parent special-mode-map
-  "r" #'opencode-session-list-refresh
-  "n" #'opencode-session-list-new
-  "M" #'opencode-toggle-mcp
-  "v" #'opencode-session-list-toggle-subagents)
+  :parent special-mode-map)
 
 (define-derived-mode opencode-session-list-mode special-mode "Sessions"
   "Major mode of OpenCode session lists.
+RET opens the session at point and \\[revert-buffer] fetches the list
+again.  Commands of other packages, such as drover, act on the session
+at point through `opencode-session-list-id-at-point'.
 \\{opencode-session-list-mode-map}"
   (setq-local truncate-lines t
               revert-buffer-function (lambda (&rest _) (opencode-session-list-refresh))))
@@ -334,11 +336,7 @@ column sorts by title."
        :columns (opencode--session-list-columns sessions)
        :objects sessions
        :getter #'opencode--session-list-value
-       :actions '("RET" opencode-session-list-open
-                  "o" opencode-session-list-open
-                  "x" opencode-session-list-delete
-                  "A" opencode-session-list-archive
-                  "R" opencode-session-list-rename)
+       :actions '("RET" opencode-session-list-open)
        :separator-width 2
        :keymap opencode-session-list-mode-map)
       (if at
@@ -446,20 +444,10 @@ column sorts by title."
   "Open session INFO in the selected window."
   (opencode-session-open info :other-window nil))
 
-(defun opencode-session-list-delete (info)
-  "Delete session INFO after confirmation."
-  (opencode-delete-session (alist-get 'id info)))
-
-(defun opencode-session-list-archive (info)
-  "Archive session INFO after confirmation."
-  (when (y-or-n-p (format "Archive the OpenCode session %s? "
-                          (or (alist-get 'title info) (alist-get 'id info))))
-    (opencode-session-archive (alist-get 'id info))))
-
-(defun opencode-session-list-rename (info)
-  "Rename session INFO."
-  (opencode-rename-session (alist-get 'id info)
-                           (read-string "Title: " (alist-get 'title info))))
+(defun opencode-session-list-id-at-point ()
+  "Return the ID of the session on the row at point of a session list, or nil."
+  (when (derived-mode-p 'opencode-session-list-mode)
+    (alist-get 'id (ignore-errors (vtable-current-object)))))
 
 (defun opencode-session-list-new ()
   "Create a session in this list's directory."

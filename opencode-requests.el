@@ -295,7 +295,5 @@ A request of the subagent call itself keeps precedence."
 
 (add-hook 'opencode-blocks-finished-functions #'opencode--refresh-subagent)
 
-(keymap-set opencode-session-mode-map "C-c C-q" #'opencode-respond)
-
 (provide 'opencode-requests)
 ;;; opencode-requests.el ends here

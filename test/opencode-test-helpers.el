@@ -110,6 +110,14 @@ Each is a plist (:method :path :query :body).")
 Each is (METHOD REGEXP FUNCTION); FUNCTION receives the request plist
 and returns the decoded response, or (:error STATUS MESSAGE).")
 
+(defun opencode-test-requests-to (method suffix)
+  "Return the bodies of the METHOD requests whose path ends in SUFFIX, oldest first."
+  (nreverse (delq nil (mapcar (lambda (request)
+                                (when (and (eq (plist-get request :method) method)
+                                           (string-suffix-p suffix (plist-get request :path)))
+                                  (or (plist-get request :body) t)))
+                              opencode-test-requests))))
+
 (defun opencode-test-cursor-with-order-p (request)
   "Return non-nil when REQUEST's query has both a cursor and an order.
 The service refuses message pages asked for so."

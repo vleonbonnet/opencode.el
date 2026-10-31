@@ -410,14 +410,6 @@ an agent of mode `all'."
                                  ((id . "review") (mode . "all"))))))))
         opencode-test-routes))
 
-(defun opencode-test-requests-to (method suffix)
-  "Return the bodies of the METHOD requests whose path ends in SUFFIX, oldest first."
-  (nreverse (delq nil (mapcar (lambda (request)
-                                (when (and (eq (plist-get request :method) method)
-                                           (string-suffix-p suffix (plist-get request :path)))
-                                  (or (plist-get request :body) t)))
-                              opencode-test-requests))))
-
 (ert-deftest opencode-test-selectable-agents ()
   "Sessions can run every agent the service can select, the default first."
   (opencode-test-with-server
@@ -631,6 +623,65 @@ an agent of mode `all'."
                                                           opencode-test-requests)
                                                 :body))))))))
 
+(ert-deftest opencode-test-session-actions-without-buffer ()
+  "Sessions are renamed, compacted, forked and deleted by ID, without a buffer."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "text"))
+           (fork (alist-get 'data (opencode-test-fixture
+                                   (format "session-%s.json" (opencode-test-scenario "shell")))))
+           (opencode-test-routes (cons (list 'post "/fork\\'" (lambda (_) `((data . ,fork))))
+                                       opencode-test-routes))
+           (shown nil))
+      (puthash id (list :id id :title "Registered title" :directory opencode-test-workspace)
+               opencode-state--sessions)
+      (cl-letf (((symbol-function 'switch-to-buffer) (lambda (buffer &rest _) (setq shown buffer)))
+                ((symbol-function 'yes-or-no-p) (lambda (&rest _) (ert-fail "Asked")))
+                ((symbol-function 'read-string)
+                 (lambda (_prompt initial &rest _) (should (equal initial "Registered title")) "Read title")))
+        (with-temp-buffer
+          (opencode-rename-session id "New title")
+          (opencode-rename-session id)
+          (opencode-session-compact id)
+          (opencode-session-fork id)
+          (opencode-session-fork id "msg_cut")
+          (opencode-session-delete id)))
+      (should (equal (mapcar (lambda (request)
+                               (list (plist-get request :method)
+                                     (string-remove-prefix (concat "/api/session/" id) (plist-get request :path))
+                                     (let ((body (plist-get request :body)))
+                                       (if (hash-table-p body) 'empty body))))
+                             (seq-filter (lambda (request)
+                                           (string-prefix-p (concat "/api/session/" id) (plist-get request :path)))
+                                         (reverse opencode-test-requests)))
+                     '((patch "" ((title . "New title")))
+                       (patch "" ((title . "Read title")))
+                       (post "/compact" empty)
+                       (post "/fork" empty)
+                       (post "/fork" ((before . "msg_cut")))
+                       (delete "" nil))))
+      ;; The fork is shown in the selected window.
+      (should (eq shown (gethash (alist-get 'id fork) opencode-session-buffers))))))
+
+(ert-deftest opencode-test-delete-session-confirms ()
+  "Deleting asks first, naming the session, then kills its buffer."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "text"))
+           (buffer (opencode-test-open id))
+           (answer nil)
+           (asked nil))
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (prompt) (setq asked prompt) answer)))
+        (with-current-buffer buffer
+          (setq opencode-test-requests nil)
+          (opencode-delete-session)
+          (should (string-match-p (regexp-quote (opencode-test-session-title id)) asked))
+          (should-not opencode-test-requests)
+          (setq answer t)
+          (opencode-delete-session)))
+      (should (equal (mapcar (lambda (request) (list (plist-get request :method) (plist-get request :path)))
+                             opencode-test-requests)
+                     `((delete ,(concat "/api/session/" id)))))
+      (should-not (buffer-live-p buffer)))))
+
 (ert-deftest opencode-test-boundary-drops-tool-steps ()
   "A fork or revert at a prompt cuts before its answer's first step, tool calls included."
   (opencode-test-with-server
@@ -650,18 +701,20 @@ an agent of mode `all'."
 (ert-deftest opencode-test-pickers-wait-for-catalogs ()
   "Commands that prompt with a catalog fetch it first, then ask."
   (opencode-test-with-server
-    (with-current-buffer (opencode-test-open (opencode-test-scenario "text"))
-      (let ((offered nil))
-        (cl-letf (((symbol-function 'opencode-annotated-completion)
-                   (lambda (_prompt entries) (setq offered (mapcar #'car entries)) nil)))
-          (clrhash opencode--catalogs)
-          (goto-char (opencode-pmark))
-          (opencode-insert-slash-command)
-          (should offered)
-          (setq offered nil)
-          (clrhash opencode--catalogs)
-          (opencode-select-agent)
-          (should (equal offered '("build" "plan"))))))))
+    (let ((opencode-test-routes (opencode-test-agent-routes)))
+      (with-current-buffer (opencode-test-open (opencode-test-scenario "text"))
+        (let ((offered nil))
+          (cl-letf (((symbol-function 'opencode-annotated-completion)
+                     (lambda (_prompt entries) (setq offered (mapcar #'car entries)) nil)))
+            (clrhash opencode--catalogs)
+            (goto-char (opencode-pmark))
+            (opencode-insert-slash-command)
+            (should offered)
+            (setq offered nil)
+            (clrhash opencode--catalogs)
+            ;; More than two agents to choose from are offered.
+            (opencode-select-agent)
+            (should (equal offered '("build" "plan" "review")))))))))
 
 (ert-deftest opencode-test-report-error ()
   "Errors of asynchronous callbacks are reported like a command's, never exiting Emacs."
