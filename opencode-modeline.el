@@ -52,6 +52,7 @@
 (require 'opencode-common)
 (require 'opencode-requests)
 (require 'opencode-session)
+(require 'opencode-variant)
 
 (defcustom opencode-mode-line t
   "When non-nil, session buffers show the session mode line."
@@ -78,11 +79,13 @@ Providers without a match show a generic icon followed by their name."
   :type 'natnum
   :group 'opencode)
 
-(defcustom opencode-default-variant-function nil
+(defcustom opencode-default-variant-function #'opencode-model-default-variant
   "Function naming the variant a model runs with when none is selected.
 Called with the provider and model catalog entries; returns a variant ID,
-a string or symbol, or nil when the provider decides.  nil shows a dim
-\"default\"."
+a string or symbol, or nil when the provider decides.  The default,
+`opencode-model-default-variant', names the variant sending the effort
+such a request sends.  A function returning nil, or nil itself, shows a
+dim \"default\"."
   :type '(choice (const :tag "Provider default" nil) function)
   :group 'opencode)
 

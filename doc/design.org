@@ -10,7 +10,7 @@
 | =opencode-service.el=     | Service discovery from =service.json=, probing, =opencode service start/restart=, version checks                        |
 | =opencode-http.el=        | =opencode-request=: authentication, location header, JSON, retries, error reporting                                     |
 | =opencode-events.el=      | The one SSE stream: frame scanning, queued dispatch, heartbeat watchdog, reconnection                                   |
-| =opencode-state.el=       | Session registry: every session's live state and status, bootstrap, the server-side read marker                         |
+| =opencode-state.el=       | Session registry: every session's live state and status, bootstrap, the server-side read marker, prompt-cache expiries  |
 | =opencode-render.el=      | Output and prompt management, fontification that survives Markdown, tables, prompt-only undo                            |
 | =opencode-links.el=       | File, Org and Markdown links in the transcript                                                                          |
 | =opencode-blocks.el=      | Collapsible reasoning, tool and notice blocks, their summaries, fitting to the window                                   |
@@ -20,6 +20,7 @@
 | =opencode-form.el=        | Question forms and other forms                                                                                          |
 | =opencode-notify.el=      | Notification log, filters and operating-system backends                                                                 |
 | =opencode-modeline.el=    | The session mode line and long-context pricing tiers                                                                    |
+| =opencode-variant.el=     | The variant a model runs with when none is selected, from the catalogs                                                  |
 | =opencode-sessions.el=    | Session pickers and their status icons, projects, worktree branches, worktrees, MCP servers                             |
 | =opencode-edits.el=       | Post-edit hooks, safe visiting and saving, indentation, Prettier, Flycheck                                              |
 | =opencode-desktop.el=     | Desktop saving and in-place restoring                                                                                   |
@@ -48,6 +49,8 @@ Every time the stream connects, whoever opened it, the registry is rebuilt from 
 The service does not record when an execution started, nor when it asked a request it lists. A running turn's start is taken as the first message after the transcript's last idle marker, skipping agent, model and location switches, which happen between turns; a request's time comes from its ID, whose first 48 bits are the creation time in the service's ID layout, and a request the registry already knew keeps the time it had.
 
 Unread is the service's, shared by every client: a session is unread when its idle time is newer than its viewed watermark. The registry projects both as the service does: an end of execution sets the idle time to the later of the event's time and one millisecond past the previous idle time, and an interruption by the service shutting down changes neither, since the restarted service resumes the turn. An entry fetched after an event may already reflect it, so a held or queued end of execution is not counted again when the entry's idle time already reaches the event's: counted twice, the idle time would run one millisecond ahead of the service's, which ignores a view of an idle time newer than its own, and the session would stay unread. Posting the view only when unread, and once per watermark while it is in flight, keeps the selection hooks from flooding the service.
+
+Prompt-cache expiries, which only my fork reports, are kept apart from the entries, in a table of their own: the service lists them for every session with a live cache entry, the registry's or not, and a session older than the recent page still shows in drover's lists. They are listed whenever the stream connects, alongside the bootstrap; =session.cache.updated= then carries each session's new expiry after every provider response, and events received while a listing is in flight are held and applied over its answer, which may predate them. Nothing reports an entry running out, and once one has, a longer-lived entry of a shorter prefix may still serve the session (a system prompt cached for an hour under a conversation cached for five minutes), or a fork may have refreshed its parent's entry without an event to the parent; so one timer, set a second past the earliest known expiry, forgets the expiries that passed and lists them all again. A listing supersedes the one in flight, and the timer only ever waits for an expiry still ahead, so listings never loop. A service without the route answers an untagged 404: it then has no expiries, and is not asked again until the stream reconnects, maybe to a newer build; any other failure keeps the expiries known until the next one passes.
 
 * No session list
 
@@ -126,6 +129,10 @@ Post-edit hooks run from =session.tool.success= of live turns only. A reloaded t
 * The prompt cache
 
 The cache guard's report comes from the service, which dry-runs the request the turn would send and compares it with what the provider confirmed it cached. The check runs from =RET=, before Comint takes the input, so declining leaves the prompt untouched; a caller that switches agent or model before sending passes them to the check, so no question appears from an asynchronous callback. Every prompt and command carries =thinkingLoss: "ask"= in its metadata, so the service refuses a turn that would replay stale thinking instead of letting the provider drop it, and consent sends =thinkingLoss: "accept"= on that one prompt. A service without the route answers an untagged 404, and the guard then stays off for it.
+
+* Default variants
+
+A model reference without a variant sends neither a variant's settings nor its body: the request carries what the provider and model catalog entries configure, and the provider decides the rest. The service never says which variant that amounts to, yet the mode line names it, so =opencode-model-default-variant= reproduces the request: the provider's settings with the model's merged over them, and the model's body overlay, read at the keys OpenCode's variants set; the OpenAI packages add a medium effort for GPT-5. Claude pairs every variant with adaptive thinking, so an effort counts only under it, and what the request leaves unset takes the API's defaults (=opencode-anthropic-default-efforts=), except behind Copilot, which handles Claude's effort itself; binding thinking blocks, from Claude 5.1 on unless the catalog says otherwise, turns adaptive thinking on. The variant named is the one sending the same effort, and none when no variant does.
 
 * Tests
 

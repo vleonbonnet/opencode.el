@@ -40,6 +40,13 @@
 ;; as the service does, so the watermark it posts is one the service
 ;; accepts.  An entry fetched after an event may already reflect it, so
 ;; replaying such an event never advances the idle time twice.
+;;
+;; With my OpenCode fork, the registry also knows when each session's
+;; provider prompt cache runs out (`opencode-state-cache'): listed when
+;; the stream connects, updated by `session.cache.updated' after every
+;; provider response, and listed again once the earliest known expiry
+;; passes, since nothing reports an entry running out.  One timer serves
+;; every session.
 
 ;;; Code:
 
@@ -64,7 +71,9 @@ session new to the registry, the new one nil for a session removed."
 
 (defcustom opencode-state-updated-functions nil
   "Abnormal hook run with a session ID whenever its registry entry changes.
-Creation and removal count as changes."
+Creation and removal count as changes, and so does a change of the
+session's prompt-cache expiry (`opencode-state-cache'), even for a
+session the registry holds no entry of."
   :type 'hook
   :group 'opencode)
 
@@ -106,6 +115,29 @@ Events are applied only while they come from this stream.")
 
 (defvar opencode-state--viewing (make-hash-table :test #'equal)
   "Session IDs mapped to the idle watermark, in milliseconds, of their view in flight.")
+
+(defvar opencode-state--caches (make-hash-table :test #'equal)
+  "Session IDs mapped to their live prompt-cache expiry, as `opencode-state-cache' returns it.")
+
+(defvar opencode-state--cache-timer nil
+  "Timer listing the expiries again once the earliest known one passes.")
+
+(defvar opencode-state--cache-generation 0
+  "Count of expiry listings; answers to a superseded one are ignored.")
+
+(defvar opencode-state--cache-listing nil
+  "Non-nil while an expiry listing is in flight.")
+
+(defvar opencode-state--cache-held nil
+  "Expiry events received while listing, newest first.")
+
+(defvar opencode-state--cache-unsupported nil
+  "Non-nil when the service cannot list expiries, until the stream reconnects.")
+
+(defconst opencode-state--cache-margin 1
+  "Seconds past an expiry before listing again.
+The service drops an entry once its expiry is reached, an expiry it
+rounds to the millisecond.")
 
 ;;;; Entries
 
@@ -260,6 +292,35 @@ known."
       ('waiting (plist-get (car (plist-get entry :requests)) :time))
       ((or 'working 'retrying) (plist-get entry :started))
       ((or 'failed 'done) (plist-get entry :idle)))))
+
+(defun opencode-state-cache (id)
+  "Return the live prompt-cache expiry of session ID, or nil.
+It describes the provider's cache entry that a next turn extending the
+session's last request would reuse, as a plist: :expires, when it runs
+out, in float seconds since the epoch; :ttl, its retention window in
+seconds, which every provider response reusing it starts over; and
+:tokens, the prompt tokens it covers.  Nil when no entry is live, the
+service cannot tell (see `opencode-state-cache-supported-p'), or the
+expiry is not known yet.  Nothing reports an entry running out, so
+callers count down to :expires themselves; the registry lists the
+expiries again once one passes, as a longer-lived entry of a shorter
+prefix may then remain, and runs `opencode-state-updated-functions'
+with every session whose expiry changed."
+  (when-let* ((cache (gethash id opencode-state--caches))
+              ((> (plist-get cache :expires) (float-time))))
+    cache))
+
+(defun opencode-state-cache-remaining (id)
+  "Return the seconds left before session ID's prompt cache expires, or nil.
+See `opencode-state-cache'."
+  (when-let* ((cache (opencode-state-cache id)))
+    (- (plist-get cache :expires) (float-time))))
+
+(defun opencode-state-cache-supported-p ()
+  "Return nil when the service cannot list prompt-cache expiries.
+Only my OpenCode fork can.  Until the service first answers, and again
+after the stream reconnects, it is taken to be able to."
+  (not opencode-state--cache-unsupported))
 
 ;;;; Changes
 
@@ -552,6 +613,8 @@ REPLAY is passed to `opencode-state--apply'."
        (opencode-state--store id (opencode-state--created-entry event)))))
     ("session.deleted"
      (remhash id opencode-state--fetching)
+     (opencode-state--cache-set id nil)
+     (opencode-state--cache-schedule)
      (opencode-state--store id nil))
     (_
      (cond
@@ -687,9 +750,14 @@ are covered by their answers; those received meanwhile are held."
                                                          active)))))))))))))
 
 (defun opencode-state--connected (_event)
-  "Bootstrap the registry on the stream that just (re)connected."
-  (setq opencode-state--stream opencode-events--process)
-  (opencode-state--bootstrap))
+  "Bootstrap the registry and list the expiries on the stream that just (re)connected.
+A service restarted meanwhile, maybe another build, may list expiries
+the previous one could not."
+  (setq opencode-state--stream opencode-events--process
+        opencode-state--cache-unsupported nil
+        opencode-state--cache-held nil)
+  (opencode-state--bootstrap)
+  (opencode-state--cache-list))
 
 (defun opencode-state-ensure (&optional callback)
   "Open the event stream and bootstrap the registry, then call CALLBACK.
@@ -723,6 +791,133 @@ registry missed, having been loaded after it."
                 "permission.asked" "permission.replied"
                 "form.created" "form.replied" "form.cancelled"))
   (opencode-events-register type #'opencode-state--handle))
+
+;;;; Prompt-cache expiry
+
+(defun opencode-state--cache-expiry (expiry)
+  "Return the registry's form of the service's EXPIRY, or nil when absent or past."
+  (let-alist expiry
+    (when-let* ((expires (opencode-time-seconds .expires))
+                ((> expires (float-time))))
+      (list :expires expires :ttl (and (numberp .ttl) (/ .ttl 1000.0)) :tokens .tokens))))
+
+(defun opencode-state--cache-set (id cache)
+  "Make CACHE the prompt-cache expiry of session ID, nil removing it.
+The update hook runs when it changed."
+  (unless (equal cache (gethash id opencode-state--caches))
+    (if cache
+        (puthash id cache opencode-state--caches)
+      (remhash id opencode-state--caches))
+    (opencode-state--run-hook 'opencode-state-updated-functions id)))
+
+(defun opencode-state--cache-install (data)
+  "Replace the known expiries with DATA, the service's listing."
+  (let ((caches (make-hash-table :test #'equal)))
+    (dolist (pair data)
+      (when-let* ((cache (opencode-state--cache-expiry (cdr pair))))
+        (puthash (format "%s" (car pair)) cache caches)))
+    (dolist (id (hash-table-keys opencode-state--caches))
+      (unless (gethash id caches)
+        (opencode-state--cache-set id nil)))
+    (maphash #'opencode-state--cache-set caches)))
+
+(defun opencode-state--cache-prune ()
+  "Forget the expiries that passed."
+  (let ((now (float-time)))
+    (dolist (id (hash-table-keys opencode-state--caches))
+      (when (<= (plist-get (gethash id opencode-state--caches) :expires) now)
+        (opencode-state--cache-set id nil)))))
+
+(defun opencode-state--cache-schedule ()
+  "Arm the one timer listing the expiries again once the earliest known passes.
+No timer runs while none is known."
+  (when (timerp opencode-state--cache-timer)
+    (cancel-timer opencode-state--cache-timer))
+  (setq opencode-state--cache-timer nil)
+  (let ((earliest nil))
+    (maphash (lambda (_id cache)
+               (let ((expires (plist-get cache :expires)))
+                 (when (or (null earliest) (< expires earliest))
+                   (setq earliest expires))))
+             opencode-state--caches)
+    (when earliest
+      ;; Absolute, as the service's expiries are.
+      (setq opencode-state--cache-timer
+            (run-at-time (time-convert (+ earliest opencode-state--cache-margin) 'list)
+                         nil #'opencode-state--cache-expired)))))
+
+(defun opencode-state--cache-listable-p ()
+  "Return non-nil when the service can be asked for the expiries now.
+While the stream is down, its reconnection lists them."
+  (and (not opencode-state--cache-unsupported)
+       (eq opencode-state--stream opencode-events--process)
+       (opencode-events-connected-p)))
+
+(defun opencode-state--cache-expired ()
+  "Forget the expiries that passed, then list them again.
+Nothing reports an entry running out, and once it has, a longer-lived
+entry of a shorter prefix, such as a system prompt cached for an hour
+under a conversation cached for five minutes, may still serve the
+session; a fork may also have refreshed the entry of its parent, which
+hears nothing of it."
+  (setq opencode-state--cache-timer nil)
+  (opencode-state--cache-prune)
+  (if (opencode-state--cache-listable-p)
+      (opencode-state--cache-list)
+    (opencode-state--cache-schedule)))
+
+(defun opencode-state--cache-listed (data)
+  "Install listed DATA, apply the events held meanwhile, and rearm the timer.
+DATA is the service's listing, or `failed' to keep the expiries known."
+  (setq opencode-state--cache-listing nil)
+  (unless (eq data 'failed)
+    (opencode-state--cache-install data))
+  (let ((held (reverse opencode-state--cache-held)))
+    (setq opencode-state--cache-held nil)
+    (mapc #'opencode-state--cache-apply held))
+  (opencode-state--cache-prune)
+  (opencode-state--cache-schedule))
+
+(defun opencode-state--cache-list ()
+  "List every session's prompt-cache expiry, replacing the known ones.
+A listing in flight is superseded.  Expiry events received meanwhile
+are held and applied over the answer, which may predate them.  A
+service without the route, which only my fork has, answers 404: it has
+no expiries, and is not asked again until the stream reconnects.  A
+failure keeps the known expiries, and the next one to pass lists again."
+  (let ((generation (cl-incf opencode-state--cache-generation)))
+    (setq opencode-state--cache-listing t)
+    (opencode-request
+     'get "/api/experimental/session/cache" :directory nil :buffer nil
+     :then (lambda (response)
+             (when (= generation opencode-state--cache-generation)
+               (opencode-state--cache-listed (opencode-request-data response))))
+     :else (lambda (error)
+             (when (= generation opencode-state--cache-generation)
+               (if (eql (opencode-error-status error) 404)
+                   (progn
+                     (setq opencode-state--cache-unsupported t)
+                     (opencode-state--cache-listed nil))
+                 (message "OpenCode: cannot list the prompt-cache expiries: %s"
+                          (opencode-error-describe error))
+                 (opencode-state--cache-listed 'failed)))))))
+
+(defun opencode-state--cache-apply (event)
+  "Make the expiry `session.cache.updated' EVENT carries its session's."
+  (let ((data (alist-get 'data event)))
+    (when-let* ((id (alist-get 'sessionID data)))
+      (opencode-state--cache-set id (opencode-state--cache-expiry (alist-get 'expiry data))))))
+
+(defun opencode-state--cache-event (event)
+  "Apply `session.cache.updated' EVENT when it follows the registry's stream.
+While a listing is in flight, the event waits for its answer."
+  (when (eq opencode-state--stream opencode-events--process)
+    (if opencode-state--cache-listing
+        (push event opencode-state--cache-held)
+      (opencode-state--cache-apply event)
+      (opencode-state--cache-schedule))))
+
+(opencode-events-register "session.cache.updated" #'opencode-state--cache-event)
 
 ;;;; The read marker
 

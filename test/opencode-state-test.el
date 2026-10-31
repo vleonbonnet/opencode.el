@@ -53,8 +53,10 @@ the tests' times stay close to the present.")
 (defvar opencode-test-state-server nil
   "What the service knows: a plist of :sessions (infos), :active (IDs),
 :permissions, :forms and :messages (alists of session IDs to lists, the
-messages newest first), and :on-list, a function called when the
-sessions are listed.")
+messages newest first), :caches (an alist of session IDs to prompt-cache
+expiries), :list-error and :cache-error (the failures of the session and
+expiry listings), and :on-list and :on-cache, functions called when the
+sessions or the expiries are listed.")
 
 (defun opencode-test-state--messages (request)
   "Answer the message page REQUEST asks for, as the service pages them."
@@ -120,7 +122,14 @@ sessions are listed.")
                  `((data . ,info))
                `(:error 404 ,(format "Session not found: %s" (plist-get request :match))))))
      (list 'post "/interrupt\\'"
-           (lambda (_) `((interrupted . ,(plist-get opencode-test-state-server :interrupted))))))))
+           (lambda (_) `((interrupted . ,(plist-get opencode-test-state-server :interrupted)))))
+     (list 'get "\\`/api/experimental/session/cache\\'"
+           (lambda (_)
+             (when-let* ((hook (plist-get opencode-test-state-server :on-cache)))
+               (funcall hook))
+             (or (plist-get opencode-test-state-server :cache-error)
+                 `((data . ,(mapcar (lambda (pair) (cons (intern (car pair)) (cdr pair)))
+                                    (plist-get opencode-test-state-server :caches))))))))))
 
 (defmacro opencode-test-with-state-server (server &rest body)
   "Run BODY with the service knowing SERVER, a plist like `opencode-test-state-server'."
@@ -696,6 +705,295 @@ DATA are the members of its data besides `sessionID'."
       (should (equal (plist-get entry :title) "renamed"))
       (should (eq (opencode-state-status entry) 'done)))
     (should-not opencode-state--held)))
+
+;;;; Prompt-cache expiry
+
+(defvar opencode-test-state-now (float-time)
+  "Float seconds the expiries of these tests count from.")
+
+(defun opencode-test-state-expiry (seconds ttl tokens)
+  "Return a service expiry SECONDS after `opencode-test-state-now', of TTL seconds, covering TOKENS."
+  `((expires . ,(round (* 1000 (+ opencode-test-state-now seconds)))) (ttl . ,(* 1000 ttl))
+    (tokens . ,tokens)))
+
+(defun opencode-test-state-cache (seconds ttl tokens)
+  "Return the registry's form of `opencode-test-state-expiry' with SECONDS, TTL and TOKENS."
+  (list :expires (/ (round (* 1000 (+ opencode-test-state-now seconds))) 1000.0)
+        :ttl (float ttl) :tokens tokens))
+
+(defun opencode-test-state-cache-event (session &optional expiry)
+  "Return a `session.cache.updated' event of SESSION carrying EXPIRY."
+  `((id . ,(opencode-generate-id "evt_")) (type . "session.cache.updated")
+    (created . ,(round (* 1000 (float-time))))
+    (data (sessionID . ,session) ,@(when expiry `((expiry . ,expiry))))))
+
+(defun opencode-test-state-cache-listings ()
+  "Return how many times the expiries were listed."
+  (seq-count (lambda (path) (equal path "/api/experimental/session/cache"))
+             (opencode-test-state-requests)))
+
+(defun opencode-test-state-cache-timer-at ()
+  "Return when the expiry timer fires, in float seconds, or nil without one."
+  (and (timerp opencode-state--cache-timer)
+       (memq opencode-state--cache-timer timer-list)
+       (float-time (timer--time opencode-state--cache-timer))))
+
+(defmacro opencode-test-state-at (seconds &rest body)
+  "Run BODY with the clock SECONDS after `opencode-test-state-now'."
+  (declare (indent 1) (debug t))
+  `(let ((now (+ opencode-test-state-now ,seconds))
+         (original (symbol-function 'float-time)))
+     (cl-letf (((symbol-function 'float-time)
+                (lambda (&optional time) (if time (funcall original time) now))))
+       ,@body)))
+
+(ert-deftest opencode-test-state-cache-bootstrap ()
+  "Connecting lists the expiries, after the sessions, for every session with a live one."
+  (let ((opencode-test-state-now (float-time)))
+    (opencode-test-with-state-server
+        (list :sessions (list (opencode-test-state-info "ses_a" :updated 10))
+              :caches `(("ses_a" . ,(opencode-test-state-expiry 300 300 120000))
+                        ("ses_old" . ,(opencode-test-state-expiry 3000 3600 8000))
+                        ;; Expired by the time it arrives: never known.
+                        ("ses_gone" . ,(opencode-test-state-expiry -5 300 100))))
+      (opencode-test-state-recording
+        (opencode-test-state-at 0
+          (should-not (opencode-state-cache "ses_a"))
+          (opencode-test-state-connect)
+          (should (equal (car (opencode-test-state-requests)) "/api/session"))
+          (let ((listing (seq-find (lambda (request)
+                                     (equal (plist-get request :path) "/api/experimental/session/cache"))
+                                   opencode-test-requests)))
+            (should (eq (plist-get listing :method) 'get))
+            (should-not (plist-get listing :query)))
+          (should (= (opencode-test-state-cache-listings) 1))
+          (should (equal (opencode-state-cache "ses_a") (opencode-test-state-cache 300 300 120000)))
+          ;; A session the registry does not hold has its expiry too.
+          (should-not (opencode-state-get "ses_old"))
+          (should (equal (opencode-state-cache "ses_old") (opencode-test-state-cache 3000 3600 8000)))
+          (should-not (opencode-state-cache "ses_gone"))
+          (should-not (opencode-state-cache "ses_none"))
+          (should (< (abs (- (opencode-state-cache-remaining "ses_a") 300)) 0.01))
+          (should (opencode-state-cache-supported-p))
+          (should (member "ses_a" opencode-test-state-updates))
+          (should (member "ses_old" opencode-test-state-updates))
+          (should-not (member "ses_gone" opencode-test-state-updates))
+          ;; The status hook is about statuses only.
+          (should-not (assoc "ses_old" opencode-test-state-changes)))
+        ;; One timer, set past the earliest expiry.
+        (should (< (abs (- (opencode-test-state-cache-timer-at)
+                           (+ (plist-get (opencode-test-state-cache 300 300 0) :expires)
+                              opencode-state--cache-margin)))
+                   0.5))
+        ;; Once it passed, it is not returned even before the timer forgets it.
+        (opencode-test-state-at 301
+          (should-not (opencode-state-cache "ses_a"))
+          (should-not (opencode-state-cache-remaining "ses_a")))))))
+
+(ert-deftest opencode-test-state-cache-events ()
+  "Each `session.cache.updated' sets or clears its session's expiry and rearms the timer."
+  (let ((opencode-test-state-now (float-time)))
+    (opencode-test-with-state-server
+        (list :sessions (list (opencode-test-state-info "ses_a" :updated 10))
+              :caches `(("ses_a" . ,(opencode-test-state-expiry 300 300 1000))))
+      (opencode-test-state-connect)
+      (opencode-test-state-recording
+        ;; A provider response restarts the window and covers more tokens.
+        (opencode-test-dispatch (list (opencode-test-state-cache-event
+                                       "ses_a" (opencode-test-state-expiry 600 300 2000))))
+        (should (equal (opencode-state-cache "ses_a") (opencode-test-state-cache 600 300 2000)))
+        (should (equal opencode-test-state-updates '("ses_a")))
+        (should (< (abs (- (opencode-test-state-cache-timer-at)
+                           (+ opencode-test-state-now 600 opencode-state--cache-margin)))
+                   0.5))
+        ;; The same expiry again changes nothing.
+        (opencode-test-dispatch (list (opencode-test-state-cache-event
+                                       "ses_a" (opencode-test-state-expiry 600 300 2000))))
+        (should (equal opencode-test-state-updates '("ses_a")))
+        ;; A session first heard of by its expiry is not fetched for it.
+        (setq opencode-test-requests nil)
+        (opencode-test-dispatch (list (opencode-test-state-cache-event
+                                       "ses_b" (opencode-test-state-expiry 120 3600 500))))
+        (should-not opencode-test-requests)
+        (should-not (opencode-state-get "ses_b"))
+        (should (equal (opencode-state-cache "ses_b") (opencode-test-state-cache 120 3600 500)))
+        (should (< (abs (- (opencode-test-state-cache-timer-at)
+                           (+ opencode-test-state-now 120 opencode-state--cache-margin)))
+                   0.5))
+        ;; Without an expiry, nothing is cached any more.
+        (opencode-test-dispatch (list (opencode-test-state-cache-event "ses_b")))
+        (should-not (opencode-state-cache "ses_b"))
+        (should (equal opencode-test-state-updates '("ses_b" "ses_b" "ses_a")))
+        (should (< (abs (- (opencode-test-state-cache-timer-at)
+                           (+ opencode-test-state-now 600 opencode-state--cache-margin)))
+                   0.5))
+        ;; A deleted session's expiry goes with it.
+        (opencode-test-dispatch (list (opencode-test-state-event "session.deleted" "ses_a" 20)))
+        (should-not (opencode-state-cache "ses_a"))
+        (should-not (hash-table-keys opencode-state--caches))
+        ;; Nothing live, no timer.
+        (should-not opencode-state--cache-timer)
+        ;; Events of another stream are left alone.
+        (let ((opencode-events--process 'another-stream))
+          (opencode-test-dispatch (list (opencode-test-state-cache-event
+                                         "ses_c" (opencode-test-state-expiry 60 300 10)))))
+        (should-not (opencode-state-cache "ses_c"))
+        (should-not opencode-state--cache-timer)))))
+
+(ert-deftest opencode-test-state-cache-expires ()
+  "The earliest expiry passing forgets it and lists the expiries again, which may hold another."
+  (let ((opencode-test-state-now (float-time)))
+    (opencode-test-with-state-server
+        (list :caches `(("ses_a" . ,(opencode-test-state-expiry 300 300 120000))
+                        ("ses_b" . ,(opencode-test-state-expiry 900 3600 4000))))
+      (opencode-test-state-connect)
+      (should (= (opencode-test-state-cache-listings) 1))
+      (let ((timer opencode-state--cache-timer))
+        (should (eq (timer--function timer) #'opencode-state--cache-expired))
+        ;; Only the conversation's entry lapsed: the system prompt's, cached for an hour, remains.
+        (plist-put opencode-test-state-server :caches
+                   `(("ses_a" . ,(opencode-test-state-expiry 3000 3600 9000))
+                     ("ses_b" . ,(opencode-test-state-expiry 900 3600 4000))))
+        (opencode-test-state-recording
+          (plist-put opencode-test-state-server :on-cache
+                     ;; Forgotten before the service is asked.
+                     (lambda () (should-not (gethash "ses_a" opencode-state--caches))))
+          (opencode-test-state-at (+ 300 opencode-state--cache-margin)
+            (timer-event-handler timer))
+          (plist-put opencode-test-state-server :on-cache nil)
+          (should (= (opencode-test-state-cache-listings) 2))
+          (should (equal (opencode-state-cache "ses_a") (opencode-test-state-cache 3000 3600 9000)))
+          (should (equal (opencode-state-cache "ses_b") (opencode-test-state-cache 900 3600 4000)))
+          (should (equal opencode-test-state-updates '("ses_a" "ses_a")))
+          (should (< (abs (- (opencode-test-state-cache-timer-at)
+                             (+ opencode-test-state-now 900 opencode-state--cache-margin)))
+                     0.5))
+          ;; Listed again when nothing is live any more: no timer.
+          (plist-put opencode-test-state-server :caches nil)
+          (opencode-test-state-at (+ 900 opencode-state--cache-margin)
+            (timer-event-handler opencode-state--cache-timer))
+          (should (= (opencode-test-state-cache-listings) 3))
+          (should-not (opencode-state-cache "ses_b"))
+          (should-not (hash-table-keys opencode-state--caches))
+          (should-not opencode-state--cache-timer))))))
+
+(ert-deftest opencode-test-state-cache-expires-offline ()
+  "An expiry passing while the stream is down is forgotten without asking the service."
+  (let ((opencode-test-state-now (float-time)))
+    (opencode-test-with-state-server
+        (list :caches `(("ses_a" . ,(opencode-test-state-expiry 300 300 100))
+                        ("ses_b" . ,(opencode-test-state-expiry 900 300 100))))
+      (opencode-test-state-connect)
+      (cl-letf (((symbol-function 'opencode-events-connected-p) #'ignore))
+        (opencode-test-state-at (+ 300 opencode-state--cache-margin)
+          (timer-event-handler opencode-state--cache-timer)))
+      (should (= (opencode-test-state-cache-listings) 1))
+      (should-not (gethash "ses_a" opencode-state--caches))
+      (should (gethash "ses_b" opencode-state--caches))
+      (should (< (abs (- (opencode-test-state-cache-timer-at)
+                         (+ opencode-test-state-now 900 opencode-state--cache-margin)))
+                 0.5)))))
+
+(ert-deftest opencode-test-state-cache-events-while-listing ()
+  "Expiry events received while listing are applied over the answer."
+  (let ((opencode-test-state-now (float-time)))
+    (opencode-test-with-state-server
+        (list :caches `(("ses_a" . ,(opencode-test-state-expiry 300 300 100))
+                        ("ses_b" . ,(opencode-test-state-expiry 300 300 100)))
+              :on-cache (lambda ()
+                          (opencode-test-dispatch
+                           (list (opencode-test-state-cache-event
+                                  "ses_a" (opencode-test-state-expiry 600 300 200))
+                                 (opencode-test-state-cache-event "ses_b")))
+                          (should opencode-state--cache-listing)
+                          (should-not (opencode-state-cache "ses_a"))))
+      (opencode-test-state-connect)
+      (should-not opencode-state--cache-listing)
+      (should-not opencode-state--cache-held)
+      (should (equal (opencode-state-cache "ses_a") (opencode-test-state-cache 600 300 200)))
+      (should-not (opencode-state-cache "ses_b")))))
+
+(ert-deftest opencode-test-state-cache-superseded ()
+  "A listing superseded by another, such as a reconnection's, is ignored when it answers."
+  (let ((opencode-test-state-now (float-time))
+        (answers nil))
+    (opencode-test-with-state-server nil
+      (cl-letf (((symbol-function 'opencode-request)
+                 (let ((original (symbol-function 'opencode-request)))
+                   (lambda (method path &rest arguments)
+                     ;; Answered below, out of order.
+                     (if (equal path "/api/experimental/session/cache")
+                         (push (plist-get arguments :then) answers)
+                       (apply original method path arguments))))))
+        (opencode-test-state-connect)
+        (opencode-test-state-connect))
+      (should (= (length answers) 2))
+      (should opencode-state--cache-listing)
+      ;; The newer answers first, then the older one arrives late.
+      (funcall (car answers) `((data (ses_a . ,(opencode-test-state-expiry 300 300 1)))))
+      (funcall (cadr answers) `((data (ses_a . ,(opencode-test-state-expiry 60 300 9)))))
+      (should (equal (opencode-state-cache "ses_a") (opencode-test-state-cache 300 300 1)))
+      (should-not opencode-state--cache-listing))))
+
+(ert-deftest opencode-test-state-cache-unsupported ()
+  "A service without the route is asked once per connection, quietly."
+  (let ((opencode-test-state-now (float-time)))
+    (opencode-test-with-state-server
+        (list :sessions (list (opencode-test-state-info "ses_a" :updated 10))
+              :caches `(("ses_a" . ,(opencode-test-state-expiry 300 300 100))))
+      (opencode-test-state-connect)
+      (should (opencode-state-cache "ses_a"))
+      ;; The service restarts as a build without the route: what it cached is gone with it.
+      (plist-put opencode-test-state-server :cache-error '(:error 404 "Not Found"))
+      (let ((messages nil))
+        (opencode-test-state-recording
+          (cl-letf (((symbol-function 'message) (lambda (&rest arguments) (push arguments messages))))
+            (opencode-test-state-connect))
+          (should-not messages)
+          (should (opencode-state-ready-p))
+          (should-not (opencode-state-cache-supported-p))
+          (should-not (opencode-state-cache "ses_a"))
+          (should (member "ses_a" opencode-test-state-updates))
+          (should-not opencode-state--cache-timer)
+          ;; Events are still applied, and their expiry does not ask the service.
+          (opencode-test-dispatch (list (opencode-test-state-cache-event
+                                         "ses_a" (opencode-test-state-expiry 60 300 5))))
+          (should (opencode-state-cache "ses_a"))
+          (opencode-test-state-at (+ 60 opencode-state--cache-margin)
+            (timer-event-handler opencode-state--cache-timer))
+          (should-not (opencode-state-cache "ses_a"))
+          (should (= (opencode-test-state-cache-listings) 2))
+          (should-not messages)))
+      ;; The next connection, maybe to the fork, asks again.
+      (plist-put opencode-test-state-server :cache-error nil)
+      (opencode-test-state-connect)
+      (should (= (opencode-test-state-cache-listings) 3))
+      (should (opencode-state-cache-supported-p))
+      (should (opencode-state-cache "ses_a")))))
+
+(ert-deftest opencode-test-state-cache-failure ()
+  "A failed listing is reported and keeps the expiries known, without retrying at once."
+  (let ((opencode-test-state-now (float-time)))
+    (opencode-test-with-state-server
+        (list :caches `(("ses_a" . ,(opencode-test-state-expiry 300 300 100))
+                        ("ses_b" . ,(opencode-test-state-expiry 900 300 100))))
+      (opencode-test-state-connect)
+      (plist-put opencode-test-state-server :cache-error '(:error 500 "busy"))
+      (let ((messages nil))
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format &rest arguments) (push (apply #'format format arguments) messages))))
+          (opencode-test-state-at (+ 300 opencode-state--cache-margin)
+            (timer-event-handler opencode-state--cache-timer)))
+        (should (equal (length messages) 1))
+        (should (string-match-p "cannot list the prompt-cache expiries.*busy" (car messages))))
+      (should (= (opencode-test-state-cache-listings) 2))
+      (should (opencode-state-cache-supported-p))
+      (should-not (gethash "ses_a" opencode-state--caches))
+      (should (opencode-state-cache "ses_b"))
+      ;; The next expiry to pass lists again.
+      (should (< (abs (- (opencode-test-state-cache-timer-at)
+                         (+ opencode-test-state-now 900 opencode-state--cache-margin)))
+                 0.5)))))
 
 ;;;; Actions
 

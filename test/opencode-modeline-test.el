@@ -75,6 +75,15 @@
         (let ((variant (alist-get 'variant (opencode-mode-line-segments))))
           (should (equal variant "medium"))
           (should (eq (get-text-property 0 'face variant) 'shadow))))
+      ;; By default, the variant sending the effort a request without one sends.
+      (let ((opencode-session-model '((id . "gpt-5.5") (providerID . "openai"))))
+        (let ((variant (alist-get 'variant (opencode-mode-line-segments))))
+          (should (equal variant "medium"))
+          (should (eq (get-text-property 0 'face variant) 'shadow))
+          (should (equal (get-text-property 0 'help-echo variant) "Variant: medium (default)")))
+        (let ((opencode-default-variant-function nil))
+          (should (equal (get-text-property 0 'help-echo (alist-get 'variant (opencode-mode-line-segments)))
+                         "Variant: provider default"))))
       ;; Unknown providers show their name.
       (let ((opencode-provider-icons nil))
         (should (string-suffix-p " OpenAI" (alist-get 'provider (opencode-mode-line-segments))))))))

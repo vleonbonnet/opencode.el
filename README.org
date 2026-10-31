@@ -9,7 +9,7 @@ This package started as [[https://codeberg.org/sczi/opencode.el][sczi's opencode
 
 - Emacs 31.1 with the =markdown= and =markdown-inline= tree-sitter grammars (=M-x markdown-ts-mode-install-parsers=, or set =opencode-ensure-grammar-function=).
 - [[https://github.com/alphapapa/plz.el][plz]] and [[https://github.com/magit/transient][transient]], and =curl= on the =PATH=.
-- OpenCode 2. The prompt-cache guard and stale-thinking consent need routes only [[https://github.com/vleonbonnet/opencode][my fork]] has; with stock OpenCode the guard switches itself off.
+- OpenCode 2. The prompt-cache guard, stale-thinking consent and prompt-cache expiries need routes only [[https://github.com/vleonbonnet/opencode][my fork]] has; with stock OpenCode the guard switches itself off and no expiry is known.
 
 * Installation
 
@@ -54,6 +54,8 @@ Messages that tell which command to run, such as "OpenCode question pending; C-'
 Emacs keeps the live state of the recent sessions and of every running one, whether or not they have a buffer, in the registry =opencode-state=: whether a turn runs, the retry it waits for, the permission requests and questions waiting on you, and how the last turn ended. It follows the service's events, and rebuilds itself from the service every time the event stream connects, whoever opened it; =opencode-state-ensure= opens the stream for it. =opencode-state-recent-limit= sets how many recent unarchived sessions it loads.
 
 A session's status, from =opencode-state-status=, is =waiting= while a request awaits you, =retrying= or =working= while a turn runs, =failed= or =done= when a turn ended that nobody viewed yet, and =idle= otherwise. =opencode-state-change-functions= run when a status changes and =opencode-state-updated-functions= when anything about a session does, for session lists, dashboards and mode lines of other packages. The session pickers show a session's title, project and status as the registry knows them when it holds the session, and otherwise as the session's last fetched info has them.
+
+With my fork, the registry also knows when each session's prompt cache runs out. =opencode-state-cache= returns the provider's cache entry that the session's next turn would reuse, as a plist: =:expires=, when it runs out, in float seconds since the epoch; =:ttl=, its retention window in seconds, which every response reusing it starts over; and =:tokens=, the prompt tokens it covers. =opencode-state-cache-remaining= gives the seconds left. The expiries are listed whenever the event stream connects and follow each provider response; nothing reports an entry running out, so callers count down themselves, and the registry lists them again once the earliest known one passes, as a longer-lived entry, such as a system prompt cached for an hour, may outlive the conversation's. =opencode-state-updated-functions= run for every session whose expiry changed, whether or not the registry holds it. With stock OpenCode, =opencode-state-cache-supported-p= returns nil and no expiry is known.
 
 Whether a finished turn was seen is the service's read marker, shared by every client. Showing a session's buffer in the selected window of a focused frame, or a turn ending while it is shown there, marks the session viewed (=opencode-session-view=), for the TUI and the desktop app too; a session viewed in another client is no longer done in Emacs either.
 
@@ -105,7 +107,7 @@ Images pasted with =yank-media= are attached to the next prompt.
 
 =M-x cd= in a session buffer moves the session to the chosen directory. The buffer's directory follows the server: it changes when the move takes effect, and stays at the last confirmed location while a request is pending or if it fails. Moves made by the agent or another client are reflected automatically, including after reconnecting.
 
-The mode line shows the session's status, title, agent, model, variant, provider and context use, fitted to the window. A model billed more past some context size, from its catalog pricing or =opencode-long-context-tiers=, is flagged as the context approaches it.
+The mode line shows the session's status, title, agent, model, variant, provider and context use, fitted to the window. A session that selected no variant shows, dimmed, the one its model runs with by default: =opencode-model-default-variant= finds the variant sending the reasoning effort that a request without one sends, from the provider and model catalogs, OpenCode's defaults for GPT-5 and the API's defaults for Claude (=opencode-anthropic-default-efforts=). =opencode-default-variant-function= can name another function, or none to show the provider's default as =default=. A model billed more past some context size, from its catalog pricing or =opencode-long-context-tiers=, is flagged as the context approaches it.
 
 * Permissions and questions
 
