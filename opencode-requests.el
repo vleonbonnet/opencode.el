@@ -29,6 +29,11 @@
 ;; request keeps its own progress, so deferring or suspending one never
 ;; blocks another.
 ;;
+;; `opencode-respond-session' with IN-PLACE answers a session's request
+;; from wherever the user is, such as a session list, without showing
+;; its buffer: the transient names the session and shows a file
+;; permission's change, and the scrolling keys scroll it.
+;;
 ;; A subagent asks in its own session, whose buffer opens in the
 ;; background, so its parent looks busy while it actually waits.  The
 ;; parent's block of a waiting subagent is marked the same way and its
@@ -55,6 +60,28 @@ the function it receives with no argument), tried in order.")
 (defvar-local opencode--pending-children nil
   "Child session IDs, oldest first, whose requests await the user.")
 
+(defvar opencode--answering-in-place nil
+  "Non-nil while a request is opened to be answered in place.
+Its transient then shows the session asking and the request's context,
+and leaves every window as it is: see `opencode-respond-session'.")
+
+(defvar opencode--permission-transient-state)
+(defvar opencode--active-form)
+
+(defconst opencode--transient-menu-variable
+  (if (boundp 'transient-show-menu) 'transient-show-menu 'transient-show-popup)
+  "Transient's option deciding when menus show, by its name in this version.")
+
+(defmacro opencode--with-transient-menu (show &rest body)
+  "Run BODY, the transients it sets up showing their menu at once if SHOW.
+A request answered in place has its context in its transient's menu,
+which a user delaying menus would otherwise not see."
+  (declare (indent 1) (debug t))
+  (let ((variables (make-symbol "variables")))
+    `(let ((,variables (and ,show (list opencode--transient-menu-variable))))
+       (cl-progv ,variables (and ,variables (list t))
+         ,@body))))
+
 (defun opencode-transient-displayed-p (prefix)
   "Return non-nil when transient PREFIX is on screen."
   (and (bound-and-true-p transient--prefix)
@@ -70,11 +97,27 @@ the function it receives with no argument), tried in order.")
     (transient-append-suffix prefix '(-1)
       `[:hide (lambda () t) ,@suffixes])))
 
+(defun opencode--transient-session-buffer ()
+  "Return the session buffer whose request the shown transient answers, or nil."
+  (pcase (and (bound-and-true-p transient--prefix) (oref transient--prefix command))
+    ('opencode-permission-transient (plist-get opencode--permission-transient-state :buffer))
+    ('opencode-question-transient (plist-get opencode--active-form :buffer))))
+
 (defun opencode--scroll-transient-session (command &optional arg)
-  "Run scroll COMMAND with ARG in the window the transient was called from."
-  (when (window-live-p transient--original-window)
-    (with-selected-window transient--original-window
-      (funcall command arg))))
+  "Run scroll COMMAND with ARG in a window showing the request's transcript.
+That is the window the transient was called from when it shows it, else
+another one.  Answered in place, the session may be shown nowhere: the
+transient's menu, which then holds the request's context, scrolls."
+  (let* ((buffer (opencode--transient-session-buffer))
+         (window (cond
+                  ((and (window-live-p transient--original-window)
+                        (eq (window-buffer transient--original-window) buffer))
+                   transient--original-window)
+                  ((and (buffer-live-p buffer) (get-buffer-window buffer)))
+                  ((window-live-p transient--window) transient--window))))
+    (when window
+      (with-selected-window window
+        (funcall command arg)))))
 
 (transient-define-suffix opencode-transient-scroll-down ()
   "Scroll the transcript down."
@@ -151,26 +194,65 @@ switch to the subagent's session and answer there."
         (cl-incf pending)
         (done)))))
 
-(defun opencode-respond-session (id &optional other-window)
+(defun opencode--request-session-heading ()
+  "Return the line naming this buffer's session, heading a request answered in place."
+  (concat (propertize (or (alist-get 'title opencode-session-info) opencode-session-id)
+                      'face 'bold)
+          (propertize (concat "  " (abbreviate-file-name default-directory)) 'face 'shadow)
+          "\n"))
+
+(defun opencode--respond-in-place ()
+  "Answer in place the request `opencode-respond' answers with point on none.
+Nothing is shown but the request's transient, which names the session;
+a subagent's request is answered in place too."
+  (let ((opencode--answering-in-place t))
+    (or (seq-some (lambda (provider)
+                    (let ((state (funcall provider)))
+                      (when (plist-get state :pending)
+                        (funcall (plist-get state :respond))
+                        t)))
+                  opencode-request-providers)
+        (when opencode--pending-children
+          (opencode-respond-session (car opencode--pending-children) nil t)
+          t)
+        (user-error "No pending OpenCode request"))))
+
+(defun opencode-respond-session (id &optional other-window in-place)
   "Show session ID's buffer, opening it if needed, and answer its request.
 OTHER-WINDOW shows it in another window.  The request answered is the
 one \\[opencode-respond] would answer there.  A buffer opened here
 first loads its transcript and the requests the session waits on, then
-is shown again and answers."
+is shown again and answers.
+
+IN-PLACE answers from the selected window instead, showing no session
+buffer: the request's transient names the session and holds what the
+request asks, its tool call's changes for a file permission.  The
+request answered is the one \\[opencode-respond] answers there with
+point on no request; a subagent's is answered in place too.  A buffer
+without the request yet, or none at all, is opened in the background,
+without display, and loads the session's requests first.  The answer
+goes to the session asking, whose buffer shows it answered as when
+answered there."
   (let ((buffer (gethash id opencode-session-buffers)))
-    (if (buffer-live-p buffer)
-        (with-current-buffer (opencode--display buffer nil other-window)
-          (opencode-respond))
-      (opencode-session-open-by-id
-       id :other-window other-window
-       :callback (lambda (_info)
-                   (opencode--sync-requests
-                    (lambda ()
+    (cl-flet ((answer ()
+                ;; From a callback, a signal would only print "error in process filter".
+                (condition-case err
+                    (if in-place
+                        (opencode--respond-in-place)
                       (with-current-buffer (opencode--display (current-buffer) nil other-window)
-                        ;; From a callback, a signal would only print "error in process filter".
-                        (condition-case err
-                            (opencode-respond)
-                          (user-error (message "%s" (error-message-string err))))))))))))
+                        (opencode-respond)))
+                  (user-error (message "%s" (error-message-string err))))))
+      (cond
+       ((not (buffer-live-p buffer))
+        (opencode-session-open-by-id
+         id :other-window other-window :no-display in-place
+         :callback (lambda (_info) (opencode--sync-requests #'answer))))
+       ((not in-place)
+        (with-current-buffer (opencode--display buffer nil other-window)
+          (opencode-respond)))
+       ((with-current-buffer buffer (opencode-pending-request-p))
+        (with-current-buffer buffer (opencode--respond-in-place)))
+       (t (with-current-buffer buffer (opencode--sync-requests #'answer)))))))
 
 ;;;; Sending while a request waits
 

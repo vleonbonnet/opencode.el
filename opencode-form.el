@@ -59,7 +59,9 @@ holds one saved selection (MARKED-VECTOR . CUSTOM-TEXT) per field.")
   "IDs of forms recently resolved, never to be queued again.")
 
 (defvar opencode--active-form nil
-  "Plist (:buffer :entry) of the form shown or suspended in the transient.")
+  "Plist (:buffer :entry :in-place) of the form shown or suspended in the transient.
+:in-place is non-nil when it is answered in place, see
+`opencode-respond-session'.")
 
 ;;;; Forms
 
@@ -344,8 +346,24 @@ shows typed answers in place of the option keys."
               (propertize "   M-p previous · M-n next" 'face 'shadow)
               "\n" (alist-get 'description field)))))
 
+(defun opencode--question-in-place-p ()
+  "Return non-nil when the active form is answered in place."
+  (and (plist-get opencode--active-form :in-place)
+       (buffer-live-p (plist-get opencode--active-form :buffer))))
+
+(defun opencode--question-shown-heading ()
+  "Return the transient heading of the active entry's current question.
+Answered in place, it names the session first."
+  (let ((entry (opencode--active-entry)))
+    (concat (when (opencode--question-in-place-p)
+              (with-current-buffer (plist-get opencode--active-form :buffer)
+                (opencode--request-session-heading)))
+            (opencode--question-heading
+             (nth (plist-get entry :index) (opencode-form-fields (plist-get entry :form)))))))
+
 (defun opencode--question-show ()
-  "Show the active entry's current question in the transient."
+  "Show the active entry's current question in the transient.
+Answered in place, its menu always shows, since it holds the question."
   (when-let* ((entry (opencode--active-entry)))
     (let* ((field (nth (plist-get entry :index) (opencode-form-fields (plist-get entry :form))))
            (options (alist-get 'options field))
@@ -357,10 +375,11 @@ shows typed answers in place of the option keys."
                                         (make-vector (length options) nil))
             opencode-question--custom-text (cdr saved)
             opencode-question--multiple (equal (alist-get 'type field) "multiselect")
-            opencode-question--heading (opencode--question-heading field)
+            opencode-question--heading (opencode--question-shown-heading)
             opencode-question--handled nil)
       (add-hook 'transient-exit-hook #'opencode--question-on-exit)
-      (call-interactively #'opencode-question-transient))))
+      (opencode--with-transient-menu (opencode--question-in-place-p)
+        (call-interactively #'opencode-question-transient)))))
 
 (defun opencode--question-gone-p ()
   "Return non-nil, saying so, when the question shown is no longer pending.
@@ -552,24 +571,30 @@ it does not count while the question transient is still shown."
 
 ;;;; Other forms
 
-(defun opencode--read-field (field)
-  "Read a value for FIELD of a form in the minibuffer, or nil to skip it."
+(defun opencode--read-field (field &optional session)
+  "Read a value for FIELD of a form in the minibuffer, or nil to skip it.
+SESSION, when given, names the session asking first in the prompt."
   (let-alist field
-    (let ((prompt (concat (or .title .description .key) ": ")))
+    (let ((prompt (concat (and session (concat session " · ")) (or .title .description .key) ": ")))
       (pcase .type
         ("string" (if .options
                       (completing-read prompt (opencode--field-options field) nil (not .custom) nil nil .default)
                     (read-string prompt .default)))
         ((or "number" "integer") (read-number prompt .default))
-        ("boolean" (if (y-or-n-p (concat (or .title .description .key) "? ")) t :false))
+        ("boolean" (if (y-or-n-p (concat (and session (concat session " · "))
+                                         (or .title .description .key) "? "))
+                       t :false))
         ("multiselect" (vconcat (completing-read-multiple prompt (opencode--field-options field))))
         ("external" (when (y-or-n-p (format "Open %s? " .url)) (browse-url .url)) nil)))))
 
 (defun opencode--answer-generic (entry)
-  "Answer form ENTRY field by field in the minibuffer."
-  (let ((answer nil))
+  "Answer form ENTRY field by field in the minibuffer.
+Answered in place, the prompts name the session asking."
+  (let ((answer nil)
+        (session (and opencode--answering-in-place
+                      (or (alist-get 'title opencode-session-info) opencode-session-id))))
     (dolist (field (opencode-form-fields (plist-get entry :form)))
-      (let ((value (opencode--read-field field)))
+      (let ((value (opencode--read-field field session)))
         (when value (push (cons (intern (alist-get 'key field)) value) answer))))
     (plist-put entry :submitted t)
     (opencode-request 'post (format "/api/session/%s/form/%s/reply" opencode-session-id (plist-get entry :id))
@@ -586,8 +611,11 @@ A question transient suspended from this buffer is resumed instead."
     (cond
      ((and entry (eq entry (opencode--active-entry))
            (opencode-transient-suspended-p 'opencode-question-transient))
+      (setq opencode--active-form (plist-put opencode--active-form :in-place opencode--answering-in-place)
+            opencode-question--heading (opencode--question-shown-heading))
       (add-hook 'transient-exit-hook #'opencode--question-on-exit)
-      (transient-resume))
+      (opencode--with-transient-menu opencode--answering-in-place
+        (transient-resume)))
      ((bound-and-true-p transient--prefix)
       (user-error "Finish or suspend the active transient first"))
      ((null entry) (user-error "No pending OpenCode question"))
@@ -596,7 +624,8 @@ A question transient suspended from this buffer is resumed instead."
      (t
       (when (opencode-transient-suspended-p 'opencode-question-transient)
         (pop transient--stack))
-      (setq opencode--active-form (list :buffer (current-buffer) :entry entry))
+      (setq opencode--active-form (list :buffer (current-buffer) :entry entry
+                                        :in-place opencode--answering-in-place))
       (opencode--question-show)))))
 
 (defun opencode--form-at-point ()

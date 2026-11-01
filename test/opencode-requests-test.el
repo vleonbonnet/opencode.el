@@ -410,6 +410,256 @@ directly, it is answered alike."
         (opencode-test-dispatch-until rest "permission.replied")
         (should-not (opencode-transient-displayed-p 'opencode-permission-transient))
         (should-not opencode--active-permission)))))
+;;;; Answering in place
+
+(defvar opencode-test-in-place-session nil
+  "Session whose request `opencode-test-list-respond' answers in place.")
+
+(transient-define-suffix opencode-test-list-respond ()
+  "Answer the request of `opencode-test-in-place-session' in place, as drover's list may."
+  (interactive)
+  (opencode-respond-session opencode-test-in-place-session nil t))
+
+(transient-define-prefix opencode-test-list-transient ()
+  "Stand for drover's menu over its session list."
+  [("A" "Answer" opencode-test-list-respond)])
+
+(defmacro opencode-test-in-place (session &rest body)
+  "Run BODY answering SESSION's requests in place from a list in the only window.
+The list's buffer stands for drover's; showing any buffer but a
+transient's menu fails, and so does showing a session buffer otherwise."
+  (declare (indent 1) (debug t))
+  `(let ((opencode-test-in-place-session ,session)
+         (list (get-buffer-create " *opencode-test-list*")))
+     (unwind-protect
+         (opencode-test-with-transients list
+           ,@body
+           (should (eq (window-buffer (frame-first-window)) list))
+           (should-not (seq-some (lambda (buffer) (get-buffer-window buffer t))
+                                 (hash-table-values opencode-session-buffers))))
+       (kill-buffer list))))
+
+(defun opencode-test-heading-line (heading)
+  "Return the first line of transient HEADING."
+  (car (split-string heading "\n")))
+
+(ert-deftest opencode-test-permission-in-place ()
+  "A permission is answered from a list, its transient naming the session, the session's buffer shown nowhere."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "permission"))
+           (buffer (opencode-test-open-empty id))
+           (title (opencode-test-session-title id)))
+      (opencode-test-dispatch-until (opencode-test-events id) "permission.asked")
+      (let ((permission (car (buffer-local-value 'opencode-pending-permissions buffer))))
+        (opencode-test-in-place id
+          ;; Menus delayed or off still show: the menu holds the request.
+          (cl-progv (list opencode--transient-menu-variable) (list nil)
+            (call-interactively #'opencode-test-list-transient)
+            (opencode-test-keys "A"))
+          (should (opencode-transient-displayed-p 'opencode-permission-transient))
+          (should (window-live-p transient--window))
+          (let ((heading (opencode--permission-description)))
+            (should (string-prefix-p title (opencode-test-heading-line heading)))
+            (should (string-match-p "Shell command: rm junk.txt" heading))
+            (should (string-match-p "rule \"rm \\*\" asks for" heading)))
+          (opencode-test-keys "o"))
+        (should (equal (car (opencode-test-requests-to
+                             'post (format "/api/session/%s/permission/%s/reply" id (plist-get permission :id))))
+                       '((decision . "once"))))
+        (with-current-buffer buffer
+          (should-not opencode-pending-permissions)
+          (should-not (plist-get (opencode-block-data (opencode--permission-block permission)) :waiting)))
+        (should-not opencode--active-permission)))))
+
+(ert-deftest opencode-test-permission-in-place-scrolls-menu ()
+  "Answered in place, the transcript keys scroll the menu, not the list they were called from."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "permission"))
+           (buffer (opencode-test-open-empty id))
+           (scrolled nil))
+      (opencode-test-dispatch-until (opencode-test-events id) "permission.asked")
+      (opencode-test-in-place id
+        (with-current-buffer buffer (opencode-respond-session id nil t))
+        (cl-letf (((symbol-function 'scroll-up-command)
+                   (lambda (&rest _) (push (selected-window) scrolled))))
+          (opencode-test-keys "C-v"))
+        (should (equal scrolled (list transient--window)))
+        (should (opencode-transient-displayed-p 'opencode-permission-transient)))
+      ;; Answered in its buffer, they scroll its transcript.
+      (setq scrolled nil)
+      (opencode-test-with-transients buffer
+        (with-current-buffer buffer (opencode-respond))
+        (cl-letf (((symbol-function 'scroll-up-command)
+                   (lambda (&rest _) (push (selected-window) scrolled))))
+          (opencode-test-keys "C-v"))
+        (should (equal scrolled (list (get-buffer-window buffer))))))))
+
+(ert-deftest opencode-test-form-in-place ()
+  "A form answered field by field in place names the session in its prompts."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "read-tools"))
+           (buffer (opencode-test-open-empty id))
+           (prompts nil))
+      (with-current-buffer buffer (opencode-form-queue (opencode-test-tool-form "call_none")))
+      (opencode-test-in-place id
+        (cl-letf (((symbol-function 'completing-read)
+                   (lambda (prompt &rest _) (push prompt prompts) "Allow search via Exa")))
+          (opencode-respond-session id nil t)))
+      (should (equal prompts (list (concat (opencode-test-session-title id)
+                                           " · Allow OpenCode to search the web for up-to-date information?: "))))
+      (should (equal (car (opencode-test-requests-to 'post "/form/frm_websearch/reply"))
+                     '((answer (choice . "Allow search via Exa"))))))))
+
+(defun opencode-test-edit-permission (session message call)
+  "Dispatch an edit CALL of assistant MESSAGE in SESSION asking a permission; return the request's ID."
+  (let ((base `((sessionID . ,session) (assistantMessageID . ,message) (id . ,call))))
+    (opencode-test-dispatch
+     `(((type . "session.step.started") (data (sessionID . ,session) (assistantMessageID . ,message)))
+       ((type . "session.tool.input.started") (data ,@base (name . "edit")))
+       ((type . "session.tool.called")
+        (data ,@base (input (path . "notes.txt") (oldString . "alpha\nbeta\ngamma")
+                            (newString . "alpha\nBETA\ngamma\ndelta"))))
+       ((type . "permission.asked")
+        (data (id . ,(concat "per_" call)) (sessionID . ,session) (action . "edit")
+              (resources "notes.txt") (save "*")
+              (source (type . "tool") (messageID . ,message) (id . ,call))))))
+    (concat "per_" call)))
+
+(ert-deftest opencode-test-permission-in-place-shows-change ()
+  "Answered in place, a file permission shows the change asked for, cut to the preview's lines."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "text"))
+           (buffer (opencode-test-open-empty id)))
+      (opencode-test-edit-permission id "msg_test_edit" "call_test_edit")
+      (opencode-test-in-place id
+        (opencode-respond-session id nil t)
+        (let* ((heading (opencode--permission-description))
+               (removed (string-search "-beta" heading))
+               (added (string-search "+BETA" heading)))
+          (should (string-match-p "^Edit notes.txt$" heading))
+          (should (and removed added (< removed added)))
+          (should (string-search "+delta" heading))
+          (should (eq (get-text-property removed 'face heading) 'diff-removed))
+          (should (eq (get-text-property added 'face heading) 'diff-added)))
+        (opencode-test-keys "n"))
+      (should (equal (car (opencode-test-requests-to 'post "/permission/per_call_test_edit/reply"))
+                     '((decision . "reject"))))
+      (with-current-buffer buffer (should-not opencode-pending-permissions))
+      (opencode-test-edit-permission id "msg_test_edit_2" "call_test_edit_2")
+      (opencode-test-in-place id
+        (let ((opencode-request-preview-lines 2))
+          (opencode-respond-session id nil t))
+        (should (string-suffix-p "\n\n  @@ -1,3 +1,4 @@\n   alpha\n  … 4 more lines"
+                                 (opencode--permission-description)))
+        (opencode-test-keys "o"))
+      ;; Answered in its buffer, the transcript shows the change instead.
+      (opencode-test-edit-permission id "msg_test_edit_3" "call_test_edit_3")
+      (opencode-test-with-transients buffer
+        (with-current-buffer buffer (opencode-respond))
+        (should (equal (opencode--permission-description) "Edit notes.txt"))))))
+
+(ert-deftest opencode-test-question-in-place ()
+  "Questions are answered from a list to the last one, each naming the session, its buffer shown nowhere."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "question"))
+           (buffer (opencode-test-open-empty id))
+           (title (opencode-test-session-title id)))
+      (with-current-buffer buffer (opencode-form-queue (opencode-test-five-questions id)))
+      (opencode-test-in-place id
+        (call-interactively #'opencode-test-list-transient)
+        (opencode-test-keys "A")
+        (should (opencode-transient-displayed-p 'opencode-question-transient))
+        (dolist (keys '("2" "4" "1 3 C-c C-c" "! m i n e RET"))
+          (should (string-prefix-p title (opencode-test-heading-line opencode-question--heading)))
+          (opencode-test-keys keys))
+        (should (string-suffix-p "Question 4?" opencode-question--heading))
+        (opencode-test-keys "3"))
+      (should (equal (car (opencode-test-requests-to 'post "/form/frm_five/reply"))
+                     '((answer (q0 . "v01") (q1 . "v13") (q2 . ["v20" "v22"]) (q3 . "mine") (q4 . "v42")))))
+      (with-current-buffer buffer (should-not opencode-pending-forms))
+      (should-not opencode--active-form))))
+
+(ert-deftest opencode-test-question-resumed-in-place ()
+  "A question suspended in its buffer is resumed in place, then named by its session."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "question"))
+           (buffer (opencode-test-open-empty id))
+           (title (opencode-test-session-title id)))
+      (with-current-buffer buffer (opencode-form-queue (opencode-test-five-questions id)))
+      (opencode-test-with-transients buffer
+        (with-current-buffer buffer (opencode-respond))
+        (should-not (string-prefix-p title opencode-question--heading))
+        (opencode-test-keys "C-z")
+        (should (opencode-transient-suspended-p 'opencode-question-transient)))
+      (opencode-test-in-place id
+        (opencode-respond-session id nil t)
+        (should (opencode-transient-displayed-p 'opencode-question-transient))
+        (should (string-prefix-p title opencode-question--heading))
+        (opencode-test-keys "1")
+        (should (= (plist-get (opencode--active-entry) :index) 1))))))
+
+(ert-deftest opencode-test-in-place-opens-in-background ()
+  "A session without a buffer gets one in the background, loads its request, and is answered in place."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "text"))
+           (permission `((id . "per_test_background") (sessionID . ,id) (action . "shell")
+                         (resources "make check") (save "make *")))
+           (opencode-test-routes
+            (cons (list 'get "/permission\\'" (lambda (_) `((data ,permission)))) opencode-test-routes)))
+      (opencode-test-in-place id
+        (opencode-respond-session id nil t)
+        (should (buffer-live-p (gethash id opencode-session-buffers)))
+        (should (opencode-transient-displayed-p 'opencode-permission-transient))
+        (should (string-match-p "Shell command: make check" (opencode--permission-description)))
+        (opencode-test-keys "a"))
+      (should (equal (car (opencode-test-requests-to 'post "/permission/per_test_background/reply"))
+                     '((decision . "always"))))
+      (with-current-buffer (gethash id opencode-session-buffers)
+        (should-not opencode-pending-permissions)))))
+
+(ert-deftest opencode-test-in-place-loads-request ()
+  "A buffer not knowing the session's request yet loads it, then answers it in place."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "text"))
+           (buffer (opencode-test-open-empty id))
+           (permission `((id . "per_test_late") (sessionID . ,id) (action . "shell")
+                         (resources "make check") (save "make *"))))
+      (with-current-buffer buffer (should-not (opencode-pending-request-p)))
+      (let ((opencode-test-routes
+             (cons (list 'get "/permission\\'" (lambda (_) `((data ,permission)))) opencode-test-routes)))
+        (opencode-test-in-place id
+          (opencode-respond-session id nil t)
+          (should (opencode-transient-displayed-p 'opencode-permission-transient))
+          (opencode-test-keys "o")))
+      (should (opencode-test-requests-to 'post "/permission/per_test_late/reply"))
+      (with-current-buffer buffer (should-not opencode-pending-permissions)))))
+
+(ert-deftest opencode-test-subagent-in-place ()
+  "Answered in place, a parent waiting only on its subagent answers the subagent's request, showing neither."
+  (opencode-test-with-server
+    (let* ((parent (opencode-test-scenario "subagent"))
+           (child (opencode-test-scenario "subagent-child")))
+      (opencode-test-open-empty parent)
+      (opencode-test-dispatch-until
+       (seq-filter (lambda (event)
+                     (member (or (alist-get 'sessionID (alist-get 'data event))
+                                 (alist-get 'sessionID (alist-get 'form (alist-get 'data event))))
+                             (list parent child)))
+                   (opencode-test-events))
+       "permission.asked")
+      (opencode--flush-sync)
+      (let* ((child-buffer (gethash child opencode-session-buffers))
+             (permission (car (buffer-local-value 'opencode-pending-permissions child-buffer))))
+        (opencode-test-in-place parent
+          (opencode-respond-session parent nil t)
+          (should (eq (plist-get opencode--permission-transient-state :buffer) child-buffer))
+          (should (string-prefix-p (opencode-test-session-title child)
+                                   (opencode-test-heading-line (opencode--permission-description))))
+          (opencode-test-keys "o"))
+        (should (opencode-test-requests-to
+                 'post (format "/api/session/%s/permission/%s/reply" child (plist-get permission :id))))
+        (with-current-buffer child-buffer (should-not opencode-pending-permissions))))))
+
 ;;;; Sending while a request waits
 
 (defvar opencode-test-choices nil
