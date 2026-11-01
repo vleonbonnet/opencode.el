@@ -429,13 +429,19 @@ labelled \"as text\" when its text replaces it, \"dropped\" otherwise."
 
 ;;;; Insertion and update
 
+(defun opencode--summary-text (summary)
+  "Return SUMMARY marked as a block summary's text.
+It shows verbatim, and the URLs in it are not links: a summary is cut to
+fit, and its keys expand or collapse the block."
+  (propertize (opencode-fontify-as summary 'verbatim) 'opencode-no-links t))
+
 (defun opencode-insert-collapsed (summary face data)
   "Write SUMMARY as a collapsed block line with a FACE margin and return its overlay.
 DATA, a plist, is kept on the overlay for expansion.  The margin lives on
 this overlay: its end marker sits after the trailing newline and follows
 every summary replacement."
   (let ((start (opencode-pmark)))
-    (opencode-output (opencode-fontify-as (concat summary "\n") 'verbatim))
+    (opencode-output (opencode--summary-text (concat summary "\n")))
     (let ((overlay (make-overlay start (opencode-pmark) nil t nil))
           (margin (opencode-margin face)))
       (overlay-put overlay 'opencode-collapsible t)
@@ -465,7 +471,7 @@ in another color."
           (save-excursion
             (goto-char start)
             (delete-region start (1- end))
-            (insert (opencode-fontify-as summary 'verbatim))
+            (insert (opencode--summary-text summary))
             (move-overlay overlay start (1+ (point))))
         (overlay-put overlay 'front-advance t))
       (overlay-put overlay 'opencode-summary summary)
@@ -546,13 +552,15 @@ in another color."
           (insert new "\n")
           (with-temp-buffer
             (diff-no-select old-buffer new-buffer nil t (current-buffer))
-            (goto-char (point-min))
-            (forward-line 3)
-            (delete-region (point-min) (point))
-            (goto-char (point-max))
-            (forward-line -2)
-            (delete-region (point) (point-max))
-            (buffer-string)))))))
+            ;; The diff buffer is read-only, in Diff mode.
+            (let ((inhibit-read-only t))
+              (goto-char (point-min))
+              (forward-line 3)
+              (delete-region (point-min) (point))
+              (goto-char (point-max))
+              (forward-line -2)
+              (delete-region (point) (point-max))
+              (buffer-string))))))))
 
 (defun opencode--format-patch (patch-text)
   "Return PATCH-TEXT with file names relative to the project, for display."

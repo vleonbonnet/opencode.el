@@ -775,6 +775,7 @@ Input still being typed is lifted out and put back afterwards."
              (opencode-set-last-response-start (opencode-pmark))
              (setq opencode--table-scan-marker (copy-marker (opencode-pmark)))
              (opencode--output-message text id)
+             (opencode-buttonize-output-end)
              (opencode-align-finished-tables t)))
          (cl-incf text-ordinal))
         ("reasoning"
@@ -783,7 +784,8 @@ Input still being typed is lifted out and put back afterwards."
                (key (opencode-reasoning-key id reasoning-ordinal)))
            (if (opencode-narration-p text native)
                (progn (opencode-open-block 'text)
-                      (opencode--output-message (string-trim text) id))
+                      (opencode--output-message (string-trim text) id)
+                      (opencode-buttonize-output-end))
              (when (or (not (string-empty-p (or text "")))
                        (opencode-reasoning-hidden-kind text native))
                (opencode-open-block 'reasoning)
@@ -1023,6 +1025,7 @@ error face unless the job completed; any other message is a notice."
         (opencode--text-append data (substring full (length shown))))
        (t (message "OpenCode: streamed text diverged from the final text; reloading")
           (opencode-session-reload)))
+      (opencode-buttonize-output-end)
       (opencode-align-finished-tables t))))
 
 (defvar-local opencode--reasoning-native nil

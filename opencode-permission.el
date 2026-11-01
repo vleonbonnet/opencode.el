@@ -376,7 +376,10 @@ The transient shows the full command, so the block stays collapsed."
 ;;;; Transient
 
 (defvar opencode--permission-transient-state nil
-  "Plist (:buffer :permission) the permission transient acts on.")
+  "Plist (:buffer :permission :in-place :preview) the permission transient acts on.
+:in-place is non-nil when it is answered in place, see
+`opencode-respond-session', and :preview is then the change the
+request's tool call would make, if any.")
 
 (defun opencode--permission-transient-act (function &rest arguments)
   "Call FUNCTION with the transient's permission and ARGUMENTS in its buffer."
@@ -433,11 +436,66 @@ The transient shows the full command, so the block stays collapsed."
     (let ((agent (completing-read (format-prompt "Hand off to" (car names)) names nil t nil nil (car names))))
       (opencode--permission-transient-act #'opencode-permission-hand-off agent))))
 
+(defcustom opencode-request-preview-lines 20
+  "Lines of a tool call's changes shown when answering its permission in place.
+Answered in place (see `opencode-respond-session'), a permission to edit,
+patch or write a file shows the diff or the content its tool call
+would write, cut to this many lines; nil shows all of it."
+  :type '(choice (const :tag "All" nil) natnum)
+  :group 'opencode)
+
+(defun opencode--preview-lines (text diff)
+  "Return TEXT indented and cut to `opencode-request-preview-lines' lines.
+DIFF colors its lines as a diff's."
+  (let* ((lines (split-string (string-trim-right text) "\n"))
+         (shown (if opencode-request-preview-lines (seq-take lines opencode-request-preview-lines) lines))
+         (rest (- (length lines) (length shown))))
+    (concat
+     (mapconcat (lambda (line)
+                  (concat "  " (if diff
+                                   (propertize line 'face
+                                               (cond ((string-prefix-p "@@" line) 'diff-hunk-header)
+                                                     ((string-prefix-p "***" line) 'diff-file-header)
+                                                     ((string-prefix-p "+" line) 'diff-added)
+                                                     ((string-prefix-p "-" line) 'diff-removed)
+                                                     (t 'diff-context)))
+                                 line)))
+                shown "\n")
+     (when (> rest 0)
+       (propertize (format "\n  … %d more line%s" rest (if (= rest 1) "" "s")) 'face 'shadow)))))
+
+(defun opencode--permission-preview (permission)
+  "Return what PERMISSION's tool call would change, or nil.
+The title names the file an edit, patch or write changes, not the
+change, which its block shows in the transcript: answered in place,
+the transient shows it instead."
+  (when-let* ((overlay (opencode--permission-block permission))
+              (data (opencode-block-data overlay))
+              (input (plist-get data :input)))
+    (let* ((tool (plist-get data :tool))
+           (text (let-alist input
+                   (pcase tool
+                     ("edit" (opencode--format-edit-diff (or .oldString "") (or .newString "")))
+                     ("patch" (opencode--format-patch (or .patchText "")))
+                     ("write" .content)))))
+      (when (and (stringp text) (not (string-blank-p text)))
+        (opencode--preview-lines text (not (equal tool "write")))))))
+
 (defun opencode--permission-description ()
-  "Return the heading of the permission transient."
-  (let ((permission (plist-get opencode--permission-transient-state :permission)))
-    (concat (or (plist-get permission :detail) (plist-get permission :title) "Permission")
-            (opencode-permission-reasons-text (plist-get permission :reasons)))))
+  "Return the heading of the permission transient.
+Answered in place, it names the session first and shows the change
+asked for last."
+  (let* ((state opencode--permission-transient-state)
+         (permission (plist-get state :permission))
+         (buffer (plist-get state :buffer))
+         (in-place (and (plist-get state :in-place) (buffer-live-p buffer))))
+    (concat (when in-place
+              (with-current-buffer buffer (opencode--request-session-heading)))
+            (or (plist-get permission :detail) (plist-get permission :title) "Permission")
+            (opencode-permission-reasons-text (plist-get permission :reasons))
+            (when-let* ((in-place)
+                        (preview (plist-get state :preview)))
+              (concat "\n\n" preview)))))
 
 (transient-define-prefix opencode-permission-transient ()
   "Answer an OpenCode permission request."
@@ -474,26 +532,38 @@ drover's menu, comes once this one is shown, and does not count."
 
 (defun opencode-respond-permission (&optional permission)
   "Open the transient of PERMISSION, else the oldest pending one.
-A transient suspended from this buffer is resumed instead."
+A transient suspended from this buffer is resumed instead.  Opened in
+place (see `opencode-respond-session'), it always shows its menu,
+which holds the request's context."
   (interactive)
-  (cond
-   ((and (opencode-transient-suspended-p 'opencode-permission-transient)
-         (eq (plist-get opencode--active-permission :buffer) (current-buffer))
-         (or (null permission)
-             (equal (plist-get permission :id) (plist-get opencode--active-permission :id))))
-    (add-hook 'transient-exit-hook #'opencode--permission-on-exit)
-    (transient-resume))
-   ((bound-and-true-p transient--prefix)
-    (user-error "Finish or suspend the active transient first"))
-   (t
-    (let ((permission (or permission (car opencode-pending-permissions)
-                          (user-error "No pending OpenCode permission"))))
-      (when (opencode-transient-suspended-p 'opencode-permission-transient)
-        (pop transient--stack))
-      (setq opencode--active-permission (list :buffer (current-buffer) :id (plist-get permission :id))
-            opencode--permission-transient-state (list :buffer (current-buffer) :permission permission))
+  (opencode--with-transient-menu opencode--answering-in-place
+    (cond
+     ((and (opencode-transient-suspended-p 'opencode-permission-transient)
+           (eq (plist-get opencode--active-permission :buffer) (current-buffer))
+           (or (null permission)
+               (equal (plist-get permission :id) (plist-get opencode--active-permission :id))))
+      (setq opencode--permission-transient-state
+            (plist-put (plist-put opencode--permission-transient-state :in-place opencode--answering-in-place)
+                       :preview (and opencode--answering-in-place
+                                     (opencode--permission-preview
+                                      (plist-get opencode--permission-transient-state :permission)))))
       (add-hook 'transient-exit-hook #'opencode--permission-on-exit)
-      (call-interactively #'opencode-permission-transient)))))
+      (transient-resume))
+     ((bound-and-true-p transient--prefix)
+      (user-error "Finish or suspend the active transient first"))
+     (t
+      (let ((permission (or permission (car opencode-pending-permissions)
+                            (user-error "No pending OpenCode permission"))))
+        (when (opencode-transient-suspended-p 'opencode-permission-transient)
+          (pop transient--stack))
+        (setq opencode--active-permission (list :buffer (current-buffer) :id (plist-get permission :id))
+              opencode--permission-transient-state
+              (list :buffer (current-buffer) :permission permission
+                    :in-place opencode--answering-in-place
+                    ;; Once: the menu's heading is drawn again after every key.
+                    :preview (and opencode--answering-in-place (opencode--permission-preview permission))))
+        (add-hook 'transient-exit-hook #'opencode--permission-on-exit)
+        (call-interactively #'opencode-permission-transient))))))
 
 (defun opencode--permission-at-point ()
   "Return the queued permission of the tool block at point, if any."

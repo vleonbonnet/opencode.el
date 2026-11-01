@@ -761,5 +761,11 @@ an agent of mode `all'."
   (dolist (entry opencode-provider-icons)
     (should (= (length (cdr entry)) 1))))
 
+(ert-deftest opencode-test-edit-call-shows-diff ()
+  "An edit call displays the diff from its old text to its new one."
+  (should (equal (opencode-format-tool-call "edit" '((path . "notes.txt") (oldString . "a\nb") (newString . "a\nc")))
+                 (concat "edit notes.txt:\n"
+                         (opencode-fenced-block "@@ -1,2 +1,2 @@\n a\n-b\n+c\n" "diff")))))
+
 (provide 'opencode-session-test)
 ;;; opencode-session-test.el ends here
