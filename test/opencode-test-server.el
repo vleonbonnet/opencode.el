@@ -12,9 +12,11 @@
 ;; `opencode-test-with-service' runs a local HTTP server standing for the
 ;; OpenCode service, registered in a temporary service.json, so requests
 ;; go through curl and plz as they do against the real service.  Routes
-;; answer JSON, `/api/info' reports the registered process ID, and
-;; `/api/event' keeps its connection open for `opencode-test-send-event'.
-;; It listens on IPv4 only: Winsock's IPv6 loopback is unreliable here.
+;; answer JSON, or a string as it is, or never when they answer `hang';
+;; `/api/info' reports the registered process ID, and `/api/event' keeps
+;; its connection open for `opencode-test-send-event'.  The CLI is
+;; stood for by `opencode-test-with-cli'.  The server listens on IPv4
+;; only: Winsock's IPv6 loopback is unreliable here.
 
 ;;; Code:
 
@@ -22,7 +24,7 @@
 
 (cl-defstruct (opencode-test-service (:constructor opencode-test-service--make))
   server port password (pid 4242) registration
-  (info-status 200) routes requests streams)
+  (info-status 200) routes requests streams held)
 
 (defvar opencode-test-service nil
   "The fake service of the running test.")
@@ -83,7 +85,10 @@
                              (opencode-test-service-routes service))))
         (if route
             (pcase-let ((`(,status . ,body) (funcall (cdr route) request)))
-              (opencode-test--respond connection status (json-serialize body)))
+              (if (eq status 'hang)
+                  (push connection (opencode-test-service-held opencode-test-service))
+                (opencode-test--respond connection status
+                                        (if (stringp body) body (json-serialize body)))))
           (opencode-test--respond connection 404 "{\"message\":\"Not found\"}")))))))
 
 (defun opencode-test--filter (service connection output)
@@ -125,6 +130,50 @@
     (when (process-live-p stream) (delete-process stream)))
   (setf (opencode-test-service-streams opencode-test-service) nil))
 
+(defun opencode-test-lose-streams ()
+  "Close every open event stream without Emacs noticing.
+That leaves the stream wanted, closed and with no reconnection pending,
+which nothing should cause but which an unnoticed death of its curl
+process did."
+  (cl-letf (((symbol-function 'opencode-events--closed) #'ignore))
+    (opencode-test-close-streams)
+    (opencode-test-wait-for (lambda () (not (opencode-events-connected-p))))
+    ;; The end of the request is reported from a timer.
+    (accept-process-output nil 0.2))
+  (should opencode-events--wanted)
+  (should-not (timerp opencode-events--reconnect-timer)))
+
+(defun opencode-test-request-buffers ()
+  "Return the live buffers of curl processes `plz' started, and of their error output."
+  (seq-filter (lambda (buffer) (string-prefix-p " *plz-request-curl" (buffer-name buffer)))
+              (buffer-list)))
+
+(defun opencode-test-restart-service (password)
+  "Make the fake service a new process, registered with PASSWORD."
+  (opencode-test-close-streams)
+  (setf (opencode-test-service-pid opencode-test-service)
+        (1+ (opencode-test-service-pid opencode-test-service)))
+  (opencode-test-service-register opencode-test-service password))
+
+(defmacro opencode-test-with-cli (handler &rest body)
+  "Run BODY with HANDLER standing for the OpenCode CLI.
+HANDLER is called with the CLI's arguments and a function of an exit
+status and optional output that ends the stand-in, which counts as the
+running CLI process until then."
+  (declare (indent 1) (debug t))
+  `(cl-letf (((symbol-function 'opencode-service--run-cli)
+              (lambda (arguments on-exit)
+                (let ((process (make-pipe-process :name "opencode-test-cli" :noquery t)))
+                  (setq opencode-service--starter process)
+                  (funcall ,handler arguments
+                           (lambda (status &optional output)
+                             (delete-process process)
+                             (when (eq opencode-service--starter process)
+                               (setq opencode-service--starter nil))
+                             (funcall on-exit status (or output ""))))
+                  process))))
+     ,@body))
+
 (defun opencode-test-wait-for (predicate &optional timeout)
   "Process input until PREDICATE returns non-nil, or fail after TIMEOUT seconds."
   (let ((deadline (+ (float-time) (or timeout 10)))
@@ -163,12 +212,15 @@ accepting after a few connections, so one server serves the whole run.")
           (opencode-service-connection nil)
           (opencode-service--waiters nil)
           (opencode-service--starter nil)
+          (opencode-service--lookup 0)
           (opencode-service--import-checked nil)
           (opencode-command "opencode-test-missing-cli")
           (opencode-events--handlers (copy-hash-table opencode-events--handlers))
           (opencode-events--process nil)
           (opencode-events--wanted nil)
           (opencode-events--closed-for-stop nil)
+          (opencode-events--opening nil)
+          (opencode-events--connection nil)
           (opencode-events--backoff 1)
           (opencode-events--reconnect-timer nil)
           (opencode-events--watchdog nil)
@@ -177,8 +229,9 @@ accepting after a few connections, so one server serves the whole run.")
      (opencode-test-service-register opencode-test-service)
      (unwind-protect (opencode-test-with-state ,@body)
        (opencode-disconnect)
-       (dolist (stream (opencode-test-service-streams opencode-test-service))
-         (when (process-live-p stream) (delete-process stream)))
+       (dolist (connection (append (opencode-test-service-streams opencode-test-service)
+                                   (opencode-test-service-held opencode-test-service)))
+         (when (process-live-p connection) (delete-process connection)))
        ;; Requests still in flight, such as those a reconnection sends,
        ;; would otherwise report their outcome during a later test.
        (let ((deadline (+ (float-time) 5)))

@@ -31,6 +31,13 @@
 ;; dispatches them in time-bounded batches.  The scan resumes where the
 ;; previous chunk ended, so a multi-megabyte frame costs linear time.
 ;;
+;; A wanted stream comes back however it ends: after a backoff when it
+;; drops, at once when a service is ready for Emacs again or a prompt is
+;; sent, and from the heartbeat watchdog when it was left closed with
+;; nothing reopening it.  `opencode-disconnect' alone keeps it closed;
+;; after `opencode-service-stop', it reopens only for the clients of
+;; `opencode-events-wanted-functions', once something starts a service.
+;;
 ;; Modules register handlers per event type with `opencode-events-register'.
 
 ;;; Code:
@@ -64,6 +71,18 @@
 
 (defvar opencode-events--closed-for-stop nil
   "Non-nil when `opencode-service-stop' closed the stream, until it reopens.")
+
+(defvar opencode-events--opening nil
+  "Non-nil while the stream waits for a ready service to open on.
+It is the handle of that wait, for `opencode-service-cancel'.")
+
+(defvar opencode-events--connection nil
+  "Connection of the service the stream was last opened on.")
+
+(defvar opencode-events-wanted-functions nil
+  "Functions, called without argument, telling whether something needs the stream.
+After `opencode-service-stop', a service answering again reopens the
+stream only when one of them returns non-nil.")
 
 (defvar opencode-events--backoff 1
   "Seconds before the next reconnection attempt.")
@@ -217,6 +236,11 @@ FUNCTION receives the event alist with members `type', `data', `id',
 
 ;;;; Lifecycle
 
+(defun opencode-events--wants-p ()
+  "Return non-nil when something needs the event stream.
+That is a client of `opencode-events-wanted-functions'."
+  (run-hook-with-args-until-success 'opencode-events-wanted-functions))
+
 (defun opencode-events--schedule-reconnect ()
   "Reopen the stream after the current backoff, while it is still wanted."
   (when (and opencode-events--wanted (not (timerp opencode-events--reconnect-timer)))
@@ -233,52 +257,98 @@ FUNCTION receives the event alist with members `type', `data', `id',
     (setq opencode-events--process nil)
     (opencode-events--schedule-reconnect)))
 
-(defun opencode-events--watch ()
-  "Reopen a stream that stopped producing heartbeats."
-  (when (and (opencode-events-connected-p)
-             (> (- (float-time) opencode-events--last-output)
-                opencode-events-heartbeat-timeout))
-    (let ((process opencode-events--process))
-      (setq opencode-events--process nil)
-      (delete-process process)
-      (opencode-events--schedule-reconnect))))
+(defun opencode-events--drop ()
+  "Close the stream, without reopening it."
+  (when-let* ((process opencode-events--process))
+    (setq opencode-events--process nil)
+    (when (process-live-p process)
+      (delete-process process))))
 
-(defun opencode-events--open ()
-  "Open the event stream on a ready service."
+(defun opencode-events--watch ()
+  "Reopen a stream that stopped producing heartbeats, or one left closed.
+Nothing should leave a wanted stream closed with no reconnection
+scheduled or waiting for a service, but if anything does, this
+reopens it rather than leave session buffers stale."
+  (cond
+   ((opencode-events-connected-p)
+    (when (> (- (float-time) opencode-events--last-output)
+             opencode-events-heartbeat-timeout)
+      (opencode-events--drop)
+      (opencode-events--schedule-reconnect)))
+   ((and opencode-events--wanted
+         (not opencode-events--opening)
+         (not (timerp opencode-events--reconnect-timer)))
+    (opencode-events--schedule-reconnect))))
+
+(defun opencode-events--start (connection)
+  "Open the stream on CONNECTION's service, unless it is open or unwanted."
   (when (and opencode-events--wanted (not (opencode-events-connected-p)))
-    (opencode-service-ensure
-     (lambda (connection)
-       (when (and opencode-events--wanted (not (opencode-events-connected-p)))
-         (setq opencode-events--last-output (float-time))
-         (let (process
-               ;; curl buffers piped output, and decompression holds frames back.
-               (plz-curl-default-args '("--silent" "--no-buffer" "--location")))
-           (setq process
-                 (plz 'get (concat (plist-get connection :url) "/api/event")
-                   :headers `(("Authorization" . ,(opencode-service-authorization connection))
-                              ("Accept" . "text/event-stream"))
-                   :as 'string :noquery t
-                   :filter #'opencode-events--filter
-                   :then (lambda (_) (opencode-events--closed process))
-                   :else (lambda (error)
-                           (when (and (plz-error-response error)
-                                      (eql 401 (plz-response-status (plz-error-response error))))
-                             (setq opencode-service-connection nil))
-                           (opencode-events--closed process))))
-           (setq opencode-events--process process))))
-     (lambda (message)
-       (message "OpenCode: %s" message)
+    (when (timerp opencode-events--reconnect-timer)
+      (cancel-timer opencode-events--reconnect-timer)
+      (setq opencode-events--reconnect-timer nil))
+    (setq opencode-events--last-output (float-time))
+    (condition-case err
+        (let (process
+              ;; curl buffers piped output, and decompression holds frames back.
+              (plz-curl-default-args '("--silent" "--no-buffer" "--location")))
+          (setq process
+                (opencode-plz 'get (concat (plist-get connection :url) "/api/event")
+                  :headers `(("Authorization" . ,(opencode-service-authorization connection))
+                             ("Accept" . "text/event-stream"))
+                  :as 'string :noquery t
+                  :filter #'opencode-events--filter
+                  :then (lambda (_) (opencode-events--closed process))
+                  :else (lambda (error)
+                          (when (and (plz-error-response error)
+                                     (eql 401 (plz-response-status (plz-error-response error))))
+                            (setq opencode-service-connection nil))
+                          (opencode-events--closed process))))
+          (setq opencode-events--process process
+                opencode-events--connection connection))
+      (error
+       (message "OpenCode: cannot open the event stream: %s" (error-message-string err))
        (opencode-events--schedule-reconnect)))))
 
-(defun opencode-events-connect (&optional callback)
-  "Open the event stream, then call CALLBACK with the service connection."
+(defun opencode-events--open ()
+  "Open the event stream on a ready service, starting one if needed."
+  (when (and opencode-events--wanted
+             (not (opencode-events-connected-p))
+             (not opencode-events--opening))
+    (setq opencode-events--opening t)
+    (let ((handle (opencode-service-ensure
+                   (lambda (connection)
+                     (setq opencode-events--opening nil)
+                     (opencode-events--start connection))
+                   (lambda (message)
+                     (setq opencode-events--opening nil)
+                     (message "OpenCode: %s" message)
+                     (opencode-events--schedule-reconnect)))))
+      ;; Unless it settled already.
+      (when opencode-events--opening
+        (setq opencode-events--opening handle)))))
+
+(defun opencode-events--want ()
+  "Note that Emacs wants the stream, and watch its heartbeats."
   (setq opencode-events--wanted t
         opencode-events--closed-for-stop nil)
   (unless (timerp opencode-events--watchdog)
-    (setq opencode-events--watchdog (run-at-time 15 15 #'opencode-events--watch)))
+    (setq opencode-events--watchdog (run-at-time 15 15 #'opencode-events--watch))))
+
+(defun opencode-events-connect (&optional callback)
+  "Open the event stream, then call CALLBACK with the service connection."
+  (opencode-events--want)
   (opencode-events--open)
   (when callback
     (opencode-service-ensure callback (lambda (message) (opencode-report-error message)))))
+
+(defun opencode-events-reopen ()
+  "Reopen the event stream at once when Emacs wants it and it is closed.
+A reconnection waiting for its backoff is made now.  Actions whose
+outcome only the stream reports, such as sending a prompt, call this,
+so that it shows even when the stream was lost.  A stream closed by
+`opencode-disconnect' or `opencode-service-stop' stays closed."
+  (when (and opencode-events--wanted (not (opencode-events-connected-p)))
+    (opencode-events--open)))
 
 (defun opencode-disconnect ()
   "Close the event stream.  The shared service keeps running."
@@ -288,25 +358,28 @@ FUNCTION receives the event alist with members `type', `data', `id',
   (dolist (timer (list opencode-events--reconnect-timer opencode-events--watchdog))
     (when (timerp timer) (cancel-timer timer)))
   (setq opencode-events--reconnect-timer nil
-        opencode-events--watchdog nil)
-  (when (process-live-p opencode-events--process)
-    (let ((process opencode-events--process))
-      (setq opencode-events--process nil)
-      (delete-process process)))
+        opencode-events--watchdog nil
+        opencode-events--connection nil)
+  ;; Its wait for a service would otherwise start one again after a stop.
+  (when (consp opencode-events--opening)
+    (opencode-service-cancel opencode-events--opening))
+  (setq opencode-events--opening nil)
+  (opencode-events--drop)
   (setq opencode-service-connection nil))
 
 (defun opencode-service-stop (&optional callback errback)
   "Stop the shared service, then call CALLBACK with no argument.
 ERRBACK, when given, receives an error message instead on failure.
 The event stream closes first, so its reconnect cannot start another
-service; reopening a session starts one again, and the stream reopens
-once any service answers Emacs while session buffers are open.  Every
-client loses the
-service, and running turns resume once one starts, though their current
-step starts over, so interactively this asks first while any runs."
+service.  Any request starts one again, waiting for the stop to end,
+and the stream then reopens while session buffers are open or the
+session registry has clients; otherwise the next session opened
+reconnects.  Every client loses the service, and running turns resume
+once one starts, though their current step starts over, so
+interactively this asks first while any runs."
   (interactive)
   (when (process-live-p opencode-service--starter)
-    (user-error "An OpenCode service start or restart is already running"))
+    (user-error "An OpenCode service start, restart or stop is already running"))
   (when-let* (((called-interactively-p 'any))
               (running (opencode-service-running-sessions))
               ((> running 0)))
@@ -315,8 +388,7 @@ step starts over, so interactively this asks first while any runs."
       (user-error "Stop cancelled")))
   (opencode-disconnect)
   (setq opencode-events--closed-for-stop t)
-  (opencode-service--run-cli
-   '("service" "stop")
+  (opencode-service--stop
    (lambda (status output)
      (cond
       ((not (zerop status))
@@ -326,16 +398,29 @@ step starts over, so interactively this asks first while any runs."
        (message "OpenCode service stopped")
        (when callback (funcall callback)))))))
 
-(defun opencode-events--reopen-after-stop (_connection)
-  "Reopen the stream `opencode-service-stop' closed, now that a service answers.
-Any request starts a service again; without this, open session buffers
-would stay stale.  With none open, the next session opened reconnects."
-  (when (and opencode-events--closed-for-stop
-             (not opencode-events--wanted)
-             (seq-some #'buffer-live-p (hash-table-values opencode-session-buffers)))
-    (opencode-events-connect)))
+(defun opencode-events--service-ready (connection)
+  "Open the wanted stream on CONNECTION's service, which is ready, if closed.
+A service is ready after Emacs started, restarted or found it again,
+such as after a request was refused: the stream then reopens at once
+rather than after its backoff, and one still open on another service
+process, which is gone, moves to this one.  After
+`opencode-service-stop', it reopens only for clients of
+`opencode-events-wanted-functions'."
+  (cond
+   (opencode-events--closed-for-stop
+    (when (and (not opencode-events--wanted) (opencode-events--wants-p))
+      (opencode-events--want)
+      (opencode-events--start connection)))
+   ((not opencode-events--wanted))
+   ((opencode-events-connected-p)
+    (unless (opencode-service-same-p opencode-events--connection connection)
+      (opencode-events--drop)
+      (opencode-events--start connection)))
+   ;; A stream waiting for a service is settled with this one.
+   ((not opencode-events--opening)
+    (opencode-events--start connection))))
 
-(add-hook 'opencode-service-ready-functions #'opencode-events--reopen-after-stop)
+(add-hook 'opencode-service-ready-functions #'opencode-events--service-ready)
 
 (provide 'opencode-events)
 ;;; opencode-events.el ends here

@@ -123,6 +123,9 @@ Events are applied only while they come from this stream.")
 (defvar opencode-state--waiters nil
   "Functions waiting for the registry to be ready, newest first.")
 
+(defvar opencode-state--wanted nil
+  "Non-nil once a client asked for the registry, which follows the event stream.")
+
 (defvar opencode-state--retry-timer nil
   "Timer retrying a failed bootstrap.")
 
@@ -815,6 +818,7 @@ ready on the current stream, else once it is.  The registry bootstraps
 on every connection of the stream, whoever opens it; this also retries
 a bootstrap that failed, and adopts a stream whose connection the
 registry missed, having been loaded after it."
+  (setq opencode-state--wanted t)
   (opencode-events-connect)
   (if (opencode-state-ready-p)
       (when callback (funcall callback))
@@ -829,6 +833,12 @@ registry missed, having been loaded after it."
         (opencode-state--connected nil))))))
 
 (opencode-events-register "server.connected" #'opencode-state--connected)
+
+(defun opencode-state--wants-events ()
+  "Return non-nil once the registry has clients, which it keeps current from the stream."
+  opencode-state--wanted)
+
+(add-hook 'opencode-events-wanted-functions #'opencode-state--wants-events)
 ;; A fork announces its new session by `session.forked' alone; being
 ;; unknown, the session is fetched.
 (dolist (type '("session.created" "session.forked" "session.renamed" "session.moved" "session.deleted"

@@ -172,7 +172,7 @@ RETRIED is internal."
                (url (opencode-request--url connection path query))
                (payload (and body (json-serialize body :null-object :null :false-object :false))))
           (opencode-request--log "%s %s%s" method url (if payload (concat " " payload) ""))
-          (plz method url
+          (opencode-plz method url
             :headers (delq nil
                            (list (cons "Authorization" (opencode-service-authorization connection))
                                  (cons "Accept" "application/json")

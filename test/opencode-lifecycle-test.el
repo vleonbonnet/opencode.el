@@ -1,0 +1,432 @@
+;;; opencode-lifecycle-test.el --- Tests of the service's lifecycle and request cleanup  -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026  Valentin Leon
+
+;; This program is free software; you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;;; Commentary:
+
+;; Whatever stops the service, a request starts it again and goes
+;; through, and the event stream comes back as soon as the service does,
+;; so that replies render; every request's curl buffer is killed once it
+;; is over.  These tests talk to `opencode-test-with-service' through
+;; curl, with the CLI stood for by `opencode-test-with-cli'.
+
+;;; Code:
+
+(require 'opencode-test-server)
+
+(defun opencode-test-agent-route ()
+  "Return a route answering the agent catalog."
+  (cons "/api/agent" (lambda (_) '(200 . ((data . []))))))
+
+(defun opencode-test-password-of (request)
+  "Return the password REQUEST authenticated with."
+  (let ((header (cdr (assoc "authorization" (plist-get request :headers)))))
+    (cadr (split-string (base64-decode-string (string-remove-prefix "Basic " header)) ":"))))
+
+(defun opencode-test-requests-on (path)
+  "Return the requests the fake service received on PATH, oldest first."
+  (reverse (seq-filter (lambda (request) (equal (car (split-string (plist-get request :path) "?")) path))
+                       (opencode-test-service-requests opencode-test-service))))
+
+(defun opencode-test-count-connections ()
+  "Count every `server.connected' event; return a function reading the count."
+  (let ((count 0))
+    (opencode-events-register "server.connected" (lambda (_) (cl-incf count)))
+    (lambda () count)))
+
+;;;; Request buffers
+
+(ert-deftest opencode-test-request-buffers-killed ()
+  "Every request's curl buffer is killed once it is over, and its callbacks run once.
+That holds for answers, errors, unreadable answers, refused
+connections, timeouts and curl processes killed by a signal, which
+`plz' alone ignores on macOS, where it calls neither callback."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service)
+          (list (opencode-test-agent-route)
+                (cons "/api/garbled" (lambda (_) '(200 . "{not json")))
+                (cons "/api/slow" (lambda (_) '(hang)))))
+    (let ((before (length (opencode-test-request-buffers)))
+          (outcomes nil))
+      (cl-flet ((send (path &rest arguments)
+                  (apply #'opencode-request 'get path :buffer nil
+                         :then (lambda (_) (push (cons path 'then) outcomes))
+                         :else (lambda (error) (push (list path 'else (opencode-error-message error)) outcomes))
+                         arguments))
+                (outcome (path) (seq-filter (lambda (entry) (equal (car entry) path)) outcomes)))
+        (opencode-request-sync 'get "/api/agent" :timeout 10)
+        (send "/api/agent")
+        (send "/api/missing")
+        (send "/api/garbled")
+        (send "/api/slow" :timeout 1)
+        (opencode-test-wait-for (lambda () (= (length outcomes) 4)) 15)
+        (should (equal (outcome "/api/agent") '(("/api/agent" . then))))
+        (should (equal (mapcar #'cadr (outcome "/api/missing")) '(else)))
+        (should (string-match-p "unreadable response" (nth 2 (car (outcome "/api/garbled")))))
+        (should (equal (mapcar #'cadr (outcome "/api/slow")) '(else)))
+        ;; A request whose curl process is killed, as cancelling it would.
+        (send "/api/slow" :timeout 30)
+        (let ((curl (opencode-test-wait-for
+                     (lambda ()
+                       (and (opencode-test-service-held opencode-test-service)
+                            (= (length (opencode-test-service-held opencode-test-service)) 2)
+                            (seq-find (lambda (process)
+                                        (and (process-live-p process)
+                                             (string-prefix-p "plz-request-curl" (process-name process))
+                                             (not (string-match-p "stderr" (process-name process)))))
+                                      (process-list)))))))
+          (delete-process curl))
+        (opencode-test-wait-for (lambda () (= (length (outcome "/api/slow")) 2)))
+        (should (string-match-p "without a response" (nth 2 (car (outcome "/api/slow")))))
+        ;; A refused connection is retried once on the registered service.
+        (setq opencode-service-connection
+              (plist-put (copy-sequence opencode-service-connection) :url "http://127.0.0.1:1"))
+        (send "/api/agent")
+        (opencode-test-wait-for (lambda () (= (length (outcome "/api/agent")) 2)))
+        (should (equal (outcome "/api/agent") '(("/api/agent" . then) ("/api/agent" . then))))
+        (accept-process-output nil 0.2)
+        (should (= (length outcomes) 6))
+        (opencode-test-wait-for (lambda () (= (length (opencode-test-request-buffers)) before)))))))
+
+(ert-deftest opencode-test-stream-buffers-killed ()
+  "The event stream's curl buffers are killed however each stream ends."
+  (opencode-test-with-service
+    (let ((before (length (opencode-test-request-buffers)))
+          (connections (opencode-test-count-connections)))
+      (opencode-events-connect)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 1)))
+      (setq opencode-events--backoff 0.1)
+      ;; Closed by the service.
+      (opencode-test-close-streams)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 2)))
+      ;; Silent past the heartbeat timeout.
+      (setq opencode-events--last-output 0
+            opencode-events--backoff 0.1)
+      (opencode-events--watch)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 3)))
+      ;; The open stream's, for its output and its errors.
+      (opencode-test-wait-for (lambda () (= (length (opencode-test-request-buffers)) (+ 2 before))))
+      (opencode-disconnect)
+      (opencode-test-wait-for (lambda () (= (length (opencode-test-request-buffers)) before))))))
+
+;;;; Event stream
+
+(ert-deftest opencode-test-stream-killed-reconnects ()
+  "A stream whose curl process dies of a signal reopens.
+`plz' reports no outcome for most signals, so nothing else would."
+  (opencode-test-with-service
+    (let ((connections (opencode-test-count-connections)))
+      (opencode-events-connect)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 1)))
+      (setq opencode-events--backoff 0.1)
+      (signal-process opencode-events--process 'SIGTERM)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 2)))
+      (setq opencode-events--backoff 0.1)
+      ;; Killing its buffer kills the process too.
+      (kill-buffer (process-buffer opencode-events--process))
+      (opencode-test-wait-for (lambda () (= (funcall connections) 3)))
+      (should (opencode-events-connected-p)))))
+
+(ert-deftest opencode-test-stream-lost-revived ()
+  "A wanted stream left closed with nothing reopening it is reopened.
+The watchdog does it at its next check; reopening it, as a sent prompt
+does, at once."
+  (opencode-test-with-service
+    (let ((connections (opencode-test-count-connections)))
+      (opencode-events-connect)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 1)))
+      (opencode-test-lose-streams)
+      (setq opencode-events--backoff 0.1)
+      (opencode-events--watch)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 2)))
+      (opencode-test-lose-streams)
+      (setq opencode-events--backoff 30)
+      (opencode-events-reopen)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 3)) 5))))
+
+(ert-deftest opencode-test-disconnect-stays-closed-whatever-asks ()
+  "After a disconnect, neither the watchdog, a send nor a ready service reopens the stream."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service) (list (opencode-test-agent-route)))
+    (let ((opencode-session-buffers (make-hash-table :test #'equal))
+          (buffer (generate-new-buffer " *opencode-test-session*"))
+          (opencode-state--wanted t))
+      (unwind-protect
+          (progn
+            (puthash "ses_test" buffer opencode-session-buffers)
+            (opencode-events-connect)
+            (opencode-test-wait-for #'opencode-events-connected-p)
+            (opencode-disconnect)
+            (opencode-events--watch)
+            (opencode-events-reopen)
+            (opencode-test-with-cli
+                (lambda (_arguments exit)
+                  (opencode-test-restart-service "second-password")
+                  (funcall exit 0))
+              (let ((restarted nil))
+                (opencode-service-restart (lambda (_) (setq restarted t)))
+                (opencode-test-wait-for (lambda () restarted))))
+            (opencode-request-sync 'get "/api/agent" :timeout 10)
+            (accept-process-output nil 0.5)
+            (should-not (opencode-events-connected-p)))
+        (kill-buffer buffer)))))
+
+;;;; Restarts
+
+(ert-deftest opencode-test-restart-reopens-stream-at-once ()
+  "After a restart, the stream reopens at once, not after its backoff.
+Requests made during the restart wait for the restarted service, rather
+than find the one going away or start another beside the CLI."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service) (list (opencode-test-agent-route)))
+    (let ((connections (opencode-test-count-connections))
+          (cli nil)
+          (answer nil)
+          (restarted nil))
+      (opencode-events-connect)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 1)))
+      (opencode-test-with-cli
+          (lambda (arguments exit)
+            (push arguments cli)
+            (pcase arguments
+              ('("service" "restart")
+               ;; The old service goes away, and the new one registers later.
+               (opencode-test-close-streams)
+               (delete-file (opencode-test-service-registration opencode-test-service))
+               (run-at-time 0.3 nil #'opencode-test-restart-service "second-password")
+               (run-at-time 0.6 nil exit 0))
+              (_ (opencode-test-service-register opencode-test-service)
+                 (funcall exit 0))))
+        ;; A reconnection after this backoff would come too late.
+        (setq opencode-events--backoff 30)
+        (opencode-service-restart (lambda (_) (setq restarted (float-time))))
+        (opencode-request 'get "/api/agent" :buffer nil :then (lambda (_) (setq answer t)))
+        (opencode-test-wait-for (lambda () (and answer restarted)) 10)
+        (opencode-test-wait-for (lambda () (= (funcall connections) 2)) 3)
+        (should (< (- (float-time) restarted) 3))
+        (should (equal cli '(("service" "restart"))))
+        (should (equal (mapcar #'opencode-test-password-of (opencode-test-requests-on "/api/agent"))
+                       '("second-password")))
+        (should (equal (plist-get opencode-service-connection :password) "second-password"))
+        (should (equal (plist-get opencode-events--connection :password) "second-password"))))))
+
+(ert-deftest opencode-test-restart-reopens-lost-stream ()
+  "A restart reopens a stream that was closed with nothing reopening it."
+  (opencode-test-with-service
+    (let ((connections (opencode-test-count-connections))
+          (restarted nil))
+      (opencode-events-connect)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 1)))
+      (opencode-test-lose-streams)
+      (opencode-test-with-cli
+          (lambda (_arguments exit)
+            (opencode-test-restart-service "second-password")
+            (run-at-time 0.1 nil exit 0))
+        (opencode-service-restart (lambda (_) (setq restarted t)))
+        (opencode-test-wait-for (lambda () restarted))
+        (opencode-test-wait-for (lambda () (= (funcall connections) 2)) 3)))))
+
+(ert-deftest opencode-test-restart-failure-serves-waiting-requests ()
+  "A failed restart fails its caller alone; requests waiting for it find the service then."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service) (list (opencode-test-agent-route)))
+    (let ((settled nil))
+      (opencode-test-with-cli
+          (lambda (_arguments exit) (run-at-time 0.2 nil exit 1 "service is locked"))
+        (opencode-service-restart #'ignore (lambda (text) (push text settled)))
+        (opencode-request 'get "/api/agent" :buffer nil :then (lambda (_) (push 'answer settled)))
+        (opencode-test-wait-for (lambda () (= (length settled) 2)))
+        (should (equal settled '(answer "opencode service restart failed: service is locked")))))))
+
+;;;; Stops
+
+(ert-deftest opencode-test-stop-then-request-starts-service ()
+  "Requests made while the service stops start it once the stop ends.
+The stream then reopens for the session registry's clients."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service) (list (opencode-test-agent-route)))
+    (let ((connections (opencode-test-count-connections))
+          (opencode-state--wanted t)
+          (cli nil)
+          (stopped nil)
+          (answer nil))
+      (opencode-events-connect)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 1)))
+      (opencode-test-with-cli
+          (lambda (arguments exit)
+            (push (cons arguments stopped) cli)
+            (pcase arguments
+              ('("service" "stop")
+               (delete-file (opencode-test-service-registration opencode-test-service))
+               (run-at-time 0.3 nil exit 0))
+              (_ (opencode-test-restart-service "second-password")
+                 (funcall exit 0))))
+        (opencode-service-stop (lambda () (setq stopped t)))
+        (should-not (opencode-events-connected-p))
+        (opencode-request 'get "/api/agent" :buffer nil :then (lambda (_) (setq answer t)))
+        (opencode-test-wait-for (lambda () answer))
+        ;; The start came once the stop had ended.
+        (should (equal (mapcar #'car (reverse cli)) '(("service" "stop") ("service" "start"))))
+        (should (cdr (car cli)))
+        (opencode-test-wait-for (lambda () (= (funcall connections) 2)) 3)))))
+
+;;;; Sending
+
+(defconst opencode-test-lifecycle-session "ses_lifecycle"
+  "ID of the session the sending tests open.")
+
+(defun opencode-test-lifecycle-routes ()
+  "Return the routes serving one empty session and what opening it asks."
+  (let ((info `((id . ,opencode-test-lifecycle-session) (title . "Lifecycle") (agent . "build")
+                (time (created . 1792531215759) (updated . 1792531215759))
+                (location (directory . ,(directory-file-name opencode-test-workspace))))))
+    (append
+     (list (cons (concat "/api/session/" opencode-test-lifecycle-session)
+                 (lambda (_) `(200 . ((data . ,info)))))
+           (cons (concat "/api/session/" opencode-test-lifecycle-session "/message")
+                 (lambda (_) '(200 . ((data . []) (cursor)))))
+           (cons (concat "/api/session/" opencode-test-lifecycle-session "/prompt")
+                 (lambda (request)
+                   (cons 200 `((data (id . ,(alist-get 'id (json-parse-string
+                                                             (plist-get request :body)
+                                                             :object-type 'alist))))))))
+           (cons "/api/session" (lambda (_) '(200 . ((data . [])))))
+           (cons "/api/session/active" (lambda (_) '(200 . ((data . nil))))))
+     (mapcar (lambda (path) (cons path (lambda (_) '(200 . ((data . []))))))
+             (list "/api/agent" "/api/model" "/api/provider" "/api/command"
+                   (concat "/api/session/" opencode-test-lifecycle-session "/permission")
+                   (concat "/api/session/" opencode-test-lifecycle-session "/form"))))))
+
+(defun opencode-test-reply (text)
+  "Send a turn of the open session answering TEXT on the stream."
+  (let* ((session opencode-test-lifecycle-session)
+         (base `((sessionID . ,session) (assistantMessageID . "msg_lifecycle_reply") (ordinal . 0))))
+    (dolist (event `(((type . "session.execution.started") (data (sessionID . ,session)))
+                     ((type . "session.step.started")
+                      (data (sessionID . ,session) (assistantMessageID . "msg_lifecycle_reply")))
+                     ((type . "session.text.started") (data ,@base))
+                     ((type . "session.text.delta") (data ,@base (delta . ,text)))
+                     ((type . "session.text.ended") (data ,@base (text . ,text)))
+                     ((type . "session.execution.succeeded") (data (sessionID . ,session)))))
+      (opencode-test-send-event event))))
+
+(defmacro opencode-test-with-lifecycle-session (buffer &rest body)
+  "Run BODY with BUFFER bound to the open session's buffer, its stream connected."
+  (declare (indent 1) (debug t))
+  `(opencode-test-with-service
+     (setf (opencode-test-service-routes opencode-test-service) (opencode-test-lifecycle-routes))
+     (let ((opencode-session-buffers (make-hash-table :test #'equal))
+           (opencode--catalogs (make-hash-table :test #'equal))
+           (opencode--catalog-waiters (make-hash-table :test #'equal))
+           (opencode--catalog-scheduled (make-hash-table :test #'equal))
+           (opencode-send-checks nil)
+           (opencode-before-send-functions nil)
+           (opencode-last-session-buffer nil)
+           (opencode-notify-os-function #'ignore)
+           (,buffer nil))
+       (cl-letf (((symbol-function 'display-buffer) (lambda (&rest _) (ert-fail "Unexpected display"))))
+         (unwind-protect
+             (progn
+               (opencode-session-open-by-id opencode-test-lifecycle-session :no-display t
+                                            :callback (lambda (_) (setq ,buffer (current-buffer))))
+               (opencode-test-wait-for (lambda () ,buffer))
+               (opencode-test-wait-for #'opencode-events-connected-p)
+               ,@body)
+           (when (buffer-live-p ,buffer) (kill-buffer ,buffer)))))))
+
+(defun opencode-test-type-prompt (buffer text)
+  "Type TEXT at the input of BUFFER and send it as RET does."
+  (with-current-buffer buffer
+    (goto-char (point-max))
+    (insert text)
+    (opencode-send-input)))
+
+(defun opencode-test-buffer-shows-p (buffer text)
+  "Return non-nil when BUFFER shows TEXT."
+  (with-current-buffer buffer
+    (save-excursion
+      (goto-char (point-min))
+      (search-forward text nil t))))
+
+(ert-deftest opencode-test-reply-renders-after-restart ()
+  "A prompt typed after a restart reaches the restarted service, and its reply renders.
+The stream had ended before the restart without being reopened, as when
+its curl process died unnoticed."
+  (opencode-test-with-lifecycle-session buffer
+    (opencode-test-lose-streams)
+    (opencode-test-with-cli
+        (lambda (_arguments exit)
+          (opencode-test-restart-service "second-password")
+          (run-at-time 0.1 nil exit 0))
+      (let ((restarted nil))
+        (opencode-service-restart (lambda (_) (setq restarted t)))
+        (opencode-test-wait-for (lambda () restarted))))
+    (opencode-test-type-prompt buffer "Hello again")
+    (opencode-test-wait-for (lambda () (opencode-test-requests-on
+                                        (concat "/api/session/" opencode-test-lifecycle-session "/prompt"))))
+    (should (equal (opencode-test-password-of
+                    (car (opencode-test-requests-on
+                          (concat "/api/session/" opencode-test-lifecycle-session "/prompt"))))
+                   "second-password"))
+    (opencode-test-wait-for (lambda () (opencode-test-service-streams opencode-test-service)) 3)
+    (opencode-test-reply "The answer after the restart.")
+    (opencode-test-wait-for (lambda () (opencode-test-buffer-shows-p buffer "The answer after the restart.")))))
+
+(ert-deftest opencode-test-send-starts-stopped-service ()
+  "A prompt sent while the service is gone starts it, goes through, and its reply renders.
+The stream, waiting for its long backoff, reopens as soon as the service is back."
+  (opencode-test-with-lifecycle-session buffer
+    (let ((cli nil))
+      ;; The stream retries late, as after failed attempts while the service was gone.
+      (setq opencode-events--backoff 30)
+      (opencode-test-close-streams)
+      (opencode-test-wait-for (lambda () (timerp opencode-events--reconnect-timer)))
+      ;; The service went away; the connection Emacs knows is refused now.
+      (delete-file (opencode-test-service-registration opencode-test-service))
+      (setq opencode-service-connection
+            (plist-put (copy-sequence opencode-service-connection) :url "http://127.0.0.1:1"))
+      (opencode-test-with-cli
+          (lambda (arguments exit)
+            (push arguments cli)
+            (opencode-test-restart-service "second-password")
+            (funcall exit 0))
+        (with-current-buffer buffer
+          (opencode-session-send "Are you there?" :show t))
+        (opencode-test-wait-for (lambda () (opencode-test-requests-on
+                                            (concat "/api/session/" opencode-test-lifecycle-session "/prompt"))))
+        (should (equal cli '(("service" "start"))))
+        (opencode-test-wait-for (lambda () (opencode-test-service-streams opencode-test-service)) 3)
+        (opencode-test-reply "Back again.")
+        (opencode-test-wait-for (lambda () (opencode-test-buffer-shows-p buffer "Back again.")))))))
+
+(ert-deftest opencode-test-send-during-stop-reopens-stream ()
+  "A prompt typed while the service stops starts it once stopped, and its reply renders."
+  (opencode-test-with-lifecycle-session buffer
+    (let ((cli nil)
+          (stopped nil))
+      (opencode-test-with-cli
+          (lambda (arguments exit)
+            (push (cons arguments stopped) cli)
+            (if (equal arguments '("service" "stop"))
+                (progn (opencode-test-close-streams)
+                       (delete-file (opencode-test-service-registration opencode-test-service))
+                       (run-at-time 0.3 nil exit 0))
+              (opencode-test-restart-service "second-password")
+              (funcall exit 0)))
+        (opencode-service-stop (lambda () (setq stopped t)))
+        (should-not (opencode-events-connected-p))
+        (opencode-test-type-prompt buffer "Wake up")
+        (opencode-test-wait-for (lambda () (opencode-test-requests-on
+                                            (concat "/api/session/" opencode-test-lifecycle-session "/prompt"))))
+        (should (equal (reverse cli) '((("service" "stop")) (("service" "start") . t))))
+        (opencode-test-wait-for (lambda () (opencode-test-service-streams opencode-test-service)) 3)
+        (opencode-test-reply "Awake.")
+        (opencode-test-wait-for (lambda () (opencode-test-buffer-shows-p buffer "Awake.")))))))
+
+(provide 'opencode-lifecycle-test)
+;;; opencode-lifecycle-test.el ends here
