@@ -552,13 +552,15 @@ in another color."
           (insert new "\n")
           (with-temp-buffer
             (diff-no-select old-buffer new-buffer nil t (current-buffer))
-            (goto-char (point-min))
-            (forward-line 3)
-            (delete-region (point-min) (point))
-            (goto-char (point-max))
-            (forward-line -2)
-            (delete-region (point) (point-max))
-            (buffer-string)))))))
+            ;; The diff buffer is read-only, in Diff mode.
+            (let ((inhibit-read-only t))
+              (goto-char (point-min))
+              (forward-line 3)
+              (delete-region (point-min) (point))
+              (goto-char (point-max))
+              (forward-line -2)
+              (delete-region (point) (point-max))
+              (buffer-string))))))))
 
 (defun opencode--format-patch (patch-text)
   "Return PATCH-TEXT with file names relative to the project, for display."
