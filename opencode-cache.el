@@ -32,7 +32,9 @@
 ;; than `opencode-cache-guard-threshold' previously cached tokens would be
 ;; re-sent uncached, showing why.  The check fails safe: when the server
 ;; cannot predict reuse, or the check fails, it asks whenever the context
-;; exceeds the threshold.  Declining leaves the input in the prompt.
+;; exceeds the threshold; right after a compaction, that size is the
+;; service's estimate, which the question says.  Declining leaves the
+;; input in the prompt.
 ;; Shell commands start no turn, and input sent while a turn runs joins
 ;; its cached conversation, so neither is checked.
 ;;
@@ -133,6 +135,17 @@ A turn the server cannot predict may lose the whole context."
                       (if (numberp opencode-session-tokens) opencode-session-tokens 0)))
       (_ .lostTokens))))
 
+(defun opencode-cache--estimate-note (report loss)
+  "Return a note that LOSS, for REPORT, is an estimated context size, or \"\".
+A turn the server cannot predict may lose the whole context, and right
+after a compaction that size is the service's estimate, not a measure."
+  (if (and opencode-session-tokens-estimated
+           (equal (alist-get 'status report) "unknown")
+           (eql loss opencode-session-tokens)
+           (> loss (or (alist-get 'lostTokens report) 0)))
+      " (estimated since the compaction)"
+    ""))
+
 (defun opencode-cache--tokens (n)
   "Format token count N compactly."
   (if (< n 1000) (format "%d" n) (format "%dk" (round n 1000))))
@@ -146,8 +159,8 @@ A turn the server cannot predict may lose the whole context."
   (let-alist report
     (concat
      (if (equal .status "unknown")
-         (format "OpenCode: cache reuse is unknown; up to ~%s context tokens could be re-sent uncached.\n"
-                 (opencode-cache--tokens loss))
+         (format "OpenCode: cache reuse is unknown; up to ~%s context tokens%s could be re-sent uncached.\n"
+                 (opencode-cache--tokens loss) (opencode-cache--estimate-note report loss))
        (format "OpenCode: ~%s cached tokens would be re-sent uncached (%s%s).\n"
                (opencode-cache--tokens loss) .status
                (if (and .reusableTokens (> .reusableTokens 0))
@@ -179,10 +192,10 @@ it can; else LOSS, the turn as it stands, is the closest estimate."
                count (if (= count 1) "" "s") (if (= count 1) "es" ""))
        (opencode-cache--line (or .staleThinking.reason "unknown reason"))
        (when (and loss opencode-cache-guard-threshold (> loss opencode-cache-guard-threshold))
-         (format (if (and (equal .status "unknown") (not .staleThinking.consent))
-                     "The turn could also re-send up to ~%s context tokens uncached.\n"
-                   "The turn also re-sends ~%s cached tokens uncached.\n")
-                 (opencode-cache--tokens loss)))
+         (if (and (equal .status "unknown") (not .staleThinking.consent))
+             (format "The turn could also re-send up to ~%s context tokens%s uncached.\n"
+                     (opencode-cache--tokens loss) (opencode-cache--estimate-note report loss))
+           (format "The turn also re-sends ~%s cached tokens uncached.\n" (opencode-cache--tokens loss))))
        "Replace them with their text and send? "))))
 
 (defun opencode-cache-stale-thinking-p (report)

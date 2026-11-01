@@ -57,12 +57,15 @@
 ;;
 ;; Each entry also carries the session's context size, as the session
 ;; buffer's mode line shows it: the token counts of its newest assistant
-;; message reporting usage.  Every step's end reports it, but neither a
-;; session's info nor its listing does, so a session the registry loaded
-;; rather than saw created has it fetched, newest assistant message
+;; message reporting usage, or, when a compaction completed since, the
+;; service's estimate of the next request, which only a step measures
+;; (`opencode-state-context-estimated-p').  Every step's end and every
+;; compaction's end report it, but neither a session's info nor its
+;; listing does, so a session the registry loaded rather than saw
+;; created has it fetched, newest assistant message and compaction
 ;; first, only when a client asks (`opencode-state-context'), a few
 ;; sessions at a time.  A reconnection keeps the sizes of the sessions
-;; the service has not updated since.
+;; the service has not updated since and that were not seen compacting.
 
 ;;; Code:
 
@@ -108,8 +111,8 @@ with nil instead: clients then read the registry again."
   :group 'opencode)
 
 (defconst opencode-state--keys
-  '(:id :title :directory :project-id :parent-id :agent :model :context :running :retry :requests
-        :outcome :error :idle :viewed :archived :created :updated :started)
+  '(:id :title :directory :project-id :parent-id :agent :model :context :context-estimated
+        :running :retry :requests :outcome :error :idle :viewed :archived :created :updated :started)
   "Keys of a registry entry, in order.")
 
 (defvar opencode-state--sessions (make-hash-table :test #'equal)
@@ -177,10 +180,20 @@ session is fetched first.")
 
 (defvar opencode-state--contexts (make-hash-table :test #'equal)
   "Session IDs mapped to how their context size stands.
-`known' once events or a fetch settled it, `failed' when its fetch
-failed, `queued' while waiting to be fetched, and a list unique to the
-fetch while one runs.  The size of a session absent from it is not
-known; one is fetched when a client asks for it.")
+`known' once events or a fetch settled it on this stream, `carried'
+while the size settled on the previous stream waits for a fresh entry
+to tell whether it is still current, `failed' when its fetch failed,
+`queued' while waiting to be fetched, and a list unique to the fetch
+while one runs.  The size of a session absent from it is not known;
+one is fetched when a client asks for it.")
+
+(defvar opencode-state--compacting (make-hash-table :test #'equal)
+  "IDs of the sessions a compaction may run in, mapped to a unique mark.
+A session joins when its compaction starts, and leaves when one ends or
+fails, when a fetch of its size begun since finds none running, or when
+its entry is dropped.  The service does not mark a session updated when
+a compaction ends, so a reconnection fetches their size again rather
+than keep it.")
 
 (defvar opencode-state--context-queue nil
   "IDs of the sessions whose context size waits to be fetched, oldest first.")
@@ -298,7 +311,9 @@ That is once the listing that follows a bootstrap ended."
   "Return the registry entry of session ID, or nil.
 An entry is a plist with the keys :id, :title, :directory (normalized),
 :project-id, :parent-id, :agent, :model (a model reference), :context (the
-context size in tokens, or nil; see `opencode-state-context'), :running,
+context size in tokens, or nil; see `opencode-state-context'),
+:context-estimated (non-nil when :context is the service's estimate; see
+`opencode-state-context-estimated-p'), :running,
 :retry (a plist :attempt :at :message, or nil), :requests (plists :kind
 :id :summary :time, oldest first), :outcome (`succeeded', `failed' or
 `interrupted'), :error (the last failure's message while it is unseen,
@@ -452,7 +467,8 @@ when only one changed, else with nil.  A batch within a batch joins it."
           (puthash id entry opencode-state--sessions)
         (remhash id opencode-state--sessions)
         (remhash id opencode-state--viewing)
-        (remhash id opencode-state--contexts))
+        (remhash id opencode-state--contexts)
+        (remhash id opencode-state--compacting))
       (let ((before (and old (opencode-state-status old)))
             (after (and entry (opencode-state-status entry))))
         (unless (eq before after)
@@ -506,11 +522,20 @@ execution whose idle time ENTRY already has is then not counted again."
          (assign :updated created)
          ;; A step failing after the provider answered reports that usage too.
          (when-let* ((size (opencode-context-size (alist-get 'tokens data))))
-           (assign :context size)))
+           (assign :context size :context-estimated nil)))
+        ;; Its usage is the compaction request's, which read the
+        ;; conversation it replaced.  Without the service's estimate, from
+        ;; a native compaction or an older service, the size is unknown
+        ;; until the next step.  The service does not mark the session
+        ;; updated.
+        ("session.compaction.ended"
+         (let ((context (alist-get 'context data)))
+           (assign :context (and (numberp context) context)
+                   :context-estimated (numberp context))))
         ("session.inbox.enqueued" (assign :updated created))
         ;; The messages after the boundary are gone, and with them maybe
         ;; the newest usage; the size is fetched again when asked for.
-        ("session.revert.committed" (assign :context nil :updated created))
+        ("session.revert.committed" (assign :context nil :context-estimated nil :updated created))
         ("session.step.started" (assign :retry nil :updated created))
         ("session.execution.started"
          (assign :running t :started created :retry nil :requests nil))
@@ -1122,6 +1147,7 @@ registry missed, having been loaded after it."
                 "session.execution.failed" "session.execution.interrupted"
                 "session.retry.scheduled" "session.step.started" "session.step.ended"
                 "session.step.failed" "session.revert.committed" "session.inbox.enqueued"
+                "session.compaction.started" "session.compaction.ended" "session.compaction.failed"
                 "session.agent.selected" "session.model.selected"
                 "permission.asked" "permission.replied"
                 "form.created" "form.replied" "form.cancelled"))
@@ -1134,7 +1160,11 @@ registry missed, having been loaded after it."
 That is what the session's next request sends again, as its buffer's
 mode line shows it: the token counts of its newest assistant message
 reporting usage, which `opencode-context-display' shows against its
-model's context size.  Every step's end updates it.
+model's context size.  Every step's end updates it.  Once a compaction
+completed after that message, it is the service's estimate of the next
+request until a step measures it, which
+`opencode-state-context-estimated-p' tells; nil when the service gave
+none, as for a native compaction.
 
 Nil when no step reported usage yet, the registry holds no entry of ID,
 or the size is not known yet.  Neither a session's info nor its listing
@@ -1147,6 +1177,14 @@ stream reconnects.  This never waits, and is safe at redisplay."
     (unless (gethash id opencode-state--contexts)
       (opencode-state--context-enqueue id))
     (plist-get entry :context)))
+
+(defun opencode-state-context-estimated-p (id)
+  "Return non-nil when the context size of session ID is an estimate.
+That is the size `opencode-state-context' returns, the service's
+estimate of the next request after a compaction, which the next step
+replaces with the measured size.  Like the size, it is known only once
+`opencode-state-context' was asked for it."
+  (plist-get (opencode-state-get id) :context-estimated))
 
 (defun opencode-state--context-pending-p (id)
   "Return non-nil when the context size of session ID is queued or being fetched."
@@ -1192,39 +1230,71 @@ again and starts them."
   "Fetch the context size of session ID into its entry.
 Assistant messages are fetched one at a time from the newest until one
 reports usage, usually the first: only a step still running, or one
-that failed before the provider answered, reports none.  An event
-settling the size meanwhile supersedes the fetch, since the answer may
-predate it."
+that failed before the provider answered, reports none.  Compactions
+are fetched the same way until a completed one, or one older than that
+message: a completed compaction newer than it holds the size, the
+service's estimate, as the buffer replaying the transcript finds.  An
+event settling the size meanwhile supersedes the fetch, since the
+answer may predate it."
   (let ((token (list 'fetching))
-        (directory (plist-get (opencode-state-get id) :directory)))
+        (directory (plist-get (opencode-state-get id) :directory))
+        (compacting (gethash id opencode-state--compacting)))
     (puthash id token opencode-state--contexts)
     (cl-labels ((current-p () (eq (gethash id opencode-state--contexts) token))
-                (settle (state &optional size)
+                (settle (state &optional size estimated)
                   (when (current-p)
                     (puthash id state opencode-state--contexts)
                     (when-let* (((eq state 'known))
                                 (entry (opencode-state-get id)))
-                      (opencode-state--store id (plist-put (copy-sequence entry) :context size))))
+                      (opencode-state--store id (plist-put (plist-put (copy-sequence entry) :context size)
+                                                           :context-estimated estimated))))
                   (opencode-state--context-schedule))
-                (page (cursor)
+                (created (message) (alist-get 'created (alist-get 'time message)))
+                (newest (type accept found &optional cursor)
+                  ;; Calls FOUND with the newest message of TYPE that ACCEPT takes, or nil.
                   (opencode-request
                    'get (format "/api/session/%s/message" id)
                    :directory directory :buffer nil
                    ;; A cursor carries its order, and the service refuses both.
-                   :query `((limit . 1) (type . "assistant")
+                   :query `((limit . 1) (type . ,type)
                             ,@(if cursor `((cursor . ,cursor)) '((order . "desc"))))
                    :else (lambda (_) (settle 'failed))
                    :then (lambda (response)
                            (let ((messages (opencode-request-data response))
                                  (next (alist-get 'next (alist-get 'cursor response))))
-                             (if-let* ((size (seq-some (lambda (message)
-                                                         (opencode-context-size (alist-get 'tokens message)))
-                                                       messages)))
-                                 (settle 'known size)
+                             (if-let* ((message (seq-find accept messages)))
+                                 (funcall found message)
                                (if (and messages next (current-p))
-                                   (page next)
-                                 (settle 'known nil))))))))
-      (page nil))))
+                                   (newest type accept found next)
+                                 (funcall found nil)))))))
+                (compared (assistant)
+                  ;; Messages are created as they are appended, so creation
+                  ;; times order them as the transcript does.
+                  (let ((after (created assistant))
+                        (running nil))
+                    (newest "compaction"
+                            (lambda (message)
+                              ;; One running is the newest, the first page.
+                              (when (equal (alist-get 'status message) "running")
+                                (setq running t))
+                              (or (equal (alist-get 'status message) "completed")
+                                  (and after (numberp (created message)) (<= (created message) after))))
+                            (lambda (compaction)
+                              (when (and compacting (not running) (current-p)
+                                         (eq (gethash id opencode-state--compacting) compacting))
+                                (remhash id opencode-state--compacting))
+                              (if (and compaction
+                                       (equal (alist-get 'status compaction) "completed")
+                                       (or (null after) (> (or (created compaction) 0) after)))
+                                  (let ((context (alist-get 'context compaction)))
+                                    (settle 'known (and (numberp context) context) (numberp context)))
+                                (settle 'known (opencode-context-size (alist-get 'tokens assistant)))))))))
+      (newest "assistant" (lambda (message) (opencode-context-size (alist-get 'tokens message)))
+              (lambda (assistant)
+                (if (current-p)
+                    (compared assistant)
+                  ;; Superseded: its slot is free for the fetches queued.
+                  (opencode-state--context-schedule)))))))
 
 (defun opencode-state--context-follow (id event)
   "Note how EVENT of session ID leaves its context size known."
@@ -1233,6 +1303,12 @@ predate it."
      (when (opencode-context-size (alist-get 'tokens (alist-get 'data event)))
        ;; Newer than the answer of a fetch in flight, which is dropped.
        (puthash id 'known opencode-state--contexts)))
+    ;; Unique, so that a fetch which began before cannot remove it.
+    ("session.compaction.started" (puthash id (list 'started) opencode-state--compacting))
+    ("session.compaction.failed" (remhash id opencode-state--compacting))
+    ("session.compaction.ended"
+     (remhash id opencode-state--compacting)
+     (puthash id 'known opencode-state--contexts))
     ("session.revert.committed"
      (if (opencode-state--context-pending-p id)
          ;; The answer in flight may predate the revert.
@@ -1241,37 +1317,66 @@ predate it."
 
 (defun opencode-state--context-reset ()
   "Ready the context sizes for a rebuild of the registry.
-Fetches in flight answer for the stream that dropped: they are queued
-again, ahead of those a client asked for meanwhile.  A failed fetch is
-tried again when next asked for.  Known sizes stay until a fresh entry
-replaces their session's (see `opencode-state--context-carry')."
+A known size becomes `carried': it stays current only while the
+service has not updated its session since, which
+`opencode-state--context-carry' decides once a fresh entry replaces
+the session's.  The end of a compaction does not update a session, so
+the size of one seen compacting is forgotten at once, and fetched again
+when asked for, until a fetch begun since finds none running.  Fetches
+in flight answer for the stream that dropped: they are queued again,
+ahead of those a client asked for meanwhile.  A failed fetch is tried
+again when next asked for."
   (let ((flying nil)
-        (failed nil))
+        (failed nil)
+        (carried nil)
+        (compacting nil))
     (maphash (lambda (id state)
                (cond ((consp state) (push id flying))
-                     ((eq state 'failed) (push id failed))))
+                     ((eq state 'failed) (push id failed))
+                     ((not (memq state '(known carried))))
+                     ((gethash id opencode-state--compacting) (push id compacting))
+                     (t (push id carried))))
              opencode-state--contexts)
-    (dolist (id failed)
+    (dolist (id (append failed compacting))
       (remhash id opencode-state--contexts))
+    (dolist (id carried)
+      (puthash id 'carried opencode-state--contexts))
     (dolist (id flying)
       (puthash id 'queued opencode-state--contexts))
+    (opencode-state--batched
+     (lambda ()
+       (dolist (id compacting)
+         (when-let* ((entry (opencode-state-get id)))
+           (opencode-state--store id (plist-put (plist-put (copy-sequence entry) :context nil)
+                                                :context-estimated nil))))))
     (setq opencode-state--context-queue
           (seq-filter (lambda (id) (eq (gethash id opencode-state--contexts) 'queued))
                       (delete-dups (append (nreverse flying) opencode-state--context-queue nil))))))
 
 (defun opencode-state--context-carry (entry)
   "Return ENTRY, about to replace its session's entry, with the context size still current.
-The old entry's size stays current while the service has not updated
-the session since: the end of a step updates it.  Otherwise it is
+A size known on this stream is current, and so is its estimate mark.
+One `carried' from the previous stream stays current while the service
+has not updated the session since, the end of a step updating it, and
+no compaction was seen to start without ending; otherwise it is
 forgotten, and fetched again when asked for."
   (let* ((id (plist-get entry :id))
-         (old (opencode-state-get id)))
-    (when (and old (eq (gethash id opencode-state--contexts) 'known))
-      (let ((before (opencode-state--ms (plist-get old :updated)))
-            (after (opencode-state--ms (plist-get entry :updated))))
-        (if (and before after (<= after before))
-            (setq entry (plist-put entry :context (plist-get old :context)))
-          (remhash id opencode-state--contexts))))
+         (old (opencode-state-get id))
+         (state (gethash id opencode-state--contexts)))
+    (cl-flet ((keep ()
+                (setq entry (plist-put (plist-put entry :context (plist-get old :context))
+                                       :context-estimated (plist-get old :context-estimated)))))
+      (when old
+        (pcase state
+          ('known (keep))
+          ('carried
+           (let ((before (opencode-state--ms (plist-get old :updated)))
+                 (after (opencode-state--ms (plist-get entry :updated))))
+             (if (and before after (<= after before)
+                      (not (gethash id opencode-state--compacting)))
+                 (progn (puthash id 'known opencode-state--contexts)
+                        (keep))
+               (remhash id opencode-state--contexts)))))))
     entry))
 
 ;;;; Prompt-cache expiry

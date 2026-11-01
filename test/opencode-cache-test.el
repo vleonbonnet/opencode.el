@@ -98,6 +98,28 @@ The fake service answers preflights with `opencode-test-reports'."
       (should (= (length opencode-test-questions) 2))
       (should (equal (alist-get 'text (opencode-test-sent-body "/prompt")) "three")))))
 
+(ert-deftest opencode-test-cache-estimate-noted ()
+  "Right after a compaction, the context an unpredictable turn may re-send is an estimate."
+  (let ((opencode-test-reports '(((status . "unknown") (lostTokens . 0) (reasons "no history"))
+                                 ((status . "unknown") (lostTokens . 0)
+                                  (staleThinking (count . 2) (reason . "the system prompt changed")))
+                                 ((status . "unknown") (lostTokens . 0) (reasons "no history")))))
+    (opencode-test-with-guard nil
+      (setq opencode-session-tokens 150000
+            opencode-session-tokens-estimated t)
+      (opencode-test-type-and-send "one")
+      (should (string-match-p "up to ~150k context tokens (estimated since the compaction) could be re-sent"
+                              (car opencode-test-questions)))
+      (delete-region (opencode-pmark) (point-max))
+      (opencode-test-type-and-send "two")
+      (should (string-match-p "could also re-send up to ~150k context tokens (estimated since the compaction)"
+                              (car opencode-test-questions)))
+      ;; A measured size says nothing of the kind.
+      (setq opencode-session-tokens-estimated nil)
+      (delete-region (opencode-pmark) (point-max))
+      (opencode-test-type-and-send "three")
+      (should (string-match-p "up to ~150k context tokens could be re-sent" (car opencode-test-questions))))))
+
 (ert-deftest opencode-test-cache-stale-thinking-consent ()
   "Stale thinking asks for consent, which travels on that prompt only."
   (let ((opencode-test-reports
