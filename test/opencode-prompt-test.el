@@ -168,6 +168,31 @@ command loop applies key remapping as typing them would."
         (should-not (opencode-test-press buffer "TAB"))
         (should (equal (opencode-test-input buffer) "elsewhere later"))))))
 
+(ert-deftest opencode-test-tab-completes-dictionary-words ()
+  "TAB in the input completes dictionary words as text modes do, per their option."
+  (opencode-test-with-server
+    (let ((dictionary nil))
+      (cl-letf (((default-value 'completion-at-point-functions) nil)
+                ((symbol-function 'ispell-completion-at-point)
+                 (lambda ()
+                   (push (point) dictionary)
+                   (let ((end (point)) (start (save-excursion (skip-syntax-backward "w") (point))))
+                     (list start end '("dictionary"))))))
+        (let ((text-mode-ispell-word-completion 'completion-at-point)
+              (buffer (opencode-test-open (opencode-test-scenario "text"))))
+          (with-current-buffer buffer
+            (should (memq #'ispell-completion-at-point completion-at-point-functions))
+            (goto-char (point-max))
+            (insert "a dictio"))
+          (should-not (opencode-test-press buffer "TAB"))
+          (should (equal (opencode-test-input buffer) "a dictionary"))
+          (should dictionary))
+        ;; Turned off for text modes, it is off here too.
+        (let ((text-mode-ispell-word-completion nil))
+          (with-temp-buffer
+            (opencode-session-mode)
+            (should-not (memq #'ispell-completion-at-point completion-at-point-functions))))))))
+
 (ert-deftest opencode-test-tab-in-transcript ()
   "TAB in the transcript toggles blocks and moves to buttons and blocks, never completing there."
   (opencode-test-with-server

@@ -424,6 +424,9 @@ interrupt the turn or are refused (`opencode-comint-unsupported'), and
               (remove #'comint-watch-for-password-prompt comint-output-filter-functions))
   (remove-hook 'completion-at-point-functions #'comint-completion-at-point t)
   (add-hook 'completion-at-point-functions #'opencode--comint-completion-at-point nil t)
+  ;; Prompts are prose: complete words as text modes do.
+  (when (eq text-mode-ispell-word-completion 'completion-at-point)
+    (add-hook 'completion-at-point-functions #'ispell-completion-at-point 10 t))
   (opencode-render-setup)
   (opencode-blocks-setup)
   (setq opencode--own-inputs (make-hash-table :test #'equal)
