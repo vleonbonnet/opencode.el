@@ -20,12 +20,12 @@
 
 ;;; Commentary:
 
-;; What the session mode line shows of a session's model, provider,
-;; variant and context use, as functions of a model reference and a
-;; token count rather than of a session buffer, so that other packages'
-;; session lists, such as drover's, show the same for every session the
-;; registry knows: its entries carry the model, and
-;; `opencode-state-context' the context size.
+;; What the session mode line shows of a session's agent, model,
+;; provider, variant and context use, as functions of an agent, a model
+;; reference and a token count rather than of a session buffer, so that
+;; other packages' session lists, such as drover's, show the same for
+;; every session the registry knows: its entries carry the agent and
+;; the model, and `opencode-state-context' the context size.
 ;;
 ;; They read the location's cached catalogs and never wait: a value
 ;; needing a catalog that is not fetched yet is nil, and the fetch
@@ -77,6 +77,14 @@ once a request exceeds SIZE tokens."
 (defcustom opencode-long-context-near 0.9
   "Fraction of a long-context tier's size from which context use warns."
   :type 'number
+  :group 'opencode)
+
+(defcustom opencode-mode-line-agent-faces
+  '(font-lock-keyword-face font-lock-type-face font-lock-constant-face font-lock-string-face)
+  "Faces cycled over primary agents that configure no color.
+The session mode line and `opencode-agent-display' draw an agent in
+one of them, chosen by its place among the primary agents."
+  :type '(repeat face)
   :group 'opencode)
 
 ;;;; Long-context pricing
@@ -176,6 +184,43 @@ the name, is not fetched yet; see `opencode-catalog-changed-functions'."
     (opencode--provider-string
      provider-id
      (or (alist-get 'name (opencode-provider-info provider-id directory)) provider-id))))
+
+(defun opencode--agent-string (id agents)
+  "Return agent ID styled as AGENTS, its location's agent catalog, has it.
+It is the catalog's name for ID, bold, in its configured `color' when
+Emacs knows that color, else in the face of
+`opencode-mode-line-agent-faces' its place among the primary agents
+that are not hidden picks, so that each agent keeps its face; an agent
+AGENTS lacks, or every agent while AGENTS is nil, goes by ID in the
+first face.  The tooltip names it."
+  (let* ((info (seq-find (lambda (agent) (equal (alist-get 'id agent) id)) agents))
+         (name (or (alist-get 'name info) id))
+         (color (alist-get 'color info))
+         (primary (seq-keep (lambda (agent)
+                              (and (equal (alist-get 'mode agent) "primary")
+                                   (not (alist-get 'hidden agent))
+                                   (alist-get 'id agent)))
+                            agents))
+         (index (or (seq-position primary id) 0)))
+    (propertize name
+                'face (list 'bold
+                            (cond ((and (stringp color) (color-defined-p color))
+                                   (list :foreground color))
+                                  (opencode-mode-line-agent-faces
+                                   (nth (mod index (length opencode-mode-line-agent-faces))
+                                        opencode-mode-line-agent-faces))))
+                'help-echo (format "Agent: %s" name))))
+
+(defun opencode-agent-display (id &optional directory)
+  "Return the agent ID as the session mode line shows it, in DIRECTORY.
+That is the name DIRECTORY's agent catalog gives it, bold, in the
+color the catalog configures for it, else in a face of
+`opencode-mode-line-agent-faces' chosen by its place among the primary
+agents, the same for every session; the tooltip names it.  Nil when ID
+is nil or DIRECTORY's agent catalog is not fetched yet; see
+`opencode-catalog-changed-functions'."
+  (when (and id (opencode--catalogs-cached-p directory 'agent))
+    (opencode--agent-string id (opencode-catalog 'agent directory))))
 
 (defun opencode--variant-string (variant provider info)
   "Return selected VARIANT for display, or the default of the model INFO.

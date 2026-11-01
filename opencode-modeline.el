@@ -41,10 +41,10 @@
 ;; then details are dropped one step at a time, the model's "Claude "
 ;; prefix, the provider, the variant, the model and last the context.
 ;;
-;; The model, variant, provider and context are drawn by the displays of
-;; opencode-display.el, which other packages' session lists share.  A
-;; model can cost more per token once a request exceeds a context size;
-;; crossing it is reported once.
+;; The agent, model, variant, provider and context are drawn by the
+;; displays of opencode-display.el, which other packages' session lists
+;; share.  A model can cost more per token once a request exceeds a
+;; context size; crossing it is reported once.
 
 ;;; Code:
 
@@ -57,12 +57,6 @@
 (defcustom opencode-mode-line t
   "When non-nil, session buffers show the session mode line."
   :type 'boolean
-  :group 'opencode)
-
-(defcustom opencode-mode-line-agent-faces
-  '(font-lock-keyword-face font-lock-type-face font-lock-constant-face font-lock-string-face)
-  "Faces cycled over primary agents that configure no color."
-  :type '(repeat face)
   :group 'opencode)
 
 (defcustom opencode-mode-line-title-min-width 24
@@ -112,35 +106,19 @@ NAME defaults to the current buffer's name; a uniquifying <N> suffix stays."
         (concat (match-string 1 name) (match-string 2 name))
       name)))
 
-(defun opencode--mode-line-agent (id agents)
-  "Return agent ID styled with its color among AGENTS, else a stable face."
-  (let* ((info (seq-find (lambda (agent) (equal (alist-get 'id agent) id)) agents))
-         (name (or (alist-get 'name info) id))
-         (color (alist-get 'color info))
-         (primary (seq-keep (lambda (agent)
-                              (and (equal (alist-get 'mode agent) "primary")
-                                   (not (alist-get 'hidden agent))
-                                   (alist-get 'id agent)))
-                            agents))
-         (index (or (seq-position primary id) 0)))
-    (propertize name
-                'face (list 'bold
-                            (cond ((and (stringp color) (color-defined-p color))
-                                   (list :foreground color))
-                                  (opencode-mode-line-agent-faces
-                                   (nth (mod index (length opencode-mode-line-agent-faces))
-                                        opencode-mode-line-agent-faces))))
-                'help-echo (format "Agent: %s" name))))
+(defun opencode--mode-line-agent (id)
+  "Return agent ID as `opencode-agent-display' shows it in this session.
+Until the agent catalog arrives, ID goes by itself, in the first face."
+  (or (opencode-agent-display id) (opencode--agent-string id nil)))
 
 (defun opencode--mode-line-compute-segments ()
   "Return the session details as an alist of (SEGMENT . STRING-OR-NIL).
-Until the catalogs arrive, the model and provider go by their IDs."
+Until the catalogs arrive, the agent, model and provider go by their IDs."
   (when opencode-session-agent
-    (let* ((agents (opencode-catalog-ensure 'agent))
-           (model opencode-session-model)
+    (let* ((model opencode-session-model)
            (id (alist-get 'id model))
            (provider-id (alist-get 'providerID model)))
-      `((agent . ,(opencode--mode-line-agent opencode-session-agent agents))
+      `((agent . ,(opencode--mode-line-agent opencode-session-agent))
         (model . ,(or (opencode-model-name model) id))
         (short-model . ,(or (opencode-model-display model) (and id (opencode--model-short-name id))))
         (variant . ,(opencode-variant-display model))

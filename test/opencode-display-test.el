@@ -40,6 +40,13 @@ Rocket has neither variants nor a context size.")
      {\"id\": \"acme\", \"name\": \"Acme Cloud\", \"package\": \"@opencode/ai/providers/openai-compatible\"}]")
   "Provider catalog entries added to the recorded ones.")
 
+(defconst opencode-test-display-agents
+  (opencode-test-parse
+   "[{\"id\": \"review\", \"name\": \"Review\", \"mode\": \"primary\", \"color\": \"#ff8800\"},
+     {\"id\": \"docs\", \"name\": \"Docs\", \"mode\": \"primary\", \"color\": \"no-such-color\"}]")
+  "Agent catalog entries added to the recorded ones.
+Review configures a color Emacs knows, Docs one it does not.")
+
 (defun opencode-test-display-routes ()
   "Return routes serving the recorded catalogs with the added entries."
   (append
@@ -50,7 +57,11 @@ Rocket has neither variants nor a context size.")
          (list 'get "\\`/api/provider\\'"
                (lambda (_)
                  `((data . ,(append (alist-get 'data (opencode-test-fixture "provider.json"))
-                                    opencode-test-display-providers))))))
+                                    opencode-test-display-providers)))))
+         (list 'get "\\`/api/agent\\'"
+               (lambda (_)
+                 `((data . ,(append (alist-get 'data (opencode-test-fixture "agent.json"))
+                                    opencode-test-display-agents))))))
    opencode-test-routes))
 
 (defmacro opencode-test-with-catalogs (&rest body)
@@ -229,6 +240,54 @@ Its arrival runs `opencode-catalog-changed-functions'."
       (should (equal changes '((nil nil))))
       (opencode-test-dispatch '(((type . "server.connected") (data))))
       (should (equal changes '((nil nil)))))))
+
+(ert-deftest opencode-test-display-agent ()
+  "Agents show their catalog name, bold, in their color, else a face by their place."
+  (opencode-test-with-server
+    (let ((opencode-test-routes (opencode-test-display-routes))
+          (workspace opencode-test-workspace)
+          (opencode-mode-line-agent-faces '(font-lock-keyword-face font-lock-type-face
+                                            font-lock-constant-face font-lock-string-face)))
+      (cl-letf (((symbol-function 'run-at-time) #'ignore))
+        ;; Until the catalog arrives, nothing, and it is not waited for.
+        (should-not (opencode-agent-display "build" workspace))
+        (should-not opencode-test-requests))
+      (opencode-catalog-fetch 'agent #'ignore workspace)
+      (let ((default-directory temporary-file-directory))
+        (cl-flet ((face (id) (get-text-property 0 'face (opencode-agent-display id workspace))))
+          (let ((build (opencode-agent-display "build" workspace)))
+            (should (equal build "Build"))
+            (should (equal (get-text-property 0 'help-echo build) "Agent: Build")))
+          ;; Primary agents that are not hidden take the faces in turn,
+          ;; in the catalog's order: build, plan, review, docs.
+          (should (equal (face "build") '(bold font-lock-keyword-face)))
+          (should (equal (face "plan") '(bold font-lock-type-face)))
+          (should (equal (face "review") '(bold (:foreground "#ff8800"))))
+          ;; A color Emacs does not know leaves the agent its face.
+          (should (equal (face "docs") '(bold font-lock-string-face)))
+          ;; Subagents, and agents the catalog lacks, take the first.
+          (should (equal (opencode-agent-display "general" workspace) "General"))
+          (should (equal (face "general") '(bold font-lock-keyword-face)))
+          (should (equal (opencode-agent-display "ghost" workspace) "ghost"))
+          (let ((opencode-mode-line-agent-faces nil))
+            (should (equal (face "plan") '(bold nil))))
+          (should-not (opencode-agent-display nil workspace)))))))
+
+(ert-deftest opencode-test-mode-line-agent-is-the-display ()
+  "The mode line's agent is the agent's display, its ID until the catalog arrives."
+  (opencode-test-with-server
+    (let ((opencode-test-routes (opencode-test-display-routes)))
+      (with-current-buffer (opencode-test-open (opencode-test-scenario "switch"))
+        (cl-letf (((symbol-function 'run-at-time) #'ignore))
+          (let ((agent (alist-get 'agent (opencode-mode-line-segments))))
+            (should (equal agent "build"))
+            (should (equal (get-text-property 0 'face agent)
+                           (list 'bold (car opencode-mode-line-agent-faces))))))
+        (opencode-catalog-fetch 'agent #'ignore)
+        (dolist (id '("build" "plan" "review"))
+          (setq opencode-session-agent id)
+          (should (equal-including-properties (alist-get 'agent (opencode-mode-line-segments))
+                                              (opencode-agent-display id))))))))
 
 (ert-deftest opencode-test-mode-line-uses-displays ()
   "The mode line's details are the displays of the session's model and context."

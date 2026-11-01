@@ -19,7 +19,7 @@
 | =opencode-permission.el=  | Permission requests, their transient and the hand-off to another agent                                                                |
 | =opencode-form.el=        | Question forms and other forms                                                                                                        |
 | =opencode-notify.el=      | Notification log, filters and operating-system backends                                                                               |
-| =opencode-display.el=     | Model, provider, variant and context-use displays for any session, long-context pricing tiers                                         |
+| =opencode-display.el=     | Agent, model, provider, variant and context-use displays for any session, long-context pricing tiers                                  |
 | =opencode-modeline.el=    | The session mode line, and reporting a context passing its price tier                                                                 |
 | =opencode-variant.el=     | The variant a model runs with when none is selected, from the catalogs                                                                |
 | =opencode-sessions.el=    | Session pickers and their status icons, projects, worktree branches, worktrees, MCP servers                                           |
@@ -65,7 +65,7 @@ A fetch in flight is superseded by an event settling the size meanwhile, which i
 
 * Displays without a buffer
 
-The session mode line's details are functions of a model reference, a token count and a directory, in =opencode-display.el=, so that other packages' lists show every session's model, provider, variant and context as the mode line does, from the registry rather than a buffer. They read the location's cached catalogs and never wait, being called at redisplay: a value needing a catalog not fetched yet is nil, the fetch starts from a timer, once per catalog however many displays asked, and =opencode-catalog-changed-functions= run when it arrives, as they do when an event or a reconnection makes a catalog forgotten. A selected variant needs no catalog; a default one needs both the model and the provider catalogs, as the request it reproduces merges their settings. The mode line falls back to the model and provider IDs until the catalogs arrive, as it always did, and computes its segments again whenever the catalog generation changes.
+The session mode line's details are functions of an agent, a model reference, a token count and a directory, in =opencode-display.el=, so that other packages' lists show every session's agent, model, provider, variant and context as the mode line does, from the registry rather than a buffer: the mode line draws its agent with =opencode-agent-display= itself, so that a list's agent has its name, weight and colour. They read the location's cached catalogs and never wait, being called at redisplay: a value needing a catalog not fetched yet is nil, the fetch starts from a timer, once per catalog however many displays asked, and =opencode-catalog-changed-functions= run when it arrives, as they do when an event or a reconnection makes a catalog forgotten. A selected variant needs no catalog; a default one needs both the model and the provider catalogs, as the request it reproduces merges their settings. The mode line falls back to the agent, model and provider IDs until the catalogs arrive, as it always did, and computes its segments again whenever the catalog generation changes.
 
 * No session list
 
