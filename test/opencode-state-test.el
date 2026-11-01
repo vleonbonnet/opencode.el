@@ -1052,27 +1052,41 @@ TYPE is the event type, `session.step.ended' by default."
       (cancel-timer timer)
       (apply (timer--function timer) (timer--args timer)))))
 
-(defun opencode-test-state-message-queries ()
-  "Return the message requests made, oldest first, as (SESSION-ID . QUERY)."
+(defun opencode-test-state-message-queries (&optional type)
+  "Return the message requests made, oldest first, as (SESSION-ID . QUERY).
+Only those for messages of TYPE when given: \"assistant\" ones start
+every context-size fetch."
   (seq-keep (lambda (request)
-              (let ((path (plist-get request :path)))
-                (when (string-match "\\`/api/session/\\([^/]+\\)/message\\'" path)
-                  (cons (match-string 1 path) (plist-get request :query)))))
+              (let ((path (plist-get request :path))
+                    (query (plist-get request :query)))
+                (when (and (string-match "\\`/api/session/\\([^/]+\\)/message\\'" path)
+                           (or (null type) (equal (alist-get 'type query) type)))
+                  (cons (match-string 1 path) query))))
             (reverse opencode-test-requests)))
 
 (defvar opencode-test-state-held nil
   "Answers of the message requests held by `opencode-test-state-holding-messages', newest first.")
 
+(defvar opencode-test-state-held-types '("assistant")
+  "Message types whose requests `opencode-test-state-holding-messages' holds.
+A context-size fetch asks for assistant messages first, so holding
+those holds the fetch; the compaction it asks for next is answered at
+once unless \"compaction\" is held too.")
+
 (defmacro opencode-test-state-holding-messages (&rest body)
   "Run BODY with message requests held until `opencode-test-state-answer' answers them.
-A held request is recorded in `opencode-test-requests' when answered,
-from what the server knows then.  Other requests are answered at once."
+Only requests for the types of `opencode-test-state-held-types' are
+held.  A held request is recorded in `opencode-test-requests' when
+answered, from what the server knows then.  Other requests are answered
+at once."
   (declare (indent 0) (debug t))
   `(let ((answer (symbol-function 'opencode-request))
          (opencode-test-state-held nil))
      (cl-letf (((symbol-function 'opencode-request)
                 (lambda (method path &rest arguments)
-                  (if (string-suffix-p "/message" path)
+                  (if (and (string-suffix-p "/message" path)
+                           (member (alist-get 'type (plist-get arguments :query))
+                                   opencode-test-state-held-types))
                       (push (lambda () (apply answer method path arguments))
                             opencode-test-state-held)
                     (apply answer method path arguments)))))
@@ -1109,11 +1123,15 @@ from what the server knows then.  Other requests are answered at once."
       (should-not (opencode-test-state-message-queries))
       (should (equal opencode-state--context-queue '("ses_a" "ses_b" "ses_c")))
       (opencode-test-state-fetch-contexts)
+      ;; Then the newest compaction, which none of them had.
       (should (equal (opencode-test-state-message-queries)
                      `(("ses_a" (limit . 1) (type . "assistant") (order . "desc"))
                        ("ses_a" (limit . 1) (type . "assistant") (cursor . "1"))
+                       ("ses_a" (limit . 1) (type . "compaction") (order . "desc"))
                        ("ses_b" (limit . 1) (type . "assistant") (order . "desc"))
-                       ("ses_c" (limit . 1) (type . "assistant") (order . "desc")))))
+                       ("ses_b" (limit . 1) (type . "compaction") (order . "desc"))
+                       ("ses_c" (limit . 1) (type . "assistant") (order . "desc"))
+                       ("ses_c" (limit . 1) (type . "compaction") (order . "desc")))))
       (should (equal (opencode-state-context "ses_a") 1250))
       (should (equal (plist-get (opencode-state-get "ses_a") :context) 1250))
       (should (equal (opencode-state-context "ses_b") 5000))
@@ -1151,7 +1169,7 @@ from what the server knows then.  Other requests are answered at once."
             (should (<= (length opencode-test-state-held) 2))
             (opencode-test-state-answer)
             (opencode-test-state-fetch-contexts))
-          (should (equal (mapcar #'car (opencode-test-state-message-queries)) ids))
+          (should (equal (mapcar #'car (opencode-test-state-message-queries "assistant")) ids))
           (should (equal (mapcar #'opencode-state-context ids) '(1000 2000 3000 4000 5000))))))))
 
 (ert-deftest opencode-test-state-context-events ()
@@ -1194,7 +1212,7 @@ from what the server knows then.  Other requests are answered at once."
       (should (equal opencode-test-state-updates '("ses_s")))
       (should-not (opencode-state-context "ses_s"))
       (opencode-test-state-fetch-contexts)
-      (should (equal (mapcar #'car (opencode-test-state-message-queries)) '("ses_s")))
+      (should (equal (mapcar #'car (opencode-test-state-message-queries "assistant")) '("ses_s")))
       (should (equal (opencode-state-context "ses_s") 300))
       ;; The size is no status.
       (should (equal opencode-test-state-changes '(("ses_new" nil idle)))))))
@@ -1284,7 +1302,8 @@ from what the server knows then.  Other requests are answered at once."
           (opencode-test-state-answer)
           (opencode-test-state-fetch-contexts))
         ;; The fetch asked for while down comes first.
-        (should (equal (mapcar #'car (opencode-test-state-message-queries)) '("ses_d" "ses_b" "ses_c")))
+        (should (equal (mapcar #'car (opencode-test-state-message-queries "assistant"))
+                       '("ses_d" "ses_b" "ses_c")))
         (should (equal (mapcar #'opencode-state-context '("ses_a" "ses_b" "ses_c" "ses_d"))
                        '(100 250 300 400))))
       ;; A fetch in flight when the stream reconnects is made again.
@@ -1320,8 +1339,9 @@ the buffer streaming the events finds."
       (opencode-test-with-state-server (copy-sequence server)
         (opencode-test-state-connect)
         (let ((replayed (buffer-local-value 'opencode-session-tokens (opencode-test-open id))))
-          ;; Only a shell command ran there.
-          (should (eq (null replayed) (equal scenario "shell-input")))
+          ;; Only a shell command ran in one; the other was compacted
+          ;; last, by a service that did not estimate what that left.
+          (should (eq (null replayed) (and (member scenario '("shell-input" "history")) t)))
           (opencode-state-context id)
           (opencode-test-state-fetch-contexts)
           (should (equal (list scenario (opencode-state-context id)) (list scenario replayed)))))
@@ -1336,10 +1356,233 @@ the buffer streaming the events finds."
           (should (equal (list scenario (opencode-state-context id))
                          (list scenario (buffer-local-value 'opencode-session-tokens live))))
           ;; Known from the events, without a fetch, unless no step
-          ;; reported usage or a revert dropped messages, as the buffer
-          ;; then reloads them.
+          ;; reported usage: the compaction that followed the revert
+          ;; of the history settled the size.
           (should (eq (and (opencode-test-state-message-queries) t)
-                      (and (member scenario '("history" "shell-input")) t))))))))
+                      (equal scenario "shell-input"))))))))
+
+;;;; Context size after a compaction
+
+(defun opencode-test-state-compaction (offset status &optional context)
+  "Return a compaction message of STATUS created at OFFSET, estimating CONTEXT.
+Its usage is the compaction request's, which read the 120k tokens of
+conversation it replaced, as the service records it."
+  `((id . ,(opencode-test-state-id "msg_" offset)) (type . "compaction")
+    (time (created . ,(opencode-test-state-ms offset)))
+    (status . ,status) (reason . "manual")
+    ,@(when (equal status "completed")
+        `((model (id . "gpt-test") (providerID . "openai")) (summary . "## Objective\n- go on")
+          ,@(when context `((context . ,context)))))
+    ,@(when (equal status "failed")
+        '((error (type . "compaction.failed") (message . "Compaction produced no summary"))))
+    (cost . 0.4) (tokens . ,(opencode-test-state-usage 2000 900 118000))))
+
+(defun opencode-test-state-compaction-ended (session offset &optional context)
+  "Return the end of a compaction of SESSION at OFFSET, estimating CONTEXT."
+  (opencode-test-state-event "session.compaction.ended" session offset
+                             '(reason . "manual") '(model (id . "gpt-test") (providerID . "openai"))
+                             '(text . "## Objective\n- go on")
+                             `(context . ,context) '(cost . 0.4)
+                             `(tokens . ,(opencode-test-state-usage 2000 900 118000))))
+
+(ert-deftest opencode-test-state-context-compaction-events ()
+  "A compaction's end settles the size to the service's estimate, or to unknown without one."
+  (opencode-test-with-state-server nil
+    (opencode-test-state-running-session)
+    (opencode-test-dispatch (list (opencode-test-state-step-ended "ses_s" 100 (opencode-test-state-usage 120000))))
+    (should (equal (opencode-state-context "ses_s") 120000))
+    (should-not (opencode-state-context-estimated-p "ses_s"))
+    (opencode-test-state-recording
+      (opencode-test-dispatch
+       (list (opencode-test-state-event "session.compaction.started" "ses_s" 110 '(reason . "manual"))))
+      ;; Running, a compaction changes nothing.
+      (should (equal (opencode-state-context "ses_s") 120000))
+      (should-not opencode-test-state-updates)
+      (opencode-test-dispatch (list (opencode-test-state-compaction-ended "ses_s" 120 4200)))
+      (should (equal opencode-test-state-updates '("ses_s")))
+      ;; Not its request's usage, which read the conversation replaced.
+      (should (equal (opencode-state-context "ses_s") 4200))
+      (should (opencode-state-context-estimated-p "ses_s"))
+      (should (plist-get (opencode-state-get "ses_s") :context-estimated))
+      ;; The service does not mark the session updated.
+      (should (equal (plist-get (opencode-state-get "ses_s") :updated) (opencode-test-state-time 100)))
+      (should-not opencode-test-state-changes))
+    ;; The next step measures it.
+    (opencode-test-dispatch (list (opencode-test-state-step-ended "ses_s" 130 (opencode-test-state-usage 4900))))
+    (should (equal (opencode-state-context "ses_s") 4900))
+    (should-not (opencode-state-context-estimated-p "ses_s"))
+    ;; Without an estimate, as from a native compaction or an older
+    ;; service, the size is unknown until the next step.
+    (opencode-test-dispatch (list (opencode-test-state-compaction-ended "ses_s" 140)))
+    (should-not (opencode-state-context "ses_s"))
+    (should-not (opencode-state-context-estimated-p "ses_s"))
+    ;; A failed compaction left the conversation as it was.
+    (opencode-test-dispatch
+     (list (opencode-test-state-step-ended "ses_s" 150 (opencode-test-state-usage 6000))
+           (opencode-test-state-event "session.compaction.failed" "ses_s" 160 '(reason . "manual")
+                                      '(error (type . "compaction.failed") (message . "no summary")))))
+    (should (equal (opencode-state-context "ses_s") 6000))
+    ;; All settled by events: nothing was fetched.
+    (opencode-test-state-fetch-contexts)
+    (should-not (opencode-test-state-message-queries))))
+
+(ert-deftest opencode-test-state-context-fetched-after-compaction ()
+  "A loaded session's size is that of a completed compaction newer than its newest usage."
+  (opencode-test-with-state-server
+      (list :sessions (mapcar (lambda (id) (opencode-test-state-info id :updated 40))
+                              '("ses_a" "ses_b" "ses_c" "ses_d" "ses_e" "ses_f"))
+            :messages
+            `(("ses_a" ,(opencode-test-state-compaction 20 "completed" 4000)
+               ,(opencode-test-state-assistant 10 (opencode-test-state-usage 120000)))
+              ;; A step after the compaction measured the size.
+              ("ses_b" ,(opencode-test-state-assistant 30 (opencode-test-state-usage 5000))
+               ,(opencode-test-state-compaction 20 "completed" 4000)
+               ,(opencode-test-state-assistant 10 (opencode-test-state-usage 120000)))
+              ;; A compaction the service did not estimate.
+              ("ses_c" ,(opencode-test-state-compaction 20 "completed")
+               ,(opencode-test-state-assistant 10 (opencode-test-state-usage 120000)))
+              ;; A failed compaction changed nothing since the completed one.
+              ("ses_d" ,(opencode-test-state-compaction 30 "failed")
+               ,(opencode-test-state-compaction 20 "completed" 3000)
+               ,(opencode-test-state-assistant 10 (opencode-test-state-usage 120000)))
+              ;; The step after the compaction runs, without usage yet.
+              ("ses_e" ,(opencode-test-state-assistant 30)
+               ,(opencode-test-state-compaction 20 "completed" 3500)
+               ,(opencode-test-state-assistant 10 (opencode-test-state-usage 120000)))
+              ;; Compactions older than the newest usage are not paged through.
+              ("ses_f" ,(opencode-test-state-assistant 30 (opencode-test-state-usage 700))
+               ,(opencode-test-state-compaction 20 "failed")
+               ,(opencode-test-state-compaction 10 "completed" 3000))))
+    (opencode-test-state-connect)
+    (let ((ids '("ses_a" "ses_b" "ses_c" "ses_d" "ses_e" "ses_f")))
+      (mapc #'opencode-state-context ids)
+      (opencode-test-state-fetch-contexts)
+      (should (equal (mapcar (lambda (id)
+                               (list id (opencode-state-context id) (opencode-state-context-estimated-p id)))
+                             ids)
+                     '(("ses_a" 4000 t) ("ses_b" 5000 nil) ("ses_c" nil nil) ("ses_d" 3000 t)
+                       ("ses_e" 3500 t) ("ses_f" 700 nil))))
+      (should (equal (seq-keep (lambda (query) (and (member (car query) '("ses_d" "ses_f")) query))
+                               (opencode-test-state-message-queries "compaction"))
+                     '(("ses_d" (limit . 1) (type . "compaction") (order . "desc"))
+                       ("ses_d" (limit . 1) (type . "compaction") (cursor . "1"))
+                       ("ses_f" (limit . 1) (type . "compaction") (order . "desc"))))))))
+
+(ert-deftest opencode-test-state-context-compaction-supersedes-fetch ()
+  "A compaction ending during a fetch wins over its answer, at either of its requests."
+  (dolist (held '("assistant" "compaction"))
+    (opencode-test-with-state-server nil
+      (opencode-test-state-running-session)
+      (plist-put opencode-test-state-server :messages
+                 `(("ses_s" ,(opencode-test-state-assistant 50 (opencode-test-state-usage 120000)))))
+      (let ((opencode-test-state-held-types (list held)))
+        (opencode-test-state-holding-messages
+          (opencode-state-context "ses_s")
+          (opencode-test-state-fetch-contexts)
+          (should (= (length opencode-test-state-held) 1))
+          (opencode-test-dispatch (list (opencode-test-state-compaction-ended "ses_s" 100 4200)))
+          (opencode-test-state-answer)
+          (should (equal (list held (opencode-state-context "ses_s")) (list held 4200)))
+          (should (opencode-state-context-estimated-p "ses_s"))
+          (opencode-test-state-fetch-contexts)
+          (should-not opencode-test-state-held))))))
+
+(ert-deftest opencode-test-state-context-compaction-reconnect ()
+  "A compaction that may have ended while the stream was down has the size fetched again.
+The service does not mark the session updated when it ends."
+  (opencode-test-with-state-server
+      (list :sessions (list (opencode-test-state-info "ses_a" :updated 10)
+                            (opencode-test-state-info "ses_b" :updated 10))
+            :messages `(("ses_a" ,(opencode-test-state-assistant 10 (opencode-test-state-usage 120000)))
+                        ("ses_b" ,(opencode-test-state-assistant 10 (opencode-test-state-usage 90000)))))
+    (opencode-test-state-connect)
+    (mapc #'opencode-state-context '("ses_a" "ses_b"))
+    (opencode-test-state-fetch-contexts)
+    (should (equal (mapcar #'opencode-state-context '("ses_a" "ses_b")) '(120000 90000)))
+    (opencode-test-dispatch
+     (list (opencode-test-state-event "session.compaction.started" "ses_a" 20 '(reason . "auto"))))
+    (cl-flet ((reconnect (messages)
+                (plist-put opencode-test-state-server :messages
+                           `(("ses_a" ,@messages ,(opencode-test-state-assistant 10 (opencode-test-state-usage 120000)))
+                             ("ses_b" ,(opencode-test-state-assistant 10 (opencode-test-state-usage 90000)))))
+                (setq opencode-test-requests nil)
+                (opencode-test-state-connect)
+                (mapc #'opencode-state-context '("ses_a" "ses_b"))
+                (opencode-test-state-fetch-contexts)
+                (mapcar #'car (opencode-test-state-message-queries "assistant"))))
+      ;; Still running when the stream comes back.
+      (should (equal (reconnect (list (opencode-test-state-compaction 20 "running"))) '("ses_a")))
+      (should (equal (mapcar #'opencode-state-context '("ses_a" "ses_b")) '(120000 90000)))
+      ;; It ended while the stream was down again.
+      (should (equal (reconnect (list (opencode-test-state-compaction 20 "completed" 4000))) '("ses_a")))
+      (should (equal (opencode-state-context "ses_a") 4000))
+      (should (opencode-state-context-estimated-p "ses_a"))
+      ;; That fetch found none running: a reconnection keeps the estimate,
+      ;; as any size, while nothing changed.
+      (should-not (reconnect (list (opencode-test-state-compaction 20 "completed" 4000))))
+      (should (equal (opencode-state-context "ses_a") 4000))
+      (should (opencode-state-context-estimated-p "ses_a"))
+      ;; A compaction starting while a fetch runs outlives that fetch's answer.
+      (opencode-test-dispatch (list (opencode-test-state-event "session.revert.committed" "ses_b" 30
+                                                               '(to . "msg_x"))))
+      (let ((opencode-test-state-held-types '("compaction")))
+        (opencode-test-state-holding-messages
+          (opencode-state-context "ses_b")
+          (opencode-test-state-fetch-contexts)
+          (opencode-test-dispatch
+           (list (opencode-test-state-event "session.compaction.started" "ses_b" 40 '(reason . "manual"))))
+          (opencode-test-state-answer)
+          (should (equal (opencode-state-context "ses_b") 90000))))
+      (should (equal (reconnect (list (opencode-test-state-compaction 20 "completed" 4000))) '("ses_b"))))))
+
+(ert-deftest opencode-test-state-context-compaction-matches-buffers ()
+  "After a compaction, the registry's size is the one the session buffer shows.
+Fetched, it is what replaying the transcript finds; followed live, what
+the buffer receiving the compaction's end finds."
+  (pcase-dolist (`(,messages ,events)
+                 `(;; The service's estimate.
+                   ((,(opencode-test-state-compaction 20 "completed" 4000)
+                     ,(opencode-test-state-assistant 10 (opencode-test-state-usage 120000)))
+                    (,(opencode-test-state-compaction-ended "ses_x" 20 4000)))
+                   ;; None: unknown until the next step.
+                   ((,(opencode-test-state-compaction 20 "completed")
+                     ,(opencode-test-state-assistant 10 (opencode-test-state-usage 120000)))
+                    (,(opencode-test-state-compaction-ended "ses_x" 20)))
+                   ;; Measured by the next step.
+                   ((,(opencode-test-state-assistant 30 (opencode-test-state-usage 5000))
+                     ,(opencode-test-state-compaction 20 "completed" 4000)
+                     ,(opencode-test-state-assistant 10 (opencode-test-state-usage 120000)))
+                    (,(opencode-test-state-compaction-ended "ses_x" 20 4000)
+                     ,(opencode-test-state-step-ended "ses_x" 30 (opencode-test-state-usage 5000))))
+                   ;; A failed compaction changes nothing.
+                   ((,(opencode-test-state-compaction 20 "failed")
+                     ,(opencode-test-state-assistant 10 (opencode-test-state-usage 120000)))
+                    (,(opencode-test-state-event "session.compaction.failed" "ses_x" 20 '(reason . "manual")
+                                                 '(error (type . "compaction.failed") (message . "no summary")))))))
+    (let ((server (list :sessions (list (opencode-test-state-info "ses_x" :updated 40))
+                        :messages (list (cons "ses_x" messages)))))
+      (opencode-test-with-state-server (copy-sequence server)
+        (opencode-test-state-connect)
+        (let ((buffer (opencode-session-open (opencode-test-state-info "ses_x" :updated 40) :no-display t)))
+          (opencode-state-context "ses_x")
+          (opencode-test-state-fetch-contexts)
+          (should (equal (list (opencode-state-context "ses_x") (opencode-state-context-estimated-p "ses_x"))
+                         (list (buffer-local-value 'opencode-session-tokens buffer)
+                               (buffer-local-value 'opencode-session-tokens-estimated buffer))))))
+      ;; Live, from an empty transcript.
+      (opencode-test-with-state-server (list :sessions (plist-get server :sessions) :messages '(("ses_x")))
+        (opencode-test-state-connect)
+        (let ((buffer (opencode-session-open (opencode-test-state-info "ses_x" :updated 40) :no-display t)))
+          (plist-put opencode-test-state-server :messages (plist-get server :messages))
+          ;; The buffer and the registry knew the measured size first.
+          (opencode-test-dispatch (list (opencode-test-state-step-ended "ses_x" 10 (opencode-test-state-usage 120000))))
+          (opencode-test-dispatch events)
+          (setq opencode-test-requests nil)
+          (should (equal (list (opencode-state-context "ses_x") (opencode-state-context-estimated-p "ses_x"))
+                         (list (buffer-local-value 'opencode-session-tokens buffer)
+                               (buffer-local-value 'opencode-session-tokens-estimated buffer))))
+          (opencode-test-state-fetch-contexts)
+          (should-not (opencode-test-state-message-queries)))))))
 
 ;;;; Actions
 

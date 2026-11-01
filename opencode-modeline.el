@@ -44,7 +44,9 @@
 ;; The agent, model, variant, provider and context are drawn by the
 ;; displays of opencode-display.el, which other packages' session lists
 ;; share.  A model can cost more per token once a request exceeds a
-;; context size; crossing it is reported once.
+;; context size; crossing it is reported once, as a step measures it:
+;; the estimate a compaction leaves is shown, with a "~", but never
+;; reported, and the next step past the size reports it again.
 
 ;;; Code:
 
@@ -77,10 +79,18 @@
     (setq opencode--long-context-notified (eq (car tier) 'over))))
 
 (defun opencode--long-context-replayed ()
-  "Take a reopened session's tier as known, so an old crossing is not reported."
-  (setq opencode--long-context-notified (eq (car (opencode-long-context-tier)) 'over)))
+  "Take a reopened session's tier as known, so an old crossing is not reported.
+An estimate is no crossing: the next step measures the size."
+  (setq opencode--long-context-notified (and (not opencode-session-tokens-estimated)
+                                             (eq (car (opencode-long-context-tier)) 'over))))
+
+(defun opencode--long-context-compacted (&rest _)
+  "Have the next step past a price tier report it.
+Compacting replaced the context that crossed it."
+  (setq opencode--long-context-notified nil))
 
 (add-hook 'opencode-step-ended-functions #'opencode--long-context-check)
+(add-hook 'opencode-compaction-ended-functions #'opencode--long-context-compacted)
 (add-hook 'opencode-session-replayed-hook #'opencode--long-context-replayed)
 
 ;;;; Segments
@@ -125,7 +135,8 @@ Until the catalogs arrive, the agent, model and provider go by their IDs."
         (provider . ,(and provider-id
                           (or (opencode-provider-display provider-id)
                               (opencode--provider-string provider-id provider-id))))
-        (context . ,(opencode-context-display opencode-session-tokens model))))))
+        (context . ,(opencode-context-display opencode-session-tokens model nil
+                                              opencode-session-tokens-estimated))))))
 
 (defvar-local opencode--mode-line-segments nil
   "(KEY . SEGMENTS) of the session details last computed.")
@@ -137,8 +148,8 @@ and `context'; `short-model' drops a leading \"Claude \".  They are
 computed again only when the session or a catalog changed, as the mode
 line is redrawn on every streamed chunk."
   (let ((key (list opencode-session-agent opencode-session-model opencode-session-tokens
-                   opencode-catalog-generation default-directory opencode-provider-icons
-                   opencode-mode-line-agent-faces opencode-default-variant-function
+                   opencode-session-tokens-estimated opencode-catalog-generation default-directory
+                   opencode-provider-icons opencode-mode-line-agent-faces opencode-default-variant-function
                    opencode-long-context-tiers opencode-long-context-near)))
     (if (equal key (car opencode--mode-line-segments))
         (cdr opencode--mode-line-segments)

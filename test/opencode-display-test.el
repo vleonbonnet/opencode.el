@@ -182,6 +182,24 @@ catalogs only when given its directory."
       (should-not (opencode-context-display 1000 '((id . "rocket") (providerID . "acme")) workspace))
       (should-not (opencode-context-display 1000 nil workspace)))))
 
+(ert-deftest opencode-test-display-context-estimated ()
+  "An estimated context shows a ~ before its percentage, and its tooltip says why."
+  (opencode-test-with-catalogs
+    (let ((workspace opencode-test-workspace))
+      (let ((context (opencode-context-display 100000 opencode-test-sol workspace t)))
+        (should (equal context "\U000F0A9F ~25%"))
+        (should (equal (get-text-property 0 'help-echo context)
+                       (concat "Context: ~100k/400k tokens\n"
+                               "Estimated by the service after compaction; the next step measures it"))))
+      (let ((context (opencode-context-display 190000 opencode-test-claude workspace t)))
+        (should (equal context "\U000F0A9F ~19%"))
+        (should (eq (get-text-property 0 'face context) 'opencode-attention))
+        (should (string-suffix-p "\nContext ~190k/200k: near the 2× tier" (get-text-property 0 'help-echo context))))
+      (let ((context (opencode-context-display 250000 opencode-test-claude workspace t)))
+        (should (equal context "\U000F0A9F ~25% 2×"))
+        (should (string-suffix-p "\nContext estimated over 200k: requests may cost 2×"
+                                 (get-text-property 0 'help-echo context)))))))
+
 (ert-deftest opencode-test-display-waits-for-catalogs ()
   "Displays needing a catalog not fetched yet are nil, and fetch it without waiting.
 Its arrival runs `opencode-catalog-changed-functions'."

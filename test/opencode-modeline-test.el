@@ -138,6 +138,114 @@
           (opencode--long-context-check)
           (should (= (length reports) 1)))))))
 
+(defun opencode-test-compaction-ended (session &optional context)
+  "Return the end of a manual compaction of SESSION, estimating CONTEXT.
+Its usage is the compaction request's, which read the conversation it replaced."
+  `((type . "session.compaction.ended")
+    (data (sessionID . ,session) (reason . "manual") (model (id . "gpt-6-sol") (providerID . "openai"))
+          (text . "## Objective\n- go on") ,@(when context `((context . ,context))) (cost . 0.4)
+          (tokens (input . 2000) (output . 900) (reasoning . 0) (cache (read . 118000) (write . 0))))))
+
+(defun opencode-test-step-ended (session input)
+  "Return the end of a step of SESSION whose usage counts INPUT tokens."
+  `((type . "session.step.ended")
+    (data (sessionID . ,session) (assistantMessageID . "msg_step") (finish . "stop") (cost . 0)
+          (tokens (input . ,input) (output . 0) (reasoning . 0) (cache (read . 0) (write . 0))))))
+
+(ert-deftest opencode-test-mode-line-context-after-compaction ()
+  "After a compaction the context is the service's estimate, with a ~, until a step measures it."
+  (let ((id (opencode-test-scenario "switch")))
+    (opencode-test-with-server
+      (with-current-buffer (opencode-test-open-empty id)
+        (opencode-test-fetch-catalogs)
+        (cl-flet ((context () (alist-get 'context (opencode-mode-line-segments))))
+          (opencode-test-dispatch (list (opencode-test-step-ended id 120000)))
+          (should (equal (context) "\U000F0AA0 30%"))
+          (should-not opencode-session-tokens-estimated)
+          ;; Not the usage of the compaction's request, which read the 120k replaced.
+          (opencode-test-dispatch (list (opencode-test-compaction-ended id 4200)))
+          (should (equal opencode-session-tokens 4200))
+          (should opencode-session-tokens-estimated)
+          (should (equal (context) "\U000F0A9E ~1%"))
+          (should (equal (get-text-property 0 'help-echo (context))
+                         (concat "Context: ~4k/400k tokens\n"
+                                 "Estimated by the service after compaction; the next step measures it")))
+          (opencode-test-dispatch (list (opencode-test-step-ended id 4900)))
+          (should (equal (context) "\U000F0A9E 1%"))
+          (should-not opencode-session-tokens-estimated)
+          ;; Without an estimate, as from a native compaction or an older
+          ;; service, no size shows until the next step.
+          (opencode-test-dispatch (list (opencode-test-compaction-ended id)))
+          (should-not opencode-session-tokens)
+          (should-not (context)))))
+    ;; Replayed, the newest of the usage and the completed compaction holds the size.
+    (pcase-dolist (`(,messages ,tokens ,estimated)
+                   `(((((id . "msg_a") (type . "assistant") (time (created . 10))
+                        (tokens (input . 120000) (output . 0) (reasoning . 0) (cache (read . 0) (write . 0))))
+                       ((id . "msg_c") (type . "compaction") (status . "completed") (reason . "manual")
+                        (summary . "## Objective") (context . 4200) (time (created . 20))
+                        (tokens (input . 2000) (output . 900) (reasoning . 0) (cache (read . 118000) (write . 0)))))
+                      4200 t)
+                     ((((id . "msg_a") (type . "assistant") (time (created . 10))
+                        (tokens (input . 120000) (output . 0) (reasoning . 0) (cache (read . 0) (write . 0))))
+                       ((id . "msg_c") (type . "compaction") (status . "completed") (reason . "manual")
+                        (summary . "## Objective") (time (created . 20))))
+                      nil nil)
+                     ((((id . "msg_a") (type . "assistant") (time (created . 10))
+                        (tokens (input . 120000) (output . 0) (reasoning . 0) (cache (read . 0) (write . 0))))
+                       ((id . "msg_c") (type . "compaction") (status . "failed") (reason . "manual")
+                        (error (type . "compaction.failed") (message . "no summary")) (time (created . 20)))
+                       ((id . "msg_r") (type . "compaction") (status . "running") (reason . "manual")
+                        (summary . "") (time (created . 30))))
+                      120000 nil)))
+      (opencode-test-with-server
+        (let ((opencode-test-routes
+               (cons (list 'get "/message\\'" (lambda (_) `((data . ,messages) (cursor))))
+                     opencode-test-routes)))
+          (with-current-buffer (opencode-test-open id)
+            (should (equal (list opencode-session-tokens opencode-session-tokens-estimated)
+                           (list tokens estimated)))))))))
+
+(ert-deftest opencode-test-context-reverted ()
+  "A revert finds the size again in what remains of the transcript, or none."
+  (let ((id (opencode-test-scenario "switch")))
+    (opencode-test-with-server
+      (with-current-buffer (opencode-test-open-empty id)
+        (opencode-test-dispatch (list (opencode-test-step-ended id 120000)
+                                      (opencode-test-compaction-ended id 4200)))
+        (should (equal (list opencode-session-tokens opencode-session-tokens-estimated) '(4200 t)))
+        (let ((opencode-test-routes
+               (cons (list 'get "/message\\'" (lambda (_) '((data) (cursor)))) opencode-test-routes)))
+          (opencode-test-dispatch `(((type . "session.revert.committed")
+                                     (data (sessionID . ,id) (to . "msg_first"))))))
+        (should (equal (list opencode-session-tokens opencode-session-tokens-estimated) '(nil nil)))))))
+
+(ert-deftest opencode-test-long-context-estimate-not-reported ()
+  "An estimate past a price tier is shown, not reported; the next step past it is."
+  (let ((id (opencode-test-scenario "switch")))
+    (opencode-test-with-server
+      (with-current-buffer (opencode-test-open-empty id)
+        (opencode-test-fetch-catalogs)
+        (let ((opencode-long-context-tiers '(("\\`openai\\'" "\\`gpt-6-sol\\'" 272000 "2×")))
+              (reports nil))
+          (cl-letf (((symbol-function 'message)
+                     (lambda (format &rest args) (push (apply #'format format args) reports))))
+            (opencode-test-dispatch (list (opencode-test-step-ended id 280000)))
+            (should (= (length reports) 1))
+            (opencode-test-dispatch (list (opencode-test-compaction-ended id 290000)))
+            (should (= (length reports) 1))
+            (should-not opencode--long-context-notified)
+            (let ((context (alist-get 'context (opencode-mode-line-segments))))
+              (should (equal context "\U000F0AA3 ~72% 2×"))
+              (should (eq (get-text-property 0 'face context) 'error))
+              (should (string-suffix-p "\nContext estimated over 272k: requests may cost 2×"
+                                       (get-text-property 0 'help-echo context))))
+            ;; Reopened on the estimate, the next step past the tier still reports it.
+            (opencode--long-context-replayed)
+            (should-not opencode--long-context-notified)
+            (opencode-test-dispatch (list (opencode-test-step-ended id 280000)))
+            (should (= (length reports) 2))))))))
+
 (ert-deftest opencode-test-mode-line-format ()
   "The default mode line keeps its place around the session element."
   (let ((mode-line-modes '("%[(" (:propertize ("" mode-name)) ("" mode-line-process) " ok" ")%]"))

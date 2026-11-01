@@ -212,6 +212,7 @@ The service refuses message pages asked for so."
          (opencode-state--retry-delay 1)
          (opencode-state--viewing (make-hash-table :test #'equal))
          (opencode-state--contexts (make-hash-table :test #'equal))
+         (opencode-state--compacting (make-hash-table :test #'equal))
          (opencode-state--context-queue nil)
          (opencode-state--context-timer nil)
          (opencode-state--caches (make-hash-table :test #'equal))

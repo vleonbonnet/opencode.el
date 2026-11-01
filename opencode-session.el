@@ -93,6 +93,9 @@ Each function receives a plist (:kind :text :name) and may return
 (defvar opencode-step-ended-functions nil
   "Functions called in the session buffer with each `session.step.ended' data.")
 
+(defvar opencode-compaction-ended-functions nil
+  "Functions called in the session buffer with each `session.compaction.ended' data.")
+
 (defvar opencode-turn-ended-functions nil
   "Functions called in the session buffer with the outcome of each turn that ends.
 They run before `opencode-session-idle-functions'.")
@@ -128,7 +131,15 @@ They run in the session buffer, after it is registered or unregistered.")
   "Model reference (alist id, providerID, variant) the session runs with.")
 
 (defvar-local opencode-session-tokens nil
-  "Context tokens reported by the last step that reported usage.")
+  "Context tokens of the session, or nil when unknown.
+They are what the last step reporting usage reported, or, once a
+compaction completed after it, the service's estimate of the next
+request, which `opencode-session-tokens-estimated' then marks.")
+
+(defvar-local opencode-session-tokens-estimated nil
+  "Non-nil when `opencode-session-tokens' is the service's estimate.
+A completed compaction reports one; the next step reporting usage
+replaces it with the measured size.")
 
 (defvar-local opencode-session-retry nil
   "Data of the retry the current step is waiting for, or nil.")
@@ -707,6 +718,8 @@ transcript or in the input stay there, others at their line, as
            (clrhash opencode--text-blocks)
            (when (hash-table-p opencode--blocks) (clrhash opencode--blocks))
            (setq opencode--last-block-kind nil opencode--current-assistant nil)
+           ;; Replaying the transcript finds the size again, if any remains.
+           (setq opencode-session-tokens nil opencode-session-tokens-estimated nil)
            (opencode--adopt-info info location-generation)
            (opencode-session-load
             (lambda ()
@@ -811,8 +824,19 @@ An error already shown during the current turn is not repeated."
 (defun opencode--note-tokens (tokens)
   "Record TOKENS as the context use, unless they report no usage."
   (when-let* ((size (opencode-context-size tokens)))
-    (setq opencode-session-tokens size)
+    (setq opencode-session-tokens size
+          opencode-session-tokens-estimated nil)
     (force-mode-line-update)))
+
+(defun opencode--note-compaction (context)
+  "Record the context use a completed compaction left, CONTEXT tokens or nil.
+CONTEXT is the service's estimate of the next request.  Its own usage
+is that of the compaction request, which read the conversation it
+replaced, so without an estimate, from a native compaction or an older
+service, the size is unknown until the next step measures it."
+  (setq opencode-session-tokens (and (numberp context) context)
+        opencode-session-tokens-estimated (numberp context))
+  (force-mode-line-update))
 
 (defun opencode--unwrap-notification (text tag attributes)
   "Return TEXT without its TAG element wrapper, or TEXT when it has none.
@@ -897,6 +921,8 @@ error face unless the job completed; any other message is a notice."
                                              "running" "completed"))))
        (opencode-block-update overlay :output (opencode--shell-output (alist-get 'output message)))))
     ("compaction"
+     (when (equal (alist-get 'status message) "completed")
+       (opencode--note-compaction (alist-get 'context message)))
      (opencode-open-block 'tool)
      (opencode-notice-block (pcase (alist-get 'status message)
                               ("failed" "Compaction failed")
@@ -1234,7 +1260,8 @@ delivered: that is where the transcript places them."
             overlay (opencode-fontify-as (propertize "Conversation compacted" 'font-lock-face 'opencode-notice)
                                          'verbatim))
            (opencode-block-update overlay :text (alist-get 'text data)))
-         (opencode--note-tokens nil))
+         (opencode--note-compaction (alist-get 'context data))
+         (run-hook-with-args 'opencode-compaction-ended-functions data))
         ("session.compaction.failed"
          (when-let* ((overlay (opencode-block key)))
            (opencode-block-update overlay :error (alist-get 'error data))))))))

@@ -37,6 +37,10 @@
 ;; as listed in its catalog pricing or in `opencode-long-context-tiers'.
 ;; The context use turns to the attention face near that size and to the
 ;; error face past it.
+;;
+;; Right after a compaction the context size is the service's estimate
+;; of the next request, until that request's step measures it: it shows
+;; with a "~", and its tooltip says so.
 
 ;;; Code:
 
@@ -125,14 +129,18 @@ context size, `opencode-session-tokens'."
             ((>= tokens (* opencode-long-context-near (car threshold)))
              (list 'near (car threshold) (cdr threshold)))))))
 
-(defun opencode-long-context-description (tier &optional tokens)
+(defun opencode-long-context-description (tier &optional tokens estimated)
   "Return the tooltip line describing TIER, from `opencode-long-context-tier'.
-TOKENS is the context size TIER was found for, by default the session's."
+TOKENS is the context size TIER was found for, by default the session's.
+ESTIMATED non-nil means TOKENS is an estimate, as after a compaction."
   (pcase-let ((`(,state ,size ,label) tier))
     (if (eq state 'over)
-        (format "Context over %dk: requests cost %s" (/ size 1000) label)
-      (format "Context %dk/%dk: near the %s tier"
-              (/ (or tokens opencode-session-tokens) 1000) (/ size 1000) label))))
+        (format (if estimated
+                    "Context estimated over %dk: requests may cost %s"
+                  "Context over %dk: requests cost %s")
+                (/ size 1000) label)
+      (format "Context %s%dk/%dk: near the %s tier"
+              (if estimated "~" "") (/ (or tokens opencode-session-tokens) 1000) (/ size 1000) label))))
 
 ;;;; Catalog values
 
@@ -283,14 +291,17 @@ gauge start from this; `opencode-context-display' draws the mode line's."
         (list :tokens tokens :limit limit :fraction (/ (float tokens) limit)
               :tier (opencode-long-context-tier model info tokens))))))
 
-(defun opencode-context-display (tokens model &optional directory)
+(defun opencode-context-display (tokens model &optional directory estimated)
   "Return a context of TOKENS shown against the context size of MODEL.
 MODEL is a model reference, read in DIRECTORY's catalogs.  A pie filling
 by eighths precedes the percentage used, followed past a long-context
 price tier by its label, such as \"2×\".  The whole is in the
 `opencode-attention' face near the tier and in the `error' face past it,
-and its tooltip has the counts and the tier.  Nil when
-`opencode-context-usage' is."
+and its tooltip has the counts and the tier.  ESTIMATED non-nil means
+TOKENS is the service's estimate after a compaction, which a \"~\"
+before the percentage and the tooltip tell, as
+`opencode-state-context-estimated-p' and `opencode-session-tokens-estimated'
+report it.  Nil when `opencode-context-usage' is."
   (when-let* ((usage (opencode-context-usage tokens model directory)))
     (let* ((limit (plist-get usage :limit))
            (tier (plist-get usage :tier))
@@ -299,12 +310,16 @@ and its tooltip has the counts and the tier.  Nil when
            (used (/ (* 100.0 tokens) limit))
            (slice (min 7 (max 0 (1- (ceiling used 12.5))))))
       (propertize (concat (string (+ #xF0A9E slice)) ; nf-md-circle_slice_1..8
-                          (format " %.0f%%" used)
+                          (format " %s%.0f%%" (if estimated "~" "") used)
                           (when (eq (car tier) 'over) (concat " " (nth 2 tier))))
                   'face (pcase (car tier) ('over 'error) ('near 'opencode-attention))
-                  'help-echo (concat (format "Context: %dk/%dk tokens" (/ tokens 1000) (/ limit 1000))
+                  'help-echo (concat (format "Context: %s%dk/%dk tokens" (if estimated "~" "")
+                                             (/ tokens 1000) (/ limit 1000))
+                                     (when estimated
+                                       "\nEstimated by the service after compaction; the next step measures it")
                                      (when tier
-                                       (concat "\n" (opencode-long-context-description tier tokens))))))))
+                                       (concat "\n" (opencode-long-context-description
+                                                      tier tokens estimated))))))))
 
 (provide 'opencode-display)
 ;;; opencode-display.el ends here
