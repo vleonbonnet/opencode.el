@@ -207,6 +207,7 @@ The service refuses message pages asked for so."
          (opencode-state--held nil)
          (opencode-state--fetching (make-hash-table :test #'equal))
          (opencode-state--waiters nil)
+         (opencode-state--wanted nil)
          (opencode-state--retry-timer nil)
          (opencode-state--retry-delay 1)
          (opencode-state--viewing (make-hash-table :test #'equal))

@@ -1368,6 +1368,12 @@ delivered: that is where the transcript places them."
 
 (add-hook 'opencode-events-connected-hook #'opencode--on-connected)
 
+(defun opencode--session-buffers-open-p ()
+  "Return non-nil while a session buffer is open, which follows its session on the stream."
+  (seq-some #'buffer-live-p (hash-table-values opencode-session-buffers)))
+
+(add-hook 'opencode-events-wanted-functions #'opencode--session-buffers-open-p)
+
 ;;;; Message IDs of sent input
 
 ;; A prompt's message exists once the service delivers it, which a
@@ -1520,6 +1526,8 @@ it."
         (opencode--track-sent-input id region)))
     (when opencode-session-model
       (setq opencode-last-model opencode-session-model))
+    ;; The turn shows only through the stream.
+    (opencode-events-reopen)
     (opencode-request
      'post (format "/api/session/%s/prompt" opencode-session-id)
      :body `((id . ,id) (text . ,text)
@@ -1551,6 +1559,7 @@ METADATA, which the service passes on to it."
     (opencode-dismiss-turn-notifications)
     (when key
       (opencode--track-sent-input key region t))
+    (opencode-events-reopen)
     (opencode-request
      'post (format "/api/session/%s/command" opencode-session-id)
      :body `((name . ,name) (text . ,arguments)
@@ -1681,6 +1690,7 @@ which like other messages between prompts never start a cut."
                                    :metadata metadata :region region
                                    :then (lambda (_) (mapc #'delete-file temp-files))))
         ('shell
+         (opencode-events-reopen)
          (opencode-request 'post (format "/api/session/%s/shell" opencode-session-id)
                            :body `((command . ,(substring string 1)))))
         ('prompt
