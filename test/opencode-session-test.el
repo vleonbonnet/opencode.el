@@ -294,10 +294,6 @@
         (should (eq (plist-get (opencode-block-data (opencode-block key)) :type) 'notice))))))
 
 ;; Signed reasoning as Anthropic sends it: the signature's decoded header names the block's kind.
-(defun opencode-test-signature (kind)
-  "Return a signature whose decoded header names block KIND."
-  (base64-encode-string (concat (string #x12 #x05) "B" (string (length kind)) kind (string 0) (make-string 45 7)) t))
-
 (defconst opencode-test-signed-reasoning
   `(((text . "Narrated for the user.") (native (signature . ,(opencode-test-signature "narration"))))
     ((text . "") (native (signature . ,(opencode-test-signature "thinking")))))

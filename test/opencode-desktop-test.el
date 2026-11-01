@@ -162,6 +162,48 @@
       (should-not (buffer-live-p buffer))
       (should (eq (gethash id opencode-session-buffers) open)))))
 
+(ert-deftest opencode-test-desktop-restored-windows-follow ()
+  "Windows that showed a placeholder show the end of the restored session, its margins, and follow it."
+  (opencode-test-with-desktop
+    (let ((id (opencode-test-scenario "text"))
+          (other (get-buffer-create "*desktop elsewhere*")))
+      (unwind-protect
+          (save-window-excursion
+            (delete-other-windows)
+            (set-window-buffer (selected-window) other)
+            (let ((buffer (opencode-desktop-restore nil "*OpenCode: restored*" (opencode-test-desktop-entry id 3)))
+                  (window (split-window nil nil 'below)))
+              (push buffer placeholders)
+              (set-window-buffer window buffer)
+              (opencode-test-service-ready)
+              (with-current-buffer buffer
+                (should (derived-mode-p 'opencode-session-mode))
+                (should (= (window-point window) (point-max)))
+                (should (eql (car (window-margins window)) left-margin-width))
+                (opencode-test-turn id "started")
+                (opencode-test-answer id "msg_restored" "Written after the restore.")
+                (opencode-test-turn id "succeeded")
+                (should (= (window-point window) (point-max))))))
+        (kill-buffer other)))))
+
+(ert-deftest opencode-test-desktop-point-following-output ()
+  "A point saved at the end of the transcript returns to its end, wherever the session moved it."
+  (opencode-test-with-desktop
+    (let ((id (opencode-test-scenario "shell")))
+      (with-current-buffer (opencode-test-open id)
+        (goto-char (point-max))
+        (should (plist-get (funcall desktop-save-buffer nil) :follow))
+        (goto-char (point-min))
+        (should-not (plist-member (funcall desktop-save-buffer nil) :follow))
+        (kill-buffer))
+      (let ((buffer (opencode-desktop-restore nil "*OpenCode: grown*"
+                                              (append (opencode-test-desktop-entry id 10) '(:follow t)))))
+        (push buffer placeholders)
+        (opencode-test-service-ready)
+        (with-current-buffer buffer
+          (should (> (point-max) 10))
+          (should (= (point) (point-max))))))))
+
 (ert-deftest opencode-test-desktop-entry-validated ()
   "Malformed entries are rejected before any buffer is made."
   (dolist (entry (list '(:version 2 :session-id "ses_a" :directory "/tmp/")

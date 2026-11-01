@@ -86,11 +86,156 @@ markdown-ts and keeps its markup."
 (defvar-local opencode--last-block-kind nil
   "Kind of the last block written: `text', `reasoning', `tool', `notice' or `user'.")
 
-;;;; Output
+;;;; The end of the transcript
 
 (defun opencode-pmark ()
   "Return the process mark position of this session buffer."
   (marker-position (process-mark (get-buffer-process (current-buffer)))))
+
+(defvar-local opencode--prompt-start nil
+  "Marker at the start of the last input prompt written.
+Comint's `comint-last-prompt' cannot tell: it covers whatever line of
+output came last, prompt or not.")
+
+(defun opencode-prompt-shown-p ()
+  "Return non-nil when the transcript ends with an input prompt."
+  (and (markerp opencode--prompt-start)
+       (marker-buffer opencode--prompt-start)
+       (= (+ (marker-position opencode--prompt-start) 2) (opencode-pmark))))
+
+;;;; Points following output
+
+;; Comint keeps the points at the process mark after the output it
+;; writes: the buffer's point through a marker that advances, window
+;; points through `window-point-insertion-type' and
+;; `comint-postoutput-scroll-to-bottom'.  Output written in other ways,
+;; such as an expansion at the end, a prompt written before typed input
+;; or a table aligned in place, keeps them after it with
+;; `opencode-keeping-followers'.
+
+(defvar opencode--keeping-followers nil
+  "Session buffers whose following points an outer call is keeping.
+That call saw them before anything changed, so inner calls leave them.")
+
+(defun opencode--follow-start ()
+  "Return where the positions following output start in this buffer.
+They are at the end of the transcript or in the input: from the start
+of the idle prompt ending the transcript, which shows as nothing, else
+from the process mark.  Without a process, only the end follows."
+  (save-restriction
+    (widen)
+    (cond ((not (get-buffer-process (current-buffer))) (point-max))
+          ((opencode-prompt-shown-p) (marker-position opencode--prompt-start))
+          (t (opencode-pmark)))))
+
+(defun opencode-follows-output-p (position)
+  "Return non-nil when POSITION is at the end of the transcript or in the input.
+A point there stays after the output written at the end, at its place
+in the input."
+  (>= position (opencode--follow-start)))
+
+(defun opencode--followers ()
+  "Return this buffer's point and window points that follow output.
+The value lists (WHO . DISTANCE): WHO is t for the buffer's point, else
+a window showing the buffer, and DISTANCE counts from the end of the
+buffer, so changing the transcript before it leaves DISTANCE as it is."
+  (save-restriction
+    (widen)
+    (let ((start (opencode--follow-start))
+          (followers nil))
+      (when (>= (point) start)
+        (push (cons t (- (point-max) (point))) followers))
+      (dolist (window (get-buffer-window-list nil nil t))
+        (when (>= (window-point window) start)
+          (push (cons window (- (point-max) (window-point window))) followers)))
+      followers)))
+
+(defun opencode--restore-followers (followers)
+  "Put FOLLOWERS, as `opencode--followers' returned them, back at their distance."
+  (save-restriction
+    (widen)
+    (pcase-dolist (`(,who . ,distance) followers)
+      (let ((position (max (point-min) (- (point-max) distance))))
+        (cond ((eq who t) (goto-char position))
+              ((and (window-live-p who) (eq (window-buffer who) (current-buffer)))
+               (set-window-point who position)))))))
+
+(defun opencode--call-keeping-followers (function)
+  "Call FUNCTION, keeping this buffer's points that follow output after it.
+See `opencode-keeping-followers'."
+  (let ((buffer (current-buffer)))
+    (if (memq buffer opencode--keeping-followers)
+        (funcall function)
+      (let ((followers (opencode--followers))
+            (opencode--keeping-followers (cons buffer opencode--keeping-followers)))
+        (unwind-protect (funcall function)
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (opencode--restore-followers followers))))))))
+
+(defmacro opencode-keeping-followers (&rest body)
+  "Run BODY, keeping the points that follow output after what it writes.
+The buffer's point and the window points at the end of the transcript
+or in the input keep their distance from the end of the buffer, so BODY
+may write, replace or delete transcript text, the process mark
+included, as long as it leaves the input alone.  Other points are left
+to their markers.  Nested in another one for the same buffer, it leaves
+them to the outer one, which saw them before anything changed."
+  (declare (indent 0) (debug t))
+  `(opencode--call-keeping-followers (lambda () ,@body)))
+
+(defun opencode--line-place (position)
+  "Return POSITION as (LINE . OFFSET): its line, and how far into it it is."
+  (save-excursion
+    (goto-char position)
+    (cons (line-number-at-pos position t) (- position (pos-bol)))))
+
+(defun opencode--line-position (place)
+  "Return the position of PLACE, a (LINE . OFFSET), within the end of its line."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line (1- (car place)))
+    (min (+ (point) (cdr place)) (pos-eol))))
+
+(defun opencode-save-viewport ()
+  "Return what puts this buffer's point and windows back once it is rendered again.
+Restore it with `opencode-restore-viewport'.  Markers do not survive
+the text they are in, so places are numbers: the points that follow
+output (see `opencode-follows-output-p') keep their distance from the
+end of the buffer, where the typed input is put back, and other points
+their line and their offset in it, their windows the line they start
+at."
+  (save-restriction
+    (widen)
+    (let ((follow (opencode--follow-start)))
+      (cl-flet ((place (position)
+                  (if (>= position follow)
+                      (list 'end (- (point-max) position))
+                    (list 'line (opencode--line-place position)))))
+        (cons (list t (place (point)))
+              (mapcar (lambda (window)
+                        (list window (place (window-point window))
+                              (opencode--line-place (window-start window))))
+                      (get-buffer-window-list nil nil t)))))))
+
+(defun opencode-restore-viewport (viewport)
+  "Put this buffer's point and windows back as `opencode-save-viewport' saved VIEWPORT.
+A window whose point follows output keeps the start the new text gave
+it, which redisplay moves as it needs to show the point."
+  (save-restriction
+    (widen)
+    (cl-flet ((position (place)
+                (pcase place
+                  (`(end ,distance) (max (point-min) (- (point-max) distance)))
+                  (`(line ,line) (opencode--line-position line)))))
+      (pcase-dolist (`(,who ,place ,start) viewport)
+        (cond ((eq who t) (goto-char (position place)))
+              ((and (window-live-p who) (eq (window-buffer who) (current-buffer)))
+               (unless (eq (car place) 'end)
+                 (set-window-start who (opencode--line-position start) t))
+               (set-window-point who (position place))))))))
+
+;;;; Output
 
 (defun opencode-output (string)
   "Write STRING at the process mark as Comint output."
@@ -106,7 +251,8 @@ markdown-ts and keeps its markup."
 Unlike `opencode-output', this writes inside an already rendered
 transcript, for expanded blocks.  Markers exactly at POSITION that
 track the stream (the process mark, the response start and the table
-scan marker) move past STRING, so later output stays after it."
+scan marker) move past STRING, so later output stays after it, and so
+do the points that follow output (see `opencode-keeping-followers')."
   (let* ((process (get-buffer-process (current-buffer)))
          (markers (seq-filter
                    (lambda (marker)
@@ -118,13 +264,14 @@ scan marker) move past STRING, so later output stays after it."
                          opencode--table-scan-marker)))
          (inhibit-read-only t)
          end)
-    (save-excursion
-      (goto-char position)
-      (insert string)
-      (setq end (point))
-      (comint--mark-as-output position end))
-    (dolist (marker markers)
-      (set-marker marker end))
+    (opencode-keeping-followers
+      (save-excursion
+        (goto-char position)
+        (insert string)
+        (setq end (point))
+        (comint--mark-as-output position end))
+      (dolist (marker markers)
+        (set-marker marker end)))
     (opencode-buttonize position end)
     end))
 
@@ -163,17 +310,6 @@ blank line.  Spacing is measured at the process mark and only added."
     (overlay-put overlay 'line-prefix margin)
     (overlay-put overlay 'wrap-prefix margin)
     overlay))
-
-(defvar-local opencode--prompt-start nil
-  "Marker at the start of the last input prompt written.
-Comint's `comint-last-prompt' cannot tell: it covers whatever line of
-output came last, prompt or not.")
-
-(defun opencode-prompt-shown-p ()
-  "Return non-nil when the transcript ends with an input prompt."
-  (and (markerp opencode--prompt-start)
-       (marker-buffer opencode--prompt-start)
-       (= (+ (marker-position opencode--prompt-start) 2) (opencode-pmark))))
 
 (defun opencode-lift-prompt ()
   "Remove the input prompt ending the transcript; return non-nil if there was one.
@@ -229,22 +365,25 @@ Nothing is written when the transcript already ends with one."
       beginning)))
 
 (defun opencode-call-preserving-viewport (buffer function)
-  "Call FUNCTION in BUFFER without moving its point or any window's viewport."
+  "Call FUNCTION in BUFFER without moving its point or any window's viewport.
+A point in the transcript stays at its text, and its window keeps its
+start.  A point at the end of the transcript or in the input follows
+the output FUNCTION writes, as Comint's points do: see
+`opencode-keeping-followers'."
   (with-current-buffer buffer
-    (let* ((pmark (if (get-buffer-process buffer) (opencode-pmark) (point-max)))
-           (keep (lambda (position) (copy-marker position (> position pmark))))
-           (point-marker (funcall keep (point)))
-           (windows (mapcar (lambda (window)
-                              (list window
-                                    (funcall keep (window-start window))
-                                    (funcall keep (window-point window))))
-                            (get-buffer-window-list buffer nil t))))
+    (let* ((follow (opencode--follow-start))
+           (point-marker (and (< (point) follow) (copy-marker (point))))
+           (windows (delq nil (mapcar (lambda (window)
+                                        (when (< (window-point window) follow)
+                                          (list window
+                                                (copy-marker (window-start window))
+                                                (copy-marker (window-point window)))))
+                                      (get-buffer-window-list buffer nil t)))))
       (unwind-protect
-          (let ((comint-output-filter-functions
-                 (remove #'comint-postoutput-scroll-to-bottom comint-output-filter-functions)))
-            (funcall function))
-        (goto-char point-marker)
-        (set-marker point-marker nil)
+          (opencode--call-keeping-followers function)
+        (when point-marker
+          (goto-char point-marker)
+          (set-marker point-marker nil))
         (pcase-dolist (`(,window ,start ,window-point) windows)
           (when (and (window-live-p window) (eq (window-buffer window) buffer))
             (set-window-start window start t)
@@ -558,63 +697,72 @@ applied back, so properties and markers on unchanged text survive."
   "Render the tables of the current text block whose end has arrived.
 A table is complete once a later complete line follows it; FINISHED
 means the block ended, so a table at its end is complete too.  One line
-of context is kept for a header whose delimiter row has yet to arrive."
+of context is kept for a header whose delimiter row has yet to arrive.
+A table ending the output may grow at the process mark, which then
+moves past it with the points following output."
   (when opencode--table-scan-marker
-    (save-excursion
-      (save-restriction
-        ;; Pending input is not part of the assistant's Markdown.
-        (narrow-to-region (point-min) (opencode-pmark))
-        (let* ((inhibit-field-text-motion t)
-               (limit (copy-marker (opencode-pmark)))
-               (complete-end (copy-marker (if finished
-                                              limit
-                                            (goto-char limit)
-                                            (line-beginning-position))))
-               waiting)
-          (unwind-protect
-              (progn
-                (goto-char opencode--table-scan-marker)
-                (while (and (< (point) complete-end) (not waiting))
-                  (let ((node (treesit-node-at (point) 'markdown)))
-                    (while (and node (not (equal (treesit-node-type node) "pipe_table")))
-                      (setq node (treesit-node-parent node)))
-                    ;; At whitespace the node can be the table before point.
-                    (if (and node (< (point) (treesit-node-end node)))
-                        (let ((beg (treesit-node-start node))
-                              (end (treesit-node-end node)))
-                          (if (and (<= end limit)
-                                   (or finished
-                                       (< (save-excursion
-                                            (goto-char end)
-                                            (if (bolp) (point) (line-beginning-position 2)))
-                                          complete-end)))
-                              (let ((next (copy-marker end t)))
-                                (unwind-protect
-                                    (progn
-                                      (funcall opencode-render-table-function beg end)
-                                      (goto-char next)
-                                      (set-marker opencode--table-scan-marker next))
-                                  (set-marker next nil)))
-                            (set-marker opencode--table-scan-marker beg)
-                            (setq waiting t)))
-                      (set-marker opencode--table-scan-marker (point))
-                      (forward-line 1))))
-                (when finished
-                  (set-marker opencode--table-scan-marker nil)
-                  (setq opencode--table-scan-marker nil)))
-            (set-marker limit nil)
-            (set-marker complete-end nil)))))))
+    (opencode-keeping-followers
+      (save-excursion
+        (save-restriction
+          ;; Pending input is not part of the assistant's Markdown.
+          (narrow-to-region (point-min) (opencode-pmark))
+          (let* ((inhibit-field-text-motion t)
+                 (limit (copy-marker (opencode-pmark)))
+                 (complete-end (copy-marker (if finished
+                                                limit
+                                              (goto-char limit)
+                                              (line-beginning-position))))
+                 waiting)
+            (unwind-protect
+                (progn
+                  (goto-char opencode--table-scan-marker)
+                  (while (and (< (point) complete-end) (not waiting))
+                    (let ((node (treesit-node-at (point) 'markdown)))
+                      (while (and node (not (equal (treesit-node-type node) "pipe_table")))
+                        (setq node (treesit-node-parent node)))
+                      ;; At whitespace the node can be the table before point.
+                      (if (and node (< (point) (treesit-node-end node)))
+                          (let ((beg (treesit-node-start node))
+                                (end (treesit-node-end node)))
+                            (if (and (<= end limit)
+                                     (or finished
+                                         (< (save-excursion
+                                              (goto-char end)
+                                              (if (bolp) (point) (line-beginning-position 2)))
+                                            complete-end)))
+                                (let ((next (copy-marker end t))
+                                      (output-end (= end (opencode-pmark))))
+                                  (unwind-protect
+                                      (progn
+                                        (funcall opencode-render-table-function beg end)
+                                        ;; What aligning appends to a table ending the output is output too.
+                                        (when output-end
+                                          (set-marker (process-mark (get-buffer-process (current-buffer))) next))
+                                        (goto-char next)
+                                        (set-marker opencode--table-scan-marker next))
+                                    (set-marker next nil)))
+                              (set-marker opencode--table-scan-marker beg)
+                              (setq waiting t)))
+                        (set-marker opencode--table-scan-marker (point))
+                        (forward-line 1))))
+                  (when finished
+                    (set-marker opencode--table-scan-marker nil)
+                    (setq opencode--table-scan-marker nil)))
+              (set-marker limit nil)
+              (set-marker complete-end nil))))))))
 
 (defun opencode--rerender-tables (&rest _)
   "Reflow rendered tables after a window resize, keeping the stream markers.
 Markers are restored by their distance from the end of the buffer, which
-a change before them does not alter."
+a change before them does not alter, and so are the points following
+output."
   (when opencode-rerender-tables-function
     (let* ((process (get-buffer-process (current-buffer)))
            (markers (delq nil (list (and process (process-mark process))
                                     opencode--table-scan-marker)))
            (distances (mapcar (lambda (marker) (- (point-max) marker)) markers)))
-      (funcall opencode-rerender-tables-function)
+      (opencode-keeping-followers
+        (funcall opencode-rerender-tables-function))
       (cl-mapc (lambda (marker distance) (set-marker marker (- (point-max) distance)))
                markers distances))))
 

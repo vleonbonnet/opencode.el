@@ -17,7 +17,7 @@
 
 (require 'opencode-test-helpers)
 
-(defun opencode-test-type (string)
+(defun opencode-test-self-insert (string)
   "Insert STRING as typing does, one `self-insert-command' per character."
   (dolist (char (string-to-list string))
     (let ((last-command-event char))
@@ -43,7 +43,7 @@
     (let ((prompt (marker-position opencode--prompt-start))
           (pmark (opencode-pmark)))
       (should (equal (opencode-test-hidden prompt pmark) (list prompt (1+ prompt))))
-      (opencode-test-type "hi")
+      (opencode-test-self-insert "hi")
       (should (= (point-max) (+ pmark 2)))
       (should-not (opencode-test-hidden pmark (point-max))))))
 
@@ -51,11 +51,11 @@
   "Markdown typed in the input keeps its delimiters in view, and text typed after them shows."
   (opencode-test-with-input
     (let ((pmark (opencode-pmark)))
-      (opencode-test-type "see `x` and **y**")
+      (opencode-test-self-insert "see `x` and **y**")
       (font-lock-ensure)
       (should-not (opencode-test-hidden pmark (point-max)))
       (should-not (text-property-not-all pmark (point-max) 'display nil))
-      (opencode-test-type " more")
+      (opencode-test-self-insert " more")
       (should-not (opencode-test-hidden pmark (point-max)))
       (font-lock-ensure)
       (should (memq 'opencode-prompt (ensure-list (get-text-property (1+ pmark) 'face)))))))
@@ -64,7 +64,7 @@
   "Markup before the input stays hidden: sent prompts read as quotes, their \"> \" unseen."
   (opencode-test-with-input
     (let ((prompt (marker-position opencode--prompt-start)))
-      (opencode-test-type "`x`")
+      (opencode-test-self-insert "`x`")
       (font-lock-ensure)
       (should (seq-some (lambda (position)
                           (and (eq (get-text-property position 'invisible) 'markdown-ts--markup)

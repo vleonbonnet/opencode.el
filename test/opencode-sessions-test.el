@@ -77,11 +77,11 @@ and filters sent with it are ignored."
   (alist-get 'data (opencode-test-fixture (format "session-%s.json" id))))
 
 (defvar opencode-test-offers nil
-  "What `completing-read' offered under `opencode-test-choosing', newest first.
+  "What `completing-read' offered under `opencode-test-picking', newest first.
 Each is a plist: :prompt, :names (the collection as given) and :rows,
 the candidates in display order as (NAME PREFIX SUFFIX).")
 
-(defmacro opencode-test-choosing (chooser &rest body)
+(defmacro opencode-test-picking (chooser &rest body)
   "Run BODY answering `completing-read' with CHOOSER.
 CHOOSER receives the rows of the offer, see `opencode-test-offers', and
 returns the name chosen.  The offer is displayed as completion UIs do:
@@ -98,7 +98,7 @@ sorted by its display sort function, then affixed."
        ,@body)))
 
 (defun opencode-test-choose (name)
-  "Return a chooser of `opencode-test-choosing' picking NAME, which must be offered."
+  "Return a chooser of `opencode-test-picking' picking NAME, which must be offered."
   (lambda (rows)
     (should (assoc name rows))
     name))
@@ -220,7 +220,7 @@ sorted by its display sort function, then affixed."
                       ("a" 1 "one" 1 "* ")
                       ("a" 3 ,(propertize "three" 'face 'bold) 3)
                       ("c" 4))))
-    (opencode-test-choosing (opencode-test-choose "a<2>")
+    (opencode-test-picking (opencode-test-choose "a<2>")
       (should (eql (opencode-annotated-completion "Pick: " candidates) 3))
       (let ((offer (car opencode-test-offers)))
         (should (equal (plist-get offer :prompt) "Pick: "))
@@ -238,10 +238,10 @@ sorted by its display sort function, then affixed."
           (should (eq (get-text-property 0 'face a-suffix) 'completions-annotations))
           ;; An annotation's own face comes first.
           (should (equal (get-text-property (- (length three) 1) 'face three) '(bold completions-annotations))))))
-    (opencode-test-choosing (opencode-test-choose "a")
+    (opencode-test-picking (opencode-test-choose "a")
       (should (eql (opencode-annotated-completion "Pick: " candidates) 1)))
     ;; Without sort keys, the order is kept.
-    (opencode-test-choosing (opencode-test-choose "y")
+    (opencode-test-picking (opencode-test-choose "y")
       (should (eq (opencode-annotated-completion "Pick: " '(("z" z) ("y" y))) 'y))
       (should (equal (opencode-test-offered-names) '("z" "y"))))
     (should-not (opencode-annotated-completion "Pick: " nil))))
@@ -302,7 +302,7 @@ sorted by its display sort function, then affixed."
                                 :id "ses_3" :title "Renamed" :directory (opencode-normalize-directory repo)
                                 :project-id "repo" :running t :updated (- now 10))
                        opencode-state--sessions)
-              (opencode-test-choosing (opencode-test-choose "Renamed")
+              (opencode-test-picking (opencode-test-choose "Renamed")
                 (should (eq (opencode-read-session "Session: " (list older untitled stale moved) root)
                             stale))
                 (should (equal (plist-get (car opencode-test-offers) :prompt) "Session: "))
@@ -340,21 +340,21 @@ sorted by its display sort function, then affixed."
                     (should (aligned "topic"))
                     (should (aligned "[^ ]+\\'")))))
               ;; Without a new entry, sessions alone are offered; choosing one returns its info.
-              (opencode-test-choosing (opencode-test-choose "Older")
+              (opencode-test-picking (opencode-test-choose "Older")
                 (should (eq (opencode-read-session "Session: " (list older untitled)) older))
                 (should (equal (opencode-test-offered-names) '("ses_2" "Older"))))
               ;; No session has a branch: the column is left out.
-              (opencode-test-choosing (opencode-test-choose "ses_2")
+              (opencode-test-picking (opencode-test-choose "ses_2")
                 (opencode-read-session "Session: " (list untitled))
                 (should (string-match-p (concat "\\` +" (regexp-quote (file-name-nondirectory
                                                                        (directory-file-name temporary-file-directory)))
                                                 "  [^ ]+\\'")
                                         (substring-no-properties
                                          (caddr (car (plist-get (car opencode-test-offers) :rows)))))))
-              (opencode-test-choosing (opencode-test-choose "New session")
+              (opencode-test-picking (opencode-test-choose "New session")
                 (should (eq (opencode-read-session "Session: " (list older) root) 'new)))
               ;; Choosing nothing returns nil.
-              (opencode-test-choosing (lambda (_) "")
+              (opencode-test-picking (lambda (_) "")
                 (should-not (opencode-read-session "Session: " (list older) root))))))
       (delete-directory root t))))
 
@@ -363,7 +363,7 @@ sorted by its display sort function, then affixed."
   (opencode-test-with-sessions
     (let ((info (opencode-test-session-info (opencode-test-scenario "text")))
           (project (file-name-nondirectory (directory-file-name opencode-test-workspace))))
-      (opencode-test-choosing (opencode-test-choose "text")
+      (opencode-test-picking (opencode-test-choose "text")
         (opencode-read-session "Session: " (list info))
         (should (= 1 (length (opencode-test-requests-to 'get "/api/project"))))
         (should (string-match-p (regexp-quote project)
@@ -374,7 +374,7 @@ sorted by its display sort function, then affixed."
       (setq opencode--projects nil)
       (let ((opencode-test-routes (cons (list 'get "\\`/api/project\\'" (lambda (_) '(:error 500 "down")))
                                         opencode-test-routes)))
-        (opencode-test-choosing (opencode-test-choose "text")
+        (opencode-test-picking (opencode-test-choose "text")
           (should (eq (opencode-read-session "Session: " (list info)) info))
           (should-not (string-match-p (regexp-quote project)
                                       (caddr (car (plist-get (car opencode-test-offers) :rows))))))))))
@@ -388,7 +388,7 @@ sorted by its display sort function, then affixed."
                  (lambda (info &rest arguments) (setq opened (cons info arguments))))
                 ((symbol-function 'opencode-session-create)
                  (lambda (&rest arguments) (setq created arguments))))
-        (opencode-test-choosing (opencode-test-choose "text")
+        (opencode-test-picking (opencode-test-choose "text")
           (opencode opencode-test-workspace)
           (should (equal (opencode-test-offered-names) (cons "New session" (opencode-test-root-titles))))
           (should (equal (alist-get 'id (car opened)) (opencode-test-scenario "text")))
@@ -400,19 +400,19 @@ sorted by its display sort function, then affixed."
           (should (equal (alist-get 'project query) opencode-test-project-id))
           (should (equal (alist-get 'parentID query) "null"))
           (should (equal (alist-get 'archived query) "false")))
-        (opencode-test-choosing (opencode-test-choose "New session")
+        (opencode-test-picking (opencode-test-choose "New session")
           (setq opened nil)
           (opencode opencode-test-workspace)
           (should-not opened)
           (should (equal created (list :directory (opencode-normalize-directory opencode-test-workspace)))))
         ;; A project without sessions starts one at once.
         (setq created nil)
-        (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+        (opencode-test-picking (lambda (_) (ert-fail "Asked"))
           (opencode temporary-file-directory))
         (should (equal created (list :directory (opencode-normalize-directory temporary-file-directory))))
         ;; Choosing nothing does nothing.
         (setq created nil opened nil)
-        (opencode-test-choosing (lambda (_) "")
+        (opencode-test-picking (lambda (_) "")
           (opencode opencode-test-workspace))
         (should-not (or created opened))
         ;; The command's former name is the same command.
@@ -425,7 +425,7 @@ sorted by its display sort function, then affixed."
           (answers (list (abbreviate-file-name (directory-file-name opencode-test-workspace)) "New session")))
       (cl-letf (((symbol-function 'opencode-session-create)
                  (lambda (&rest arguments) (setq created arguments))))
-        (opencode-test-choosing (lambda (_) (pop answers))
+        (opencode-test-picking (lambda (_) (pop answers))
           (opencode-select-project)
           (should (equal (mapcar (lambda (offer) (plist-get offer :prompt)) (reverse opencode-test-offers))
                          '("Project: " "Session: ")))
@@ -446,7 +446,7 @@ sorted by its display sort function, then affixed."
         (cl-letf (((symbol-function 'y-or-n-p) (lambda (prompt) (push prompt questions) t))
                   ((symbol-function 'yes-or-no-p) (lambda (prompt) (push prompt questions) t))
                   ((symbol-function 'read-string) (lambda (_prompt initial) (push initial questions) "Typed")))
-          (opencode-test-choosing (opencode-test-choose "reasoning")
+          (opencode-test-picking (opencode-test-choose "reasoning")
             (opencode-rename-session nil "Renamed")
             (opencode-archive-session)
             (opencode-delete-session)
@@ -469,10 +469,10 @@ sorted by its display sort function, then affixed."
                            (patch ((title . "Typed"))))))
           ;; An explicit ID asks nothing.
           (setq opencode-test-requests nil)
-          (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+          (opencode-test-picking (lambda (_) (ert-fail "Asked"))
             (opencode-rename-session id "Again"))
           (should (opencode-test-requests-to 'patch (concat "/api/session/" id)))
-          (opencode-test-choosing (lambda (_) "")
+          (opencode-test-picking (lambda (_) "")
             (should-error (opencode-archive-session) :type 'user-error)))))))
 
 (ert-deftest opencode-test-commands-act-on-the-buffer-session ()
@@ -482,7 +482,7 @@ sorted by its display sort function, then affixed."
       (with-current-buffer (opencode-test-open id)
         (setq opencode-test-requests nil)
         (cl-letf (((symbol-function 'y-or-n-p) #'always))
-          (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+          (opencode-test-picking (lambda (_) (ert-fail "Asked"))
             (opencode-rename-session nil "Renamed")
             (opencode-archive-session)
             (opencode-interrupt)))
@@ -502,12 +502,12 @@ sorted by its display sort function, then affixed."
       (with-temp-buffer
         (setq default-directory opencode-test-workspace)
         (setq active (list id "ses_elsewhere"))
-        (opencode-test-choosing (opencode-test-choose "steer")
+        (opencode-test-picking (opencode-test-choose "steer")
           (opencode-interrupt)
           (should (equal (plist-get (car opencode-test-offers) :prompt) "Interrupt session: "))
           (should (equal (opencode-test-offered-names) '("steer"))))
         (should (opencode-test-requests-to 'post (format "/api/session/%s/interrupt" id)))
-        (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+        (opencode-test-picking (lambda (_) (ert-fail "Asked"))
           ;; Running sessions of other projects only.
           (setq active (list "ses_elsewhere"))
           (should (string-match-p "No OpenCode session is running in"
@@ -524,7 +524,7 @@ sorted by its display sort function, then affixed."
   (opencode-test-with-sessions
     (with-temp-buffer
       (setq default-directory temporary-file-directory)
-      (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+      (opencode-test-picking (lambda (_) (ert-fail "Asked"))
         (should (string-match-p "\\`No OpenCode session in "
                                 (cadr (should-error (opencode-rename-session) :type 'user-error))))))))
 
@@ -535,7 +535,7 @@ sorted by its display sort function, then affixed."
            (second (opencode-test-open (opencode-test-scenario "reasoning")))
            (shown nil))
       (cl-letf (((symbol-function 'switch-to-buffer) (lambda (buffer &rest _) (setq shown buffer))))
-        (opencode-test-choosing (opencode-test-choose "text")
+        (opencode-test-picking (opencode-test-choose "text")
           (opencode-select-open-session)
           (should (eq shown first))
           (should (equal (opencode-test-offered-names) '("reasoning" "text")))
@@ -544,7 +544,7 @@ sorted by its display sort function, then affixed."
         (kill-buffer first)
         (kill-buffer second)
         (setq shown nil)
-        (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+        (opencode-test-picking (lambda (_) (ert-fail "Asked"))
           (opencode-select-open-session))
         (should-not shown)))))
 
@@ -556,18 +556,18 @@ sorted by its display sort function, then affixed."
         (let ((opencode-alerted-sessions (mapcar #'opencode-test-session-info
                                                  (list (opencode-test-scenario "text")
                                                        (opencode-test-scenario "steer")))))
-          (opencode-test-choosing (opencode-test-choose "text")
+          (opencode-test-picking (opencode-test-choose "text")
             (opencode-select-idle)
             (should (equal (plist-get (car opencode-test-offers) :prompt) "Idle session: "))
             (should (equal (opencode-test-offered-names) '("steer" "text")))
             (should (equal (alist-get 'id opened) (opencode-test-scenario "text")))))
         (let ((opencode-alerted-sessions nil))
-          (opencode-test-choosing (lambda (_) (ert-fail "Asked"))
+          (opencode-test-picking (lambda (_) (ert-fail "Asked"))
             (opencode-select-idle))))
       (let ((child (opencode-test-session-info (opencode-test-scenario "subagent-child"))))
         (with-current-buffer (opencode-test-open (opencode-test-scenario "subagent"))
           (cl-letf (((symbol-function 'opencode-session-open) (lambda (info &rest _) (setq opened info))))
-            (opencode-test-choosing (opencode-test-choose (alist-get 'title child))
+            (opencode-test-picking (opencode-test-choose (alist-get 'title child))
               (opencode-select-child-session)
               (should (equal (opencode-test-offered-names) (list (alist-get 'title child))))
               (should (equal (alist-get 'id opened) (alist-get 'id child))))))))))

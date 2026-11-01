@@ -127,6 +127,91 @@ command loop applies key remapping as typing them would."
         (should (equal (string-trim-right (string-remove-suffix "draft" (opencode-test-text buffer)))
                        transcript))))))
 
+;;;; TAB
+
+(defvar opencode-test-completed nil
+  "Words `opencode-test-word-capf' was asked to complete, newest first.")
+
+(defun opencode-test-word-capf ()
+  "Complete the word at point from a fixed list, as a global dabbrev function would."
+  (when-let* ((bounds (bounds-of-thing-at-point 'word)))
+    (push (buffer-substring-no-properties (car bounds) (cdr bounds)) opencode-test-completed)
+    (list (car bounds) (cdr bounds) '("fixture" "elsewhere") :exclusive 'no)))
+
+(defmacro opencode-test-with-word-completion (&rest body)
+  "Run BODY with `opencode-test-word-capf' as the only global completion function."
+  (declare (indent 0) (debug t))
+  `(let ((opencode-test-completed nil))
+     (cl-letf (((default-value 'completion-at-point-functions) (list #'opencode-test-word-capf)))
+       ,@body)))
+
+(ert-deftest opencode-test-tab-completes-input ()
+  "TAB in the input completes file names as Comint does, and other words through the global functions."
+  (opencode-test-with-server
+    (opencode-test-with-word-completion
+      (let ((buffer (opencode-test-open (opencode-test-scenario "text"))))
+        (with-current-buffer buffer
+          (goto-char (point-max))
+          (insert "the fix"))
+        (should-not (opencode-test-press buffer "TAB"))
+        (should (equal (opencode-test-input buffer) "the fixture"))
+        (should (equal opencode-test-completed '("fix")))
+        ;; A word naming a file of the session's directory completes as that file.
+        (with-current-buffer buffer (insert " and hel"))
+        (should-not (opencode-test-press buffer "TAB"))
+        (should (equal (opencode-test-input buffer) "the fixture and hello.txt "))
+        ;; Completion works at the start of the input as anywhere in it.
+        (with-current-buffer buffer
+          (delete-region (opencode-pmark) (point-max))
+          (insert "els later")
+          (goto-char (+ (opencode-pmark) 3)))
+        (should-not (opencode-test-press buffer "TAB"))
+        (should (equal (opencode-test-input buffer) "elsewhere later"))))))
+
+(ert-deftest opencode-test-tab-in-transcript ()
+  "TAB in the transcript toggles blocks and moves to buttons and blocks, never completing there."
+  (opencode-test-with-server
+    (opencode-test-with-word-completion
+      (let ((buffer (opencode-test-open (opencode-test-scenario "read-tools"))))
+        (with-current-buffer buffer
+          (let* ((block (car (sort (opencode-tool-blocks) :key #'overlay-start)))
+                 (prompt (text-property-any (point-min) (opencode-pmark) 'opencode-prompt t))
+                 (transcript (opencode-test-text buffer)))
+            (should (< prompt (overlay-start block)))
+            (should-not (or (button-at prompt) (opencode-block-at prompt)))
+            ;; Before a block, TAB goes to it.
+            (goto-char prompt)
+            (should-not (opencode-test-press buffer "TAB"))
+            (should (= (point) (overlay-start block)))
+            ;; On its summary, TAB expands it; within its expansion, collapses it.
+            (should-not (opencode-test-press buffer "TAB"))
+            (should (overlay-get block 'opencode-expanded))
+            (goto-char (1+ (overlay-start (overlay-get block 'opencode-content-overlay))))
+            (should-not (opencode-test-press buffer "TAB"))
+            (should-not (overlay-get block 'opencode-expanded))
+            (should (= (point) (overlay-start block)))
+            (should (equal (opencode-test-text buffer) transcript))
+            ;; On a button, TAB goes to the next one.
+            (let ((inhibit-read-only t))
+              (opencode-make-button prompt (+ prompt 2) 'action #'ignore)
+              (opencode-make-button (+ prompt 4) (+ prompt 6) 'action #'ignore))
+            (goto-char prompt)
+            (should-not (opencode-test-press buffer "TAB"))
+            (should (= (point) (+ prompt 4)))
+            ;; After the last block, TAB says so and stays.
+            (let ((end (1- (marker-position opencode--prompt-start))))
+              (should-not (opencode--next-block-start end))
+              (goto-char end)
+              (should-not (opencode-test-press buffer "TAB"))
+              (should (= (point) end)))
+            (should-not opencode-test-completed)
+            (should (equal (opencode-test-text buffer) transcript))
+            ;; <backtab> goes to the previous button, from the input too.
+            (goto-char (point-max))
+            (should-not (opencode-test-press buffer "<backtab>"))
+            (should (< (point) (opencode-pmark)))
+            (should (button-at (point)))))))))
+
 ;;;; Attachments
 
 (defun opencode-test-attachments (buffer)
@@ -323,34 +408,6 @@ command loop applies key remapping as typing them would."
   (alist-get 'id (plist-get (seq-find (lambda (request) (string-suffix-p "/prompt" (plist-get request :path)))
                                       opencode-test-requests)
                             :body)))
-
-(defun opencode-test-inbox-events (session id text &optional metadata)
-  "Return the events admitting, then delivering, prompt ID of SESSION with TEXT and METADATA."
-  `(((type . "session.inbox.enqueued")
-     (data (sessionID . ,session) (inboxID . ,id)
-           (item (type . "user") (delivery . "steer")
-                 (payload (text . ,text) ,@(when metadata `((metadata . ,metadata)))))))
-    ((type . "session.inbox.delivered") (data (sessionID . ,session) (inboxID . ,id)))))
-
-(defun opencode-test-answer (session message text)
-  "Stream TEXT as the answer of assistant MESSAGE in SESSION."
-  (let ((base `((sessionID . ,session) (assistantMessageID . ,message) (ordinal . 0))))
-    (opencode-test-dispatch
-     `(((type . "session.step.started") (data (sessionID . ,session) (assistantMessageID . ,message)))
-       ((type . "session.text.started") (data ,@base))
-       ((type . "session.text.delta") (data ,@base (delta . ,text)))
-       ((type . "session.text.ended") (data ,@base (text . ,text)))))))
-
-(defun opencode-test-turn (session event)
-  "Dispatch the execution EVENT of SESSION, such as \"started\"."
-  (opencode-test-dispatch `(((type . ,(concat "session.execution." event)) (data (sessionID . ,session))))))
-
-(defun opencode-test-find (text)
-  "Return the position of the first TEXT in the current buffer."
-  (save-excursion
-    (goto-char (point-min))
-    (search-forward text)
-    (match-beginning 0)))
 
 (ert-deftest opencode-test-typed-prompt-gets-its-id ()
   "A prompt typed and sent gets its message ID once delivered, for revert and fork."

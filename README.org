@@ -69,14 +69,19 @@ Prompts are typed at the bottom. A prompt sent while a turn runs steers it (=ope
 |-------------------------------+--------------------------------------------------------------------|
 | =RET=                         | send                                                               |
 | =M-p=, =M-n=                  | previous or next input at the prompt, else previous or next button |
-| =TAB=                         | expand or collapse the block at point, else next button            |
-| =<backtab>=                   | previous button                                                    |
+| =TAB= in the input            | complete at point, as in Shell mode                                |
+| =TAB= elsewhere               | expand or collapse the block at point, else next button or block   |
+| =<backtab>=                   | previous button, from the input too                                |
 | =/= at the start of the input | pick a slash command                                               |
 | =@= in the input              | mention a subagent                                                 |
 | =C-c C-o=                     | open the link or file reference at point                           |
 | =RET=, =TAB=, click           | on a block summary, expand or collapse it; on a link, follow it    |
 
 Comint's other keys keep their meaning, such as =C-c C-n= and =C-c C-p= between prompts or =M-r= through the input history, except those meant for a subprocess, since a session runs none: =C-c C-c= interrupts the turn (=opencode-interrupt=), =C-d= only deletes characters, never sending an end of file, and =C-c C-d=, =C-c C-z=, =C-c C-\=, =C-c M-o= and the Signals menu are refused, as is the In/Out menu's deletion of output: the transcript is the server's. =revert-buffer= (=opencode-session-reload=) renders the transcript again, keeping the input.
+
+=TAB= in the input completes through =completion-at-point-functions=: Comint's history and file name completion first, then the global functions, such as a dabbrev function, for a word that names no file. In the read-only transcript it never completes.
+
+Output follows the input as in any Comint buffer. A point at the end of the transcript or anywhere in the input, in every window showing the session, selected or not, stays after whatever is written there, at its place in the input: streamed answers, blocks expanding at the end, the prompt shown when a turn ends, notices, permission requests and questions, other clients' prompts. Redisplay then scrolls its window to keep it in view. A point elsewhere in the transcript stays at its text, and its window keeps its start. =revert-buffer= keeps them too: a point that followed output is back after the transcript rendered again, which may have grown meanwhile, and others at their line.
 
 The other commands act on the current session:
 
@@ -131,7 +136,7 @@ Backends that support removal return a dismissal function. Answering or declinin
 
 * Desktop
 
-Session buffers are saved with the desktop by session ID, directory and point, and restored in place in the background. A restore that fails, because the service is unavailable or the session was deleted, leaves a placeholder that is still saved; =g= in it retries. The restore's =opencode-desktop-restore-timeout= counts from the moment the service is ready, so a slow start or import does not use it up.
+Session buffers are saved with the desktop by session ID, directory and point, and restored in place in the background. A point that followed output comes back at the end of the transcript, which may have grown since, and windows that showed the buffer while it was restored follow its output as any other. A restore that fails, because the service is unavailable or the session was deleted, leaves a placeholder that is still saved; =g= in it retries. The restore's =opencode-desktop-restore-timeout= counts from the moment the service is ready, so a slow start or import does not use it up.
 
 * Development
 

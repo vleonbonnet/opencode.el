@@ -662,17 +662,24 @@ Each receives the block data and returns a string, or nil to defer.")
         (overlay-put overlay 'opencode-content-overlay content-overlay)))))
 
 (defun opencode--refresh-expanded (overlay)
-  "Rewrite OVERLAY's expansion after its data changed."
+  "Rewrite OVERLAY's expansion after its data changed.
+Points in the old expansion stay at its start, and those following
+output after it, as `opencode-call-preserving-viewport' keeps them."
   (when (overlay-get overlay 'opencode-expanded)
     (let ((old (overlay-get overlay 'opencode-content-overlay))
           (inhibit-read-only t))
-      (if (and (overlayp old) (overlay-buffer old))
-          (let ((start (overlay-start old))
-                (end (overlay-end old)))
-            (delete-overlay old)
-            (delete-region start end)
-            (opencode--insert-expansion overlay start))
-        (opencode--insert-expansion overlay (overlay-end overlay))))))
+      ;; Told apart before the deletion, which brings the points of an
+      ;; expansion ending the output to the process mark.
+      (opencode-call-preserving-viewport
+       (current-buffer)
+       (lambda ()
+         (if (and (overlayp old) (overlay-buffer old))
+             (let ((start (overlay-start old))
+                   (end (overlay-end old)))
+               (delete-overlay old)
+               (delete-region start end)
+               (opencode--insert-expansion overlay start))
+           (opencode--insert-expansion overlay (overlay-end overlay))))))))
 
 (defun opencode-collapsible-at (position)
   "Return the collapsible summary overlay at POSITION, if any."
@@ -734,19 +741,25 @@ Each receives the block data and returns a string, or nil to defer.")
         (setq best (overlay-start overlay))))))
 
 (defun opencode-tab-dwim ()
-  "Toggle the block at point, follow the button at point, or go to the next block.
-Never switches the session agent, as TAB does in the TUI; that is
-`opencode-cycle-agent'."
+  "Complete in the input, else toggle the block at point or move on to the next.
+In the input, after the process mark, this completes with
+`completion-at-point', as TAB does in Shell mode.  In the read-only
+transcript, it expands or collapses the block whose summary or
+expansion holds point, else moves to the next button when point is on
+one, else to the next block.  It never switches the session agent, as
+TAB does in the TUI; that is `opencode-cycle-agent'."
   (interactive)
-  (if-let* ((summary (opencode-block-at (point))))
-      (progn
-        (goto-char (overlay-start summary))
-        (opencode-toggle-block (point)))
-    (if (button-at (point))
-        (forward-button 1)
-      (if-let* ((next (opencode--next-block-start (point))))
-          (goto-char next)
-        (message "No block after point")))))
+  (if (comint-after-pmark-p)
+      (completion-at-point)
+    (if-let* ((summary (opencode-block-at (point))))
+        (progn
+          (goto-char (overlay-start summary))
+          (opencode-toggle-block (point)))
+      (if (button-at (point))
+          (forward-button 1)
+        (if-let* ((next (opencode--next-block-start (point))))
+            (goto-char next)
+          (message "No block after point"))))))
 
 ;;;; Reasoning blocks
 
@@ -771,7 +784,9 @@ Never switches the session agent, as TAB does in the TUI; that is
 (defun opencode--show-narration (overlay text)
   "Replace narration block OVERLAY with its TEXT as prose.
 Its signature only arrives at completion, after a provisional thinking
-block was shown; an expanded copy goes too."
+block was shown; an expanded copy goes too.  Points in the block stay
+at its start, and those following output after it, as
+`opencode-call-preserving-viewport' keeps them."
   (let* ((content (overlay-get overlay 'opencode-content-overlay))
          (start (overlay-start overlay))
          (end (if (and content (overlay-buffer content)) (overlay-end content) (overlay-end overlay)))
@@ -779,17 +794,22 @@ block was shown; an expanded copy goes too."
          (inhibit-read-only t))
     (when content (delete-overlay content))
     (delete-overlay overlay)
-    (delete-region start end)
-    (let* ((prefix (if (or (= start (point-min))
-                           (and (> start (1+ (point-min)))
-                                (equal (buffer-substring-no-properties (- start 2) start) "\n\n")))
-                       "" "\n"))
-           (finish (opencode-insert-output-at start (concat prefix (string-trim text) "\n\n")))
-           (marker (make-overlay start finish nil t nil)))
-      (overlay-put marker 'opencode-narration t)
-      (overlay-put marker 'opencode-data (list :type 'narration :key key))
-      (puthash key marker opencode--blocks)
-      (opencode-set-last-response-start (+ start (length prefix))))))
+    ;; Told apart before the deletion, which brings the points of a block
+    ;; ending the output to the process mark.
+    (opencode-call-preserving-viewport
+     (current-buffer)
+     (lambda ()
+       (delete-region start end)
+       (let* ((prefix (if (or (= start (point-min))
+                              (and (> start (1+ (point-min)))
+                                   (equal (buffer-substring-no-properties (- start 2) start) "\n\n")))
+                          "" "\n"))
+              (finish (opencode-insert-output-at start (concat prefix (string-trim text) "\n\n")))
+              (marker (make-overlay start finish nil t nil)))
+         (overlay-put marker 'opencode-narration t)
+         (overlay-put marker 'opencode-data (list :type 'narration :key key))
+         (puthash key marker opencode--blocks)
+         (opencode-set-last-response-start (+ start (length prefix))))))))
 
 (defun opencode-reasoning-end (key text native)
   "Finish reasoning block KEY with its full TEXT and the provider's NATIVE data."

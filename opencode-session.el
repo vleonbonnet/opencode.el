@@ -396,6 +396,18 @@ the server."
   (mapc (lambda (file) (ignore-errors (delete-file file))) opencode--temp-files)
   (setq opencode--temp-files nil))
 
+(defun opencode--comint-completion-at-point ()
+  "Complete history and file names as Comint does, yielding other words.
+Comint reads any word at point as a file name: a word that names no
+file would fail to complete without trying the functions after this
+one, such as the global ones, so its file names complete
+non-exclusively."
+  (let ((data (comint-completion-at-point)))
+    (if (and (consp data) (not (functionp data))
+             (not (plist-member (nthcdr 3 data) :exclusive)))
+        (append data '(:exclusive no))
+      data)))
+
 (define-derived-mode opencode-session-mode comint-mode "OpenCode"
   "Major mode of an OpenCode session buffer.
 Only standard keys are bound.  Comint commands meant for a subprocess
@@ -410,6 +422,8 @@ interrupt the turn or are refused (`opencode-comint-unsupported'), and
   ;; Output never prompts for a password.
   (setq-local comint-output-filter-functions
               (remove #'comint-watch-for-password-prompt comint-output-filter-functions))
+  (remove-hook 'completion-at-point-functions #'comint-completion-at-point t)
+  (add-hook 'completion-at-point-functions #'opencode--comint-completion-at-point nil t)
   (opencode-render-setup)
   (opencode-blocks-setup)
   (setq opencode--own-inputs (make-hash-table :test #'equal)
@@ -507,6 +521,12 @@ the buffer."
             (erase-buffer))
           (setq buffer-read-only nil)
           (opencode-session-mode)
+          ;; A window takes the insertion type of its point, which keeps
+          ;; it after output, and its margins when shown the buffer: one
+          ;; showing a placeholder, as a restored desktop does, took them
+          ;; from another mode.
+          (dolist (window (get-buffer-window-list buffer nil t))
+            (set-window-buffer window buffer))
           (setq opencode-session-id id)
           (opencode--adopt-info info)
           (hack-dir-local-variables-non-file-buffer)
@@ -629,34 +649,34 @@ ELSE, when given, receives the `opencode-error' of a failed request."
 
 (defun opencode-session-reload ()
   "Render this session's transcript again from the server.
-Input typed at the prompt is kept.  `revert-buffer' does this too."
+Input typed at the prompt is kept.  Points at the end of the
+transcript or in the input stay there, others at their line, as
+`opencode-save-viewport' keeps them.  `revert-buffer' does this too."
   (interactive)
   (unless opencode-session-id (user-error "Not in an OpenCode session"))
-  (let ((input (and (get-buffer-process (current-buffer))
-                    (buffer-substring-no-properties (opencode-pmark) (point-max))))
-        (line (line-number-at-pos))
-        (location-generation opencode--location-generation))
+  (let ((location-generation opencode--location-generation))
     (opencode-session-fetch
      opencode-session-id
      (lambda (info)
        (opencode-with-session-buffer (alist-get 'id info)
-         (let ((inhibit-read-only t))
-           (remove-overlays)
-           (erase-buffer))
-         (set-marker (process-mark (get-buffer-process (current-buffer))) (point-min))
-         (opencode--sent-inputs-erased)
-         (clrhash opencode--text-blocks)
-         (when (hash-table-p opencode--blocks) (clrhash opencode--blocks))
-         (setq opencode--last-block-kind nil opencode--current-assistant nil)
-         (opencode--adopt-info info location-generation)
-         (opencode-session-load
-          (lambda ()
-            (goto-char (point-max))
-            (when (and input (not (string-empty-p input)))
-              (insert input))
-            (unless (= line 1)
-              (goto-char (point-min))
-              (forward-line (1- line))))))))))
+         (let ((input (and (get-buffer-process (current-buffer))
+                           (buffer-substring-no-properties (opencode-pmark) (point-max))))
+               (viewport (opencode-save-viewport)))
+           (let ((inhibit-read-only t))
+             (remove-overlays)
+             (erase-buffer))
+           (set-marker (process-mark (get-buffer-process (current-buffer))) (point-min))
+           (opencode--sent-inputs-erased)
+           (clrhash opencode--text-blocks)
+           (when (hash-table-p opencode--blocks) (clrhash opencode--blocks))
+           (setq opencode--last-block-kind nil opencode--current-assistant nil)
+           (opencode--adopt-info info location-generation)
+           (opencode-session-load
+            (lambda ()
+              (goto-char (point-max))
+              (when (and input (not (string-empty-p input)))
+                (insert input))
+              (opencode-restore-viewport viewport)))))))))
 
 (defun opencode--render-user-prompt (text &optional message-id note)
   "Render a user prompt with TEXT for MESSAGE-ID, followed by NOTE when given.

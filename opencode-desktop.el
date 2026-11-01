@@ -60,10 +60,14 @@ They count from the moment the service is ready."
   (put variable 'permanent-local t))
 
 (defun opencode-desktop-save (_directory)
-  "Return the desktop entry of this session buffer."
+  "Return the desktop entry of this session buffer.
+A point at the end of the transcript or in the input is saved as
+following output, to be restored at the end of the transcript then."
   (or opencode--desktop-data
-      (list :version 1 :session-id opencode-session-id
-            :directory default-directory :point (point))))
+      (append (list :version 1 :session-id opencode-session-id
+                    :directory default-directory :point (point))
+              (when (opencode-follows-output-p (point))
+                (list :follow t)))))
 
 (defun opencode--desktop-track ()
   "Save this buffer with the desktop."
@@ -179,12 +183,16 @@ The placeholder is killed unless displayed, and is never saved again."
     (kill-buffer (current-buffer))))
 
 (defun opencode--desktop-ready ()
-  "Finish restoring this buffer: return to the saved point."
-  (let ((point (plist-get opencode--desktop-data :point)))
+  "Finish restoring this buffer: return to the saved point.
+A point saved following output goes to the end, which the transcript
+may have moved since."
+  (let ((point (plist-get opencode--desktop-data :point))
+        (follow (plist-get opencode--desktop-data :follow)))
     (opencode--desktop-stop)
     (setq opencode--desktop-data nil)
-    (when (integerp point)
-      (goto-char (min (point-max) (max (point-min) point))))))
+    (cond (follow (goto-char (point-max)))
+          ((integerp point)
+           (goto-char (min (point-max) (max (point-min) point)))))))
 
 (defun opencode-desktop-restore (_file name data)
   "Return the buffer NAME of desktop entry DATA, restoring it in the background.

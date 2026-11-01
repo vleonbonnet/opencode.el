@@ -275,10 +275,42 @@ session registry starts empty and follows events once a test dispatches
         (setq done (equal (alist-get 'type event) type))))
     events))
 
+(defun opencode-test-inbox-events (session id text &optional metadata)
+  "Return the events admitting, then delivering, prompt ID of SESSION with TEXT and METADATA."
+  `(((type . "session.inbox.enqueued")
+     (data (sessionID . ,session) (inboxID . ,id)
+           (item (type . "user") (delivery . "steer")
+                 (payload (text . ,text) ,@(when metadata `((metadata . ,metadata)))))))
+    ((type . "session.inbox.delivered") (data (sessionID . ,session) (inboxID . ,id)))))
+
+(defun opencode-test-answer (session message text)
+  "Stream TEXT as the answer of assistant MESSAGE in SESSION."
+  (let ((base `((sessionID . ,session) (assistantMessageID . ,message) (ordinal . 0))))
+    (opencode-test-dispatch
+     `(((type . "session.step.started") (data (sessionID . ,session) (assistantMessageID . ,message)))
+       ((type . "session.text.started") (data ,@base))
+       ((type . "session.text.delta") (data ,@base (delta . ,text)))
+       ((type . "session.text.ended") (data ,@base (text . ,text)))))))
+
+(defun opencode-test-turn (session event)
+  "Dispatch the execution EVENT of SESSION, such as \"started\"."
+  (opencode-test-dispatch `(((type . ,(concat "session.execution." event)) (data (sessionID . ,session))))))
+
+(defun opencode-test-signature (kind)
+  "Return a reasoning signature whose decoded header names block KIND, as Anthropic signs it."
+  (base64-encode-string (concat (string #x12 #x05) "B" (string (length kind)) kind (string 0) (make-string 45 7)) t))
+
 (defun opencode-test-text (buffer)
   "Return BUFFER's text without properties and trailing whitespace."
   (with-current-buffer buffer
     (string-trim-right (buffer-substring-no-properties (point-min) (point-max)))))
+
+(defun opencode-test-find (text)
+  "Return the position of the first TEXT in the current buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (search-forward text)
+    (match-beginning 0)))
 
 (provide 'opencode-test-helpers)
 ;;; opencode-test-helpers.el ends here

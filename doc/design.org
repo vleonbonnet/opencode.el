@@ -78,6 +78,18 @@ Opening a session renders its projected messages; afterwards the event stream dr
 - Notices are inserted before the idle prompt, and a turn started elsewhere lifts the prompt first.
 - A background job's completion is a synthetic message, keyed by its message ID, which its inbox item shares. Its metadata makes it a block of the job's tool, and the element wrapping its text is removed only when it is exactly what the service writes, so an unexpected text shows whole.
 
+* Points that follow output
+
+A point at the end of the transcript or in the input follows output, in the buffer and in every window showing it, selected or not; one elsewhere in the transcript keeps its text, and its window its start. The end of the transcript starts at the idle prompt when one is shown, whose markup is hidden, so that a point before it looks the same as one after it; otherwise at the process mark.
+
+Comint provides this for the output it writes: the buffer's point is saved with a marker that advances, window points advance through =window-point-insertion-type=, and =comint-postoutput-scroll-to-bottom= moves window points left at the process mark after the output and scrolls their window to it. Output written otherwise needs the same care, which =opencode-keeping-followers= gives it: it records each following point by its distance from the end of the buffer, which writing, replacing or deleting transcript text leaves unchanged, and puts it back there afterwards. It wraps the expansions written at the process mark, tables aligned in place, which may also grow past the process mark (the process mark then moves after them, or their tail would become input), and table reflows. Nested calls leave the points to the outermost one, which saw them before anything changed: rewriting a block ending the output deletes it first, which brings the points that were in it to the process mark.
+
+=opencode-call-preserving-viewport= wraps output that must not move what the user reads: the prompt shown when a turn ends, notices, other clients' prompts, permission fallbacks, question blocks, rewritten expansions. It keeps the following points so, which also keeps a point's place in an input that rendering another client's prompt lifts and puts back, and the others with markers that stay before what is written at them. Following windows are left to Comint and redisplay, as for streamed output.
+
+Markers do not survive reloading, which erases the buffer: =opencode-save-viewport= records the following points by distance, the others by line and column, and their windows' starts by line, and =opencode-session-reload= puts them back once the transcript and the input are written again. A desktop entry marks a point that followed output, which then comes back at the end of a transcript that may have grown. A window takes the insertion type of its point from the buffer it is shown, so the windows showing a restored placeholder are shown the session buffer again once its mode is set, which also gives them its margins.
+
+Batch Emacs has windows but never redisplays them, so the tests check window points and starts in real windows, through the event handlers, rather than what is visible.
+
 * Fontification that survives
 
 Markdown is fontified by =markdown-ts-mode= as text streams in. Regions that must keep their own faces (verbatim output, tool summaries, buttons) are marked with properties the Markdown fontifier skips, and buttons are made after fontification from registered buttonizers. Half-typed Markdown never turns the transcript red: the parser's error feature is off.
@@ -109,6 +121,7 @@ A session buffer inherits =comint-mode-map=, whose keys show through once the pa
 | =C-c M-o=                                                                 | =comint-clear-buffer=                                                                           | refuse                                         | it erases the transcript, which the server owns and blocks and markers point into                            |
 | =RET=                                                                     | =comint-send-input=                                                                             | bound to =opencode-send-input=                 | runs the send checks before Comint takes the input                                                           |
 | =M-p=, =M-n=                                                              | =comint-previous-input=, =comint-next-input=                                                    | bound to their -or-button variants             | history at the input, buttons elsewhere                                                                      |
+| =TAB=                                                                     | none: the global =indent-for-tab-command=                                                       | bound to =opencode-tab-dwim=                   | completes at the input, as Shell mode's =completion-at-point=; blocks and buttons in the transcript          |
 | =C-c RET=, In/Out menu                                                    | =comint-copy-old-input=                                                                         | keep                                           | copies an earlier prompt to the input                                                                        |
 | =C-c C-n=, =C-c C-p=                                                      | =comint-next-prompt=, =comint-previous-prompt=                                                  | keep                                           | prompts are Comint input fields, which the package also navigates                                            |
 | =C-c C-r=, =C-M-l=, =C-c C-e=                                             | =comint-show-output=, =comint-show-maximum-output=                                              | keep                                           | only scroll                                                                                                  |
@@ -121,6 +134,8 @@ A session buffer inherits =comint-mode-map=, whose keys show through once the pa
 | =<delete>=, Completion menu                                               | =delete-forward-char=, file name completion                                                     | keep                                           | plain editing                                                                                                |
 
 Remapping rather than binding keeps the standard keys' standard meaning and covers the menus too. =revert-buffer= in a session buffer renders its transcript again.
+
+Comint binds no =TAB=; Shell mode binds it to =completion-at-point=, and so does =opencode-tab-dwim= at the input, while the read-only transcript keeps =TAB= for its blocks and buttons. Comint's own completion function reads any word at point as a file name and is exclusive, so a word that names no file would fail before the global completion functions, such as a dabbrev function, are tried: session buffers call it through a wrapper making its file names non-exclusive.
 
 * Edits only from live turns
 
