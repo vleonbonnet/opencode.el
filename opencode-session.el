@@ -2142,13 +2142,14 @@ leave them out."
               ((not (string-empty-p text))))
     text))
 
-(defun opencode-session-last-reply (id callback &optional max-length)
-  "Call CALLBACK with the text of session ID's last assistant reply, or nil.
-The reply is the newest assistant message with text; steps that only
-called tools are skipped.  Its text is cut to MAX-LENGTH characters,
-2000 by default, the last one an ellipsis.  CALLBACK receives nil when
-there is no reply or the request fails."
-  (let ((max-length (or max-length 2000)))
+(defun opencode--newest-assistant (id then else)
+  "Call THEN with the newest assistant messages of session ID.
+THEN receives NEWEST and REPLY: the newest assistant message, and the
+newest one with text, which may be older, as steps that only called
+tools have none; either is nil when the session has none.  Pages of
+messages are fetched until REPLY is found.  ELSE receives the
+`opencode-error' of a failed request."
+  (let ((newest nil))
     (cl-labels ((page (cursor)
                   (opencode-request
                    'get (format "/api/session/%s/message" id)
@@ -2156,19 +2157,113 @@ there is no reply or the request fails."
                    ;; A cursor carries its order, and the type must follow it.
                    :query `((limit . 20) (type . "assistant")
                             ,@(if cursor `((cursor . ,cursor)) '((order . "desc"))))
-                   :else (lambda (_) (funcall callback nil))
+                   :else else
                    :then (lambda (response)
                            (let ((messages (opencode-request-data response))
                                  (next (alist-get 'next (alist-get 'cursor response))))
-                             (if-let* ((text (seq-some #'opencode--reply-text messages)))
-                                 (funcall callback
-                                          (if (> (length text) max-length)
-                                              (concat (substring text 0 (max 0 (1- max-length))) "…")
-                                            text))
+                             (setq newest (or newest (car messages)))
+                             (if-let* ((reply (seq-find #'opencode--reply-text messages)))
+                                 (funcall then newest reply)
                                (if (and messages next)
                                    (page next)
-                                 (funcall callback nil))))))))
+                                 (funcall then newest nil))))))))
       (page nil))))
+
+(defun opencode-session-last-reply (id callback &optional max-length)
+  "Call CALLBACK with the text of session ID's last assistant reply, or nil.
+The reply is the newest assistant message with text; steps that only
+called tools are skipped.  Its text is cut to MAX-LENGTH characters,
+2000 by default, the last one an ellipsis.  CALLBACK receives nil when
+there is no reply or the request fails."
+  (let ((max-length (or max-length 2000)))
+    (opencode--newest-assistant
+     id
+     (lambda (_newest reply)
+       (let ((text (and reply (opencode--reply-text reply))))
+         (funcall callback (if (and text (> (length text) max-length))
+                               (concat (substring text 0 (max 0 (1- max-length))) "…")
+                             text))))
+     (lambda (_) (funcall callback nil)))))
+
+(defun opencode-session-last-turn (id callback)
+  "Call CALLBACK with a recap of the last turn of session ID, as a plist.
+The turn is that of the newest user message.  The plist holds:
+
+ :prompt   The text of that message.
+ :reply    The text of the newest assistant message with text since
+           it, whole: what the agent said last.
+ :error    The message of the error the turn's newest assistant
+           message ended with.
+ :changes  The files the turn changed, as (FILE ADDITIONS DELETIONS),
+           FILE as the service names it, relative to the session's
+           working tree.
+
+Each is nil when the turn has none.  The prompt, the replies and the
+files changed are asked for at once; a request failing leaves its
+members nil, and when every request fails the plist is (:failure
+MESSAGE).  CALLBACK is called once, possibly before this returns, in
+whatever buffer is current then."
+  (let ((pending 3)
+        (failures nil)
+        prompt newest reply changes)
+    (cl-labels ((done ()
+                  (when (zerop (cl-decf pending))
+                    (funcall callback (opencode--last-turn prompt newest reply changes failures))))
+                (fail (error)
+                  (push (opencode-error-describe error) failures)
+                  (done)))
+      (let ((directory (opencode-state--directory id)))
+        (opencode-request
+         'get (format "/api/session/%s/message" id)
+         :directory directory :buffer nil
+         :query '((limit . 1) (type . "user") (order . "desc"))
+         :else #'fail
+         :then (lambda (response)
+                 (setq prompt (car (opencode-request-data response)))
+                 (done)))
+        (opencode--newest-assistant
+         id (lambda (message text-message)
+              (setq newest message reply text-message)
+              (done))
+         #'fail)
+        (opencode-request
+         'get (format "/api/session/%s/diff" id)
+         :directory directory :buffer nil
+         ;; Hunks without context: only the counts are read.
+         :query '((context . "0"))
+         :else #'fail
+         :then (lambda (response)
+                 (setq changes (opencode-request-data response))
+                 (done)))))))
+
+(defun opencode--last-turn (prompt newest reply changes failures)
+  "Return the recap of `opencode-session-last-turn'.
+PROMPT is the newest user message, NEWEST the newest assistant
+message, REPLY the newest one with text, CHANGES the files the turn
+changed, each nil when unknown; FAILURES the descriptions of the
+requests that failed, newest first."
+  (if (= (length failures) 3)
+      (list :failure (car (last failures)))
+    (let ((since (alist-get 'created (alist-get 'time prompt))))
+      (cl-flet ((in-turn (message)
+                  ;; Before the prompt, a message is a former turn's.
+                  (and message
+                       (or (not (numberp since))
+                           (let ((created (alist-get 'created (alist-get 'time message))))
+                             (or (not (numberp created)) (>= created since))))
+                       message)))
+        (let ((text (alist-get 'text prompt))
+              (error (alist-get 'error (in-turn newest))))
+          (list :prompt (and (stringp text) (not (string-blank-p text)) (string-trim text))
+                :reply (opencode--reply-text (in-turn reply))
+                :error (let ((message (alist-get 'message error)))
+                         (and (stringp message) (not (string-empty-p message)) message))
+                :changes (mapcar (lambda (change)
+                                   (let-alist change
+                                     (list .file
+                                           (and (numberp .additions) .additions)
+                                           (and (numberp .deletions) .deletions))))
+                                 changes)))))))
 
 (defun opencode--session-title (id)
   "Return the title of session ID as the registry or its buffer knows it, or nil."

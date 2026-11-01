@@ -1433,6 +1433,64 @@ the buffer streaming the events finds."
         (should (= (length pages) 2))
         (should (equal (alist-get 'type (plist-get (cadr pages) :query)) "assistant"))))))
 
+(ert-deftest opencode-test-state-last-turn ()
+  "The last turn is the newest prompt, the reply and error since, and the files changed."
+  (opencode-test-with-state-server
+      (list :messages `(("ses_a"
+                         ((type . "assistant") (time (created . 50))
+                          (content ((type . "tool") (id . "call_1") (name . "edit")))
+                          (error (type . "provider") (message . "Quota exceeded")))
+                         ((type . "assistant") (time (created . 40))
+                          (content ((type . "text") (text . "  All done.  "))))
+                         ((type . "user") (time (created . 30)) (text . " Fix the build \n"))
+                         ((type . "assistant") (time (created . 20))
+                          (content ((type . "text") (text . "Earlier reply")))))
+                        ("ses_b"
+                         ((type . "user") (time (created . 30)) (text . "Next step"))
+                         ((type . "assistant") (time (created . 20))
+                          (content ((type . "text") (text . "A former turn's reply")))))))
+    (let ((opencode-test-routes
+           (cons (list 'get "\\`/api/session/\\(ses_[A-Za-z0-9_]+\\)/diff\\'"
+                       (lambda (request)
+                         (if (equal (plist-get request :match) "ses_a")
+                             '((data ((file . "a.el") (patch . "") (additions . 10) (deletions . 2)
+                                      (status . "modified"))
+                                     ((file . "b/c.el") (patch . "") (additions . 3) (deletions . 0)
+                                      (status . "added"))))
+                           '(:error 500 "Snapshots unavailable"))))
+                 opencode-test-routes))
+          (results nil))
+      (dolist (id '("ses_a" "ses_b"))
+        (opencode-session-last-turn id (lambda (turn) (push (cons id turn) results))))
+      (should (equal (alist-get "ses_a" results nil nil #'equal)
+                     '(:prompt "Fix the build" :reply "All done." :error "Quota exceeded"
+                       :changes (("a.el" 10 2) ("b/c.el" 3 0)))))
+      ;; A reply older than the prompt is a former turn's; the files
+      ;; changed, unavailable, are unknown.
+      (should (equal (alist-get "ses_b" results nil nil #'equal)
+                     '(:prompt "Next step" :reply nil :error nil :changes nil)))
+      ;; Without context: only the counts are read.
+      (let ((diff (seq-find (lambda (request) (equal (plist-get request :path) "/api/session/ses_a/diff"))
+                            opencode-test-requests)))
+        (should (equal (plist-get diff :query) '((context . "0")))))
+      (let ((prompt (seq-find (lambda (request)
+                                (and (equal (plist-get request :path) "/api/session/ses_a/message")
+                                     (equal (alist-get 'type (plist-get request :query)) "user")))
+                              opencode-test-requests)))
+        (should (equal (alist-get 'limit (plist-get prompt :query)) 1))))))
+
+(ert-deftest opencode-test-state-last-turn-failure ()
+  "A turn none of whose requests succeed is a failure, told once."
+  (opencode-test-with-state-server nil
+    (let ((opencode-test-routes
+           (cons (list 'get "\\`/api/session/ses_x/" (lambda (_) '(:error 404 "Session not found: ses_x")))
+                 opencode-test-routes))
+          (results nil))
+      (opencode-session-last-turn "ses_x" (lambda (turn) (push turn results)))
+      (should (= (length results) 1))
+      (should (eq (car (car results)) :failure))
+      (should (string-match-p "Session not found" (cadr (car results)))))))
+
 (ert-deftest opencode-test-respond-session-open-buffer ()
   "Responding to a session with a buffer shows it and answers there."
   (opencode-test-with-server
