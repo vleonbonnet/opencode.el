@@ -711,15 +711,18 @@ DATA are the members of its data besides `sessionID'."
 (defvar opencode-test-state-now (float-time)
   "Float seconds the expiries of these tests count from.")
 
-(defun opencode-test-state-expiry (seconds ttl tokens)
-  "Return a service expiry SECONDS after `opencode-test-state-now', of TTL seconds, covering TOKENS."
+(defun opencode-test-state-expiry (seconds ttl tokens &optional prompt-tokens)
+  "Return a service expiry SECONDS after `opencode-test-state-now', of TTL seconds, covering TOKENS.
+PROMPT-TOKENS, when given, is the last request's whole prompt, which
+only newer builds of the fork tell."
   `((expires . ,(round (* 1000 (+ opencode-test-state-now seconds)))) (ttl . ,(* 1000 ttl))
-    (tokens . ,tokens)))
+    (tokens . ,tokens) ,@(when prompt-tokens `((promptTokens . ,prompt-tokens)))))
 
-(defun opencode-test-state-cache (seconds ttl tokens)
-  "Return the registry's form of `opencode-test-state-expiry' with SECONDS, TTL and TOKENS."
+(defun opencode-test-state-cache (seconds ttl tokens &optional prompt-tokens)
+  "Return the registry's form of `opencode-test-state-expiry' with SECONDS, TTL and TOKENS.
+PROMPT-TOKENS is as for `opencode-test-state-expiry'."
   (list :expires (/ (round (* 1000 (+ opencode-test-state-now seconds))) 1000.0)
-        :ttl (float ttl) :tokens tokens))
+        :ttl (float ttl) :tokens tokens :prompt-tokens prompt-tokens))
 
 (defun opencode-test-state-cache-event (session &optional expiry)
   "Return a `session.cache.updated' event of SESSION carrying EXPIRY."
@@ -839,6 +842,32 @@ DATA are the members of its data besides `sessionID'."
                                          "ses_c" (opencode-test-state-expiry 60 300 10)))))
         (should-not (opencode-state-cache "ses_c"))
         (should-not opencode-state--cache-timer)))))
+
+(ert-deftest opencode-test-state-cache-prompt-tokens ()
+  "An expiry tells the last request's whole prompt, of which its tokens are cached."
+  (let ((opencode-test-state-now (float-time)))
+    (opencode-test-with-state-server
+        (list :sessions (list (opencode-test-state-info "ses_a" :updated 10))
+              :caches `(("ses_a" . ,(opencode-test-state-expiry 300 3600 120000 130000))
+                        ("ses_b" . ,(opencode-test-state-expiry 300 300 900))))
+      (opencode-test-state-connect)
+      (should (equal (opencode-state-cache "ses_a") (opencode-test-state-cache 300 3600 120000 130000)))
+      (should (= (plist-get (opencode-state-cache "ses_a") :prompt-tokens) 130000))
+      ;; A build of the service that does not tell it.
+      (should (plist-member (opencode-state-cache "ses_b") :prompt-tokens))
+      (should-not (plist-get (opencode-state-cache "ses_b") :prompt-tokens))
+      (opencode-test-state-recording
+        ;; A new turn sent more, and cached a larger share of it.
+        (opencode-test-dispatch (list (opencode-test-state-cache-event
+                                       "ses_a" (opencode-test-state-expiry 600 3600 140000 141000))))
+        (should (= (plist-get (opencode-state-cache "ses_a") :prompt-tokens) 141000))
+        (should (= (plist-get (opencode-state-cache "ses_a") :tokens) 140000))
+        (should (equal opencode-test-state-updates '("ses_a")))
+        ;; The prompt alone changing is a change.
+        (opencode-test-dispatch (list (opencode-test-state-cache-event
+                                       "ses_a" (opencode-test-state-expiry 600 3600 140000 150000))))
+        (should (= (plist-get (opencode-state-cache "ses_a") :prompt-tokens) 150000))
+        (should (equal opencode-test-state-updates '("ses_a" "ses_a")))))))
 
 (ert-deftest opencode-test-state-cache-expires ()
   "The earliest expiry passing forgets it and lists the expiries again, which may hold another."

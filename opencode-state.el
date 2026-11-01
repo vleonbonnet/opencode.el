@@ -329,8 +329,11 @@ known."
 It describes the provider's cache entry that a next turn extending the
 session's last request would reuse, as a plist: :expires, when it runs
 out, in float seconds since the epoch; :ttl, its retention window in
-seconds, which every provider response reusing it starts over; and
-:tokens, the prompt tokens it covers.  Nil when no entry is live, the
+seconds, which every provider response reusing it starts over;
+:tokens, the prompt tokens it covers; and :prompt-tokens, all the
+prompt tokens of the session's last request, uncached input and cache
+reads and writes, of which :tokens is the share cached, or nil from a
+service that does not tell it.  Nil when no entry is live, the
 service cannot tell (see `opencode-state-cache-supported-p'), or the
 expiry is not known yet.  Nothing reports an entry running out, so
 callers count down to :expires themselves; the registry lists the
@@ -985,7 +988,8 @@ fetch is tried again when next asked for."
   (let-alist expiry
     (when-let* ((expires (opencode-time-seconds .expires))
                 ((> expires (float-time))))
-      (list :expires expires :ttl (and (numberp .ttl) (/ .ttl 1000.0)) :tokens .tokens))))
+      (list :expires expires :ttl (and (numberp .ttl) (/ .ttl 1000.0)) :tokens .tokens
+            :prompt-tokens .promptTokens))))
 
 (defun opencode-state--cache-set (id cache)
   "Make CACHE the prompt-cache expiry of session ID, nil removing it.
