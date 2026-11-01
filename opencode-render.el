@@ -272,7 +272,7 @@ do the points that follow output (see `opencode-keeping-followers')."
         (comint--mark-as-output position end))
       (dolist (marker markers)
         (set-marker marker end)))
-    (opencode-buttonize position end)
+    (opencode-buttonize position end t)
     end))
 
 (defun opencode-set-last-response-start (position)
@@ -410,21 +410,29 @@ the output FUNCTION writes, as Comint's points do: see
   "Return STRING marked to show as KIND whatever its Markdown reading."
   (propertize string 'opencode-fontify kind))
 
+(defun opencode-fontify-kinds (position)
+  "Return the list of `opencode-fontify' kinds marked at POSITION."
+  (ensure-list (get-text-property position 'opencode-fontify)))
+
 (defun opencode-apply-fontify-properties (start end &optional _loudly)
-  "Reassert `opencode-fontify' effects and durable buttons between START and END."
+  "Reassert `opencode-fontify' effects and durable buttons between START and END.
+Text may be marked with several kinds, such as a link in verbatim text:
+verbatim and hidden text first lose what Markdown gave them, then links
+get their face."
   (with-silent-modifications
     (let ((pos start))
       (while (< pos end)
-        (let ((next (next-single-property-change pos 'opencode-fontify nil end)))
-          (pcase (get-text-property pos 'opencode-fontify)
-            ('verbatim
-             (remove-text-properties pos next '(face nil invisible nil display nil button nil
-                                                     category nil action nil)))
-            ('hidden
-             (remove-text-properties pos next '(face nil invisible nil button nil category nil
-                                                     action nil help-echo nil mouse-face nil))
-             (put-text-property pos next 'display ""))
-            ('link (add-face-text-property pos next 'link)))
+        (let ((next (next-single-property-change pos 'opencode-fontify nil end))
+              (kinds (opencode-fontify-kinds pos)))
+          (when (memq 'verbatim kinds)
+            (remove-text-properties pos next '(face nil invisible nil display nil button nil
+                                                    category nil action nil)))
+          (when (memq 'hidden kinds)
+            (remove-text-properties pos next '(face nil invisible nil button nil category nil
+                                                    action nil help-echo nil mouse-face nil))
+            (put-text-property pos next 'display ""))
+          (when (memq 'link kinds)
+            (add-face-text-property pos next 'link))
           (setq pos next))))
     (let ((pos start))
       (while (< pos end)
@@ -433,28 +441,66 @@ the output FUNCTION writes, as Comint's points do: see
             (add-text-properties pos next properties))
           (setq pos next))))))
 
-(defun opencode-mark-fontify (start end kind)
-  "Mark START..END to show as KIND, and apply it at once."
+(defun opencode-mark-fontify (start end kind &optional add)
+  "Mark START..END to show as KIND, and apply it at once.
+With ADD, KIND joins the kinds already marked there instead of
+replacing them, as a link does in verbatim text."
   (with-silent-modifications
-    (put-text-property start end 'opencode-fontify kind))
+    (if (not add)
+        (put-text-property start end 'opencode-fontify kind)
+      (let ((pos start))
+        (while (< pos end)
+          (let ((next (next-single-property-change pos 'opencode-fontify nil end))
+                (kinds (opencode-fontify-kinds pos)))
+            (unless (memq kind kinds)
+              (put-text-property pos next 'opencode-fontify
+                                 (if kinds (append kinds (list kind)) kind)))
+            (setq pos next))))))
   (opencode-apply-fontify-properties start end))
 
 (defun opencode-make-button (start end &rest properties)
-  "Make a text button from START to END with PROPERTIES surviving fontification."
+  "Make a text button from START to END with PROPERTIES surviving fontification.
+The button's category, which gives it its keys, survives too: verbatim
+text drops the buttons Markdown would make there."
   (apply #'make-text-button start end properties)
   (with-silent-modifications
-    (put-text-property start end 'opencode-button properties)))
+    (put-text-property start end 'opencode-button
+                       (append (list 'button (get-text-property start 'button)
+                                     'category (get-text-property start 'category))
+                               properties))))
 
 (defvar opencode-buttonize-functions nil
   "Functions turning references between START and END into buttons.
 Run over every chunk of output, from the start of its first line, so a
 reference is found once its closing delimiter arrives.  Each function
-must skip references it already buttonized.")
+must skip references it already buttonized.  A reference without a
+closing delimiter, such as a bare URL, ends at END only when
+`opencode-buttonize-complete' is non-nil.")
 
-(defun opencode-buttonize (start end)
-  "Run `opencode-buttonize-functions' between START and END."
-  (let ((inhibit-read-only t))
+(defvar opencode-buttonize-complete nil
+  "Non-nil while the output being buttonized is complete.
+The text at the end of streamed output may still grow, so a reference
+that ends there without a closing delimiter is left until more output
+follows it or the block writing it ends.")
+
+(defun opencode-buttonize (start end &optional complete)
+  "Run `opencode-buttonize-functions' between START and END.
+COMPLETE means nothing written later continues the text before END."
+  (let ((inhibit-read-only t)
+        (opencode-buttonize-complete complete))
     (run-hook-with-args 'opencode-buttonize-functions start end)))
+
+(defun opencode-buttonize-output-end ()
+  "Buttonize the last line of the output as complete.
+Called when the block writing at the process mark ended, so that a
+reference ending the output, which more text might have continued,
+becomes a button."
+  (let ((pmark (opencode-pmark)))
+    (opencode-buttonize (save-excursion
+                          (goto-char pmark)
+                          (let ((inhibit-field-text-motion t))
+                            (line-beginning-position)))
+                        pmark t)))
 
 ;;;; Fontification
 
@@ -546,6 +592,9 @@ something else."
   (setq-local font-lock-extra-managed-props
               (cl-set-difference font-lock-extra-managed-props
                                  '(button category action help-echo)))
+  ;; markdown-ts links bare URLs at redisplay, in the input too, and opens
+  ;; them as mail; opencode-links makes them from output instead.
+  (jit-lock-unregister 'markdown-ts--fontify-bare-uri)
   ;; Half-typed input can wrap the whole transcript in one error node.
   ;; The settings are shared between markdown buffers, so copy them first.
   (setq-local treesit-font-lock-settings (mapcar #'copy-sequence treesit-font-lock-settings))
@@ -691,7 +740,7 @@ applied back, so properties and markers on unchanged text survive."
                       (unless (get-text-property pos 'field)
                         (add-text-properties pos next output-properties))
                       (setq pos next)))))
-              (opencode-buttonize (point-min) (point-max)))))))))
+              (opencode-buttonize (point-min) (point-max) t))))))))
 
 (defun opencode-align-finished-tables (&optional finished)
   "Render the tables of the current text block whose end has arrived.

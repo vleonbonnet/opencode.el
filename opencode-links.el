@@ -22,14 +22,17 @@
 
 ;;; Commentary:
 
-;; Three kinds of references in assistant output become buttons, each
+;; Four kinds of references in assistant output become buttons, each
 ;; once its closing delimiter arrives: backticked file references with an
 ;; optional line (`file.el:12'), bracketed Org links of any type
 ;; (`[[id:UUID][heading]]', opened by Org's own dispatcher, custom link
-;; types included), and Markdown links (`[label](url)', local paths open
-;; in Emacs).  Org link brackets are hidden so only the description shows,
-;; as in Org.  File references and Org labels get the link face over
-;; whatever Markdown gave them.
+;; types included), Markdown links (`[label](url)', local paths open
+;; in Emacs), and URLs written out (http, https, ftp and file), which
+;; end where a URL cannot continue, or where the text ends, without the
+;; punctuation closing a sentence or a bracket they do not open.  Org
+;; link brackets are hidden so only the description shows, as in Org.
+;; File references, Org labels and URLs get the link face over whatever
+;; Markdown gave them.
 ;;
 ;; \\[opencode-open-link-at-point] follows the link at point, else offers
 ;; the links of the exchange around point, the way `org-open-at-point'
@@ -92,7 +95,7 @@ The first returning non-nil has handled the link at point.")
                             (format "Open %s:%d in another window" file line)
                           (format "Open %s in another window" file))
              'mouse-face 'highlight)
-            (opencode-mark-fontify beg finish 'link)))))))
+            (opencode-mark-fontify beg finish 'link t)))))))
 
 (defun opencode--follow-org-link (button)
   "Open BUTTON's Org link with Org's link dispatcher."
@@ -112,6 +115,7 @@ The first returning non-nil has handled the link at point.")
              (label-beg (or (match-beginning 2) link-beg))
              (label-end (or (match-end 2) link-end))
              (link (match-string-no-properties 0)))
+        (opencode--unlink-bare-urls beg finish)
         (unless (get-text-property label-beg 'opencode-button)
           (opencode-make-button
            label-beg label-end
@@ -121,7 +125,7 @@ The first returning non-nil has handled the link at point.")
            'follow-link t
            'help-echo (format "Open %s" link)
            'mouse-face 'highlight)
-          (opencode-mark-fontify label-beg label-end 'link)
+          (opencode-mark-fontify label-beg label-end 'link t)
           (opencode-mark-fontify beg label-beg 'hidden)
           (opencode-mark-fontify label-end finish 'hidden))))))
 
@@ -151,6 +155,7 @@ The first returning non-nil has handled the link at point.")
     (while (re-search-forward opencode--markdown-link-regexp end t)
       (let ((label-beg (match-beginning 1))
             (url (match-string-no-properties 2)))
+        (opencode--unlink-bare-urls (match-beginning 0) (match-end 0))
         (unless (get-text-property label-beg 'opencode-button)
           (opencode-make-button
            label-beg (match-end 1)
@@ -160,9 +165,110 @@ The first returning non-nil has handled the link at point.")
            'help-echo (format "Open %s" url)
            'mouse-face 'highlight))))))
 
+;;;; Bare URLs
+
+(defconst opencode--bare-url-regexp
+  (rx (or "https" "http" "ftp" "file") "://"
+      (group (* (not (any (?\0 . ?\s) ?\177 blank ?< ?> ?\" ?`)))))
+  "A URL written out in text, up to whatever cannot be part of one.
+Its first group is what follows the scheme.  Trailing punctuation is
+left to `opencode--bare-url-end'.")
+
+(defconst opencode--bare-url-properties
+  '(button category action url follow-link help-echo mouse-face opencode-button opencode-bare-url)
+  "Text properties of a bare URL's button.")
+
+(defun opencode--bare-url-end (beg end)
+  "Return where the URL from BEG ends, its match ending at END.
+Punctuation closing the sentence or quote it is in is not part of it,
+nor a closing bracket it does not open, as in GitHub's Markdown."
+  (let ((stop end)
+        (done nil))
+    (while (and (> stop beg) (not done))
+      (let* ((char (char-before stop))
+             (opening (cdr (assq char '((?\) . ?\() (?\] . ?\[) (?} . ?{))))))
+        (if (or (memq char '(?. ?, ?: ?\; ?! ?? ?' ?* ?_ ?~))
+                (and opening
+                     (let ((url (buffer-substring-no-properties beg stop)))
+                       (< (cl-count opening url) (cl-count char url))))
+                (and (> char 127)
+                     (memq (get-char-code-property char 'general-category)
+                           '(Po Pe Pf Pi Ps))))
+            (setq stop (1- stop))
+          (setq done t))))
+    stop))
+
+(defun opencode--bare-url-skip-p (beg end)
+  "Return non-nil when the URL from BEG to END must not be a button of its own.
+That is when it continues a word, is or is in a link already, is the
+hidden target of an Org link or the destination of a Markdown one, or is
+in text marked `opencode-no-links'."
+  (or (and (> beg (point-min))
+           (string-match-p "[[:alnum:]]" (string (char-before beg))))
+      (text-property-not-all beg end 'opencode-button nil)
+      (text-property-not-all beg end 'opencode-no-links nil)
+      (memq 'hidden (opencode-fontify-kinds beg))
+      (save-excursion
+        (goto-char beg)
+        (looking-back "\\](<?" (max (point-min) (- beg 3))))))
+
+(defun opencode--buttonize-bare-urls (start end)
+  "Turn the URLs written out between START and END into buttons.
+A URL ending at END may still grow, unless the output is complete
+\(see `opencode-buttonize-complete'), and is left for the next pass."
+  (save-excursion
+    (goto-char start)
+    (while (re-search-forward opencode--bare-url-regexp end t)
+      (let* ((beg (match-beginning 0))
+             (path-beg (match-beginning 1))
+             (run-end (match-end 0))
+             (finish (opencode--bare-url-end path-beg run-end)))
+        (when (and (or (< run-end end) opencode-buttonize-complete)
+                   (> finish path-beg)
+                   (not (opencode--bare-url-skip-p beg finish)))
+          (let ((url (buffer-substring-no-properties beg finish)))
+            (opencode-make-button
+             beg finish
+             'action #'opencode--follow-url
+             'url url
+             'follow-link t
+             'help-echo (format "Open %s" url)
+             'mouse-face 'highlight
+             'opencode-bare-url t)
+            (opencode-mark-fontify beg finish 'link t)))))))
+
+(defun opencode--unlink-bare-urls (start end)
+  "Undo the bare URL buttons overlapping START..END.
+A link whose delimiters arrived later, such as an Org link with a
+description, may hold a URL that was made a button on its own."
+  (let ((pos start))
+    (while (and (< pos end) (setq pos (text-property-any pos end 'opencode-bare-url t)))
+      (let* ((button (button-at pos))
+             (beg (button-start button))
+             (finish (button-end button)))
+        (with-silent-modifications
+          (remove-list-of-text-properties beg finish opencode--bare-url-properties)
+          (let ((run beg))
+            (while (< run finish)
+              (let ((next (next-single-property-change run 'opencode-fontify nil finish))
+                    (kinds (remq 'link (opencode-fontify-kinds run))))
+                (put-text-property run next 'opencode-fontify (if (cdr kinds) kinds (car kinds)))
+                (setq run next)))
+            (setq run beg)
+            (while (< run finish)
+              (let ((next (next-single-property-change run 'face nil finish))
+                    (face (get-text-property run 'face)))
+                (cond ((eq face 'link) (put-text-property run next 'face nil))
+                      ((and (consp face) (memq 'link face))
+                       (put-text-property run next 'face (remq 'link face))))
+                (setq run next)))))
+        (setq pos finish)))))
+
 (add-hook 'opencode-buttonize-functions #'opencode--buttonize-file-references)
 (add-hook 'opencode-buttonize-functions #'opencode--buttonize-org-links)
 (add-hook 'opencode-buttonize-functions #'opencode--buttonize-markdown-links)
+;; Last, so that a URL in a link of another kind is left to it.
+(add-hook 'opencode-buttonize-functions #'opencode--buttonize-bare-urls 90)
 
 ;;;; Opening links
 
