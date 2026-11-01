@@ -451,13 +451,16 @@ The transient shows the full command, so the block stays collapsed."
 (opencode-install-hidden-navigation 'opencode-permission-transient opencode-transient-scroll-suffixes)
 
 (defun opencode--permission-on-exit ()
-  "Keep a dismissed request pending; only a suspended one stays active."
-  (remove-hook 'transient-exit-hook #'opencode--permission-on-exit)
-  (if (opencode-transient-suspended-p 'opencode-permission-transient)
-      (message "OpenCode permission suspended; %s resumes it" (opencode-command-keys 'opencode-respond))
-    (when opencode--active-permission
-      (setq opencode--active-permission nil)
-      (message "OpenCode permission deferred; %s resumes it" (opencode-command-keys 'opencode-respond)))))
+  "Keep a dismissed request pending; only a suspended one stays active.
+The exit of another transient whose suffix opened this one, such as
+drover's menu, comes once this one is shown, and does not count."
+  (unless (opencode-transient-displayed-p 'opencode-permission-transient)
+    (remove-hook 'transient-exit-hook #'opencode--permission-on-exit)
+    (if (opencode-transient-suspended-p 'opencode-permission-transient)
+        (message "OpenCode permission suspended; %s resumes it" (opencode-command-keys 'opencode-respond))
+      (when opencode--active-permission
+        (setq opencode--active-permission nil)
+        (message "OpenCode permission deferred; %s resumes it" (opencode-command-keys 'opencode-respond))))))
 
 (defun opencode--permission-close-transient ()
   "Close the permission transient because its request was resolved elsewhere."

@@ -362,12 +362,22 @@ shows typed answers in place of the option keys."
       (add-hook 'transient-exit-hook #'opencode--question-on-exit)
       (call-interactively #'opencode-question-transient))))
 
+(defun opencode--question-gone-p ()
+  "Return non-nil, saying so, when the question shown is no longer pending.
+Its form may be resolved elsewhere while a suffix runs, such as while
+a custom answer is typed, after the transient was left."
+  (unless (opencode--active-entry)
+    (setq opencode-question--handled t)
+    (message "The OpenCode question is no longer pending")
+    t))
+
 (defun opencode--question-goto (index)
   "Keep the current selection, leave the transient and show question INDEX."
-  (opencode--question-save)
-  (setq opencode-question--handled t)
-  (plist-put (opencode--active-entry) :index index)
-  (run-at-time 0 nil #'opencode--question-show))
+  (unless (opencode--question-gone-p)
+    (opencode--question-save)
+    (setq opencode-question--handled t)
+    (plist-put (opencode--active-entry) :index index)
+    (run-at-time 0 nil #'opencode--question-show)))
 
 (defun opencode--question-submit (&optional cancel)
   "Send the active entry's answers, or CANCEL it, and release the transient."
@@ -375,14 +385,17 @@ shows typed answers in place of the option keys."
          (buffer (plist-get active :buffer)))
     (setq opencode-question--handled t
           opencode--active-form nil)
-    (when (buffer-live-p buffer)
+    (when (and active (buffer-live-p buffer))
       (with-current-buffer buffer (opencode-form-send (plist-get active :entry) cancel)))))
 
 (defun opencode--question-advance ()
   "Keep the current answer, then show the next question or submit them all."
-  (if (opencode--question-final-p)
-      (progn (opencode--question-save) (opencode--question-submit))
-    (opencode--question-goto (1+ (opencode--question-index)))))
+  (cond
+   ((opencode--question-gone-p))
+   ((opencode--question-final-p)
+    (opencode--question-save)
+    (opencode--question-submit))
+   (t (opencode--question-goto (1+ (opencode--question-index))))))
 
 (defclass opencode-question-option (transient-suffix)
   ((option-index :initarg :option-index :initform 0)
@@ -457,11 +470,14 @@ shows typed answers in place of the option keys."
 
 (defun opencode--question-previous-transient ()
   "Leave the transient only when a previous question exists."
-  (if (> (opencode--question-index) 0) transient--exit transient--stay))
+  (if (or (not (opencode--active-entry)) (> (opencode--question-index) 0))
+      transient--exit
+    transient--stay))
 
 (defun opencode--question-next-transient ()
   "Leave the transient only for an answered question that is not the last."
-  (if (and (opencode--question-selection) (not (opencode--question-final-p)))
+  (if (or (not (opencode--active-entry))
+          (and (opencode--question-selection) (not (opencode--question-final-p))))
       transient--exit
     transient--stay))
 
@@ -469,15 +485,17 @@ shows typed answers in place of the option keys."
   "Show the previous question with its saved answer."
   :transient #'opencode--question-previous-transient
   (interactive)
-  (if (> (opencode--question-index) 0)
-      (opencode--question-goto (1- (opencode--question-index)))
-    (message "This is the first question")))
+  (cond
+   ((opencode--question-gone-p))
+   ((> (opencode--question-index) 0) (opencode--question-goto (1- (opencode--question-index))))
+   (t (message "This is the first question"))))
 
 (transient-define-suffix opencode-question-next ()
   "Keep the current answer and show the next question."
   :transient #'opencode--question-next-transient
   (interactive)
   (cond
+   ((opencode--question-gone-p))
    ((not (opencode--question-selection)) (message "Answer this question first"))
    ((opencode--question-final-p) (message "Last question; confirm an answer to submit"))
    (t (opencode--question-advance))))
@@ -507,14 +525,19 @@ shows typed answers in place of the option keys."
          opencode-transient-scroll-suffixes))
 
 (defun opencode--question-on-exit ()
-  "Keep an unanswered question and its selection pending after the transient exits."
-  (remove-hook 'transient-exit-hook #'opencode--question-on-exit)
-  (unless opencode-question--handled
-    (opencode--question-save)
-    (if (opencode-transient-suspended-p 'opencode-question-transient)
-        (message "OpenCode question suspended; %s resumes it" (opencode-command-keys 'opencode-respond))
-      (setq opencode--active-form nil)
-      (message "OpenCode question deferred; %s resumes it" (opencode-command-keys 'opencode-respond)))))
+  "Keep an unanswered question and its selection pending after the transient exits.
+The hook runs on the exit of any transient, and when a suffix of
+another transient, such as drover's menu, opens the question, that
+transient's exit comes only after the question transient is set up:
+it does not count while the question transient is still shown."
+  (unless (opencode-transient-displayed-p 'opencode-question-transient)
+    (remove-hook 'transient-exit-hook #'opencode--question-on-exit)
+    (unless opencode-question--handled
+      (opencode--question-save)
+      (if (opencode-transient-suspended-p 'opencode-question-transient)
+          (message "OpenCode question suspended; %s resumes it" (opencode-command-keys 'opencode-respond))
+        (setq opencode--active-form nil)
+        (message "OpenCode question deferred; %s resumes it" (opencode-command-keys 'opencode-respond))))))
 
 (defun opencode--form-close-transient ()
   "Close the transient of the active form, resolved elsewhere."

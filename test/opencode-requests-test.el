@@ -234,6 +234,182 @@
           (opencode-test-dispatch (opencode-test-events id))
           (should (equal (cons scenario (opencode-test-text live)) (cons scenario replayed))))))))
 
+;;;; Answering in the transients
+
+(defvar opencode-test-transient-buffer nil
+  "Session buffer whose request `opencode-test-outer-respond' answers.")
+
+(transient-define-suffix opencode-test-outer-respond ()
+  "Answer the request of `opencode-test-transient-buffer', as drover's menu does."
+  (interactive)
+  (with-current-buffer opencode-test-transient-buffer
+    (opencode-respond)))
+
+(transient-define-prefix opencode-test-outer-transient ()
+  "Stand for another package's menu answering requests, such as `drover-dispatch'."
+  [("A" "Answer" opencode-test-outer-respond)])
+
+(defmacro opencode-test-with-transients (buffer &rest body)
+  "Run BODY with session BUFFER selected, as when answering its requests by keys.
+Transients show their menu, when they do, in a window of their own
+below, and every one still active afterwards is left."
+  (declare (indent 1) (debug t))
+  `(let ((opencode-test-transient-buffer ,buffer)
+         (opencode--active-form nil)
+         (opencode--active-permission nil)
+         (opencode--permission-transient-state nil))
+     (save-window-excursion
+       (delete-other-windows)
+       (set-window-buffer (selected-window) opencode-test-transient-buffer)
+       (cl-letf (((symbol-function 'display-buffer)
+                  (lambda (buffer &rest _)
+                    (unless (equal (buffer-name (get-buffer buffer)) transient--buffer-name)
+                      (ert-fail "Unexpected display"))
+                    (let ((window (split-window (frame-root-window) nil 'below)))
+                      (set-window-buffer window buffer)
+                      window))))
+         (unwind-protect (progn ,@body)
+           (transient--emergency-exit)
+           (remove-hook 'transient-exit-hook #'opencode--question-on-exit)
+           (remove-hook 'transient-exit-hook #'opencode--permission-on-exit))))))
+
+(defun opencode-test-keys (keys)
+  "Type KEYS, then run the timers showing the next question, as the command loop would."
+  (execute-kbd-macro (kbd keys))
+  (let ((deadline (+ (float-time) 5)))
+    (while (and (seq-find (lambda (timer) (eq (timer--function timer) #'opencode--question-show)) timer-list)
+                (< (float-time) deadline))
+      (accept-process-output nil 0.01))))
+
+(defun opencode-test-five-questions (session)
+  "Return a question form of SESSION asking five questions, the third of several answers.
+Their options, three or four, have descriptions."
+  `((id . "frm_five") (sessionID . ,session) (title . "Questions")
+    (metadata (kind . "question"))
+    (fields ,@(cl-loop for index below 5
+                       collect `((key . ,(format "q%d" index)) (title . ,(format "Topic %d" index))
+                                 (description . ,(format "Question %d?" index))
+                                 (type . ,(if (= index 2) "multiselect" "string"))
+                                 (custom . t)
+                                 (options ,@(cl-loop for option below (if (cl-oddp index) 4 3)
+                                                     collect `((value . ,(format "v%d%d" index option))
+                                                               (label . ,(format "Option %d.%d" index option))
+                                                               (description . ,(format "Means %d.%d" index option))))))))))
+
+(defun opencode-test-answer-five (between &optional direct)
+  "Answer five questions opened from another transient, calling BETWEEN after each.
+BETWEEN receives the session buffer and the index of the question just
+answered.  DIRECT opens them with `opencode-respond' instead.  Return
+the messages shown."
+  (let* ((id (opencode-test-scenario "question"))
+         (buffer (opencode-test-open-empty id))
+         (form (opencode-test-five-questions id))
+         (messages nil))
+    (setq opencode-test-routes
+          (cons (list 'get "/form\\'" (lambda (_) `((data ,form)))) opencode-test-routes))
+    (with-current-buffer buffer (opencode-form-queue form))
+    (opencode-test-with-transients buffer
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format &rest arguments)
+                   (when format (push (apply #'format-message format arguments) messages)))))
+        (if direct
+            (with-current-buffer buffer (opencode-respond))
+          (call-interactively #'opencode-test-outer-transient)
+          (opencode-test-keys "A"))
+        (should (opencode-transient-displayed-p 'opencode-question-transient))
+        (should (equal (plist-get (opencode--active-entry) :index) 0))
+        (opencode-test-keys "2")
+        (funcall between buffer 0)
+        (should (equal opencode-question--heading
+                       (concat "Question 2/5 · Topic 1" (propertize "   M-p previous · M-n next" 'face 'shadow)
+                               "\nQuestion 1?")))
+        (opencode-test-keys "4")
+        (funcall between buffer 1)
+        (should opencode-question--multiple)
+        (opencode-test-keys "1 3 C-c C-c")
+        (funcall between buffer 2)
+        (opencode-test-keys "! m i n e RET")
+        (funcall between buffer 3)
+        ;; Back to the typed answer, kept, and on.
+        (opencode-test-keys "M-p")
+        (should (equal opencode-question--custom-text "mine"))
+        (opencode-test-keys "M-n")
+        (opencode-test-keys "3")))
+    (with-current-buffer buffer
+      (should (equal (car (opencode-test-requests-to 'post (format "/form/%s/reply" "frm_five")))
+                     '((answer (q0 . "v01") (q1 . "v13") (q2 . ["v20" "v22"]) (q3 . "mine") (q4 . "v42")))))
+      (should-not opencode-pending-forms))
+    (should-not opencode--active-form)
+    messages))
+
+(ert-deftest opencode-test-question-from-another-transient ()
+  "A form opened from another transient's suffix, as drover's menu does, is answered to the end.
+That transient's exit, which follows the question transient's setup,
+neither defers the question nor leaves it without a form.  Opened
+directly, it is answered alike."
+  (dolist (direct '(nil t))
+    (opencode-test-with-server
+      (let ((messages (opencode-test-answer-five #'ignore direct)))
+        (should-not (seq-find (lambda (message) (string-prefix-p "OpenCode question deferred" message))
+                              messages))))))
+
+(ert-deftest opencode-test-question-survives-events ()
+  "Between questions, the form asked again, synchronized, reloaded and reconnected stays answerable."
+  (opencode-test-with-server
+    (let ((opencode--stream-seen t))
+      (opencode-test-dispatch '(((type . "server.connected") (data))))
+      (opencode-test-answer-five
+       (lambda (buffer index)
+         (pcase index
+           (0 (opencode-test-dispatch
+               `(((type . "form.created")
+                  (data (form . ,(opencode-test-five-questions (buffer-local-value 'opencode-session-id buffer))))))))
+           (1 (with-current-buffer buffer (opencode-form-sync)))
+           (2 (with-current-buffer buffer (opencode-session-reload)))
+           (3 (opencode-test-dispatch '(((type . "server.connected") (data))))))
+         (with-current-buffer buffer
+           (should (= (length opencode-pending-forms) 1))
+           (should (eq (car opencode-pending-forms) (opencode--active-entry)))
+           (should (= (plist-get (opencode--active-entry) :index) (1+ index)))))))))
+
+(ert-deftest opencode-test-question-resolved-while-typing ()
+  "A form answered elsewhere while a custom answer is typed is let go, without a reply or an error."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "question"))
+           (buffer (opencode-test-open-empty id))
+           (messages nil))
+      (with-current-buffer buffer (opencode-form-queue (opencode-test-five-questions id)))
+      (opencode-test-with-transients buffer
+        (cl-letf (((symbol-function 'read-string)
+                   (lambda (&rest _)
+                     (opencode-test-dispatch
+                      `(((type . "form.replied") (data (sessionID . ,id) (id . "frm_five")))))
+                     "late"))
+                  ((symbol-function 'message)
+                   (lambda (format &rest arguments)
+                     (when format (push (apply #'format-message format arguments) messages)))))
+          (with-current-buffer buffer (opencode-respond))
+          (opencode-test-keys "!")))
+      (should (member "The OpenCode question is no longer pending" messages))
+      (should-not (opencode-test-requests-to 'post "/reply"))
+      (should-not opencode--active-form)
+      (with-current-buffer buffer (should-not opencode-pending-forms)))))
+
+(ert-deftest opencode-test-permission-from-another-transient ()
+  "A permission opened from another transient's suffix stays the one shown, closed once answered elsewhere."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "permission"))
+           (buffer (opencode-test-open-empty id))
+           (rest (opencode-test-dispatch-until (opencode-test-events id) "permission.asked")))
+      (opencode-test-with-transients buffer
+        (call-interactively #'opencode-test-outer-transient)
+        (opencode-test-keys "A")
+        (should (opencode-transient-displayed-p 'opencode-permission-transient))
+        (should (equal (plist-get opencode--active-permission :id)
+                       (plist-get (car (buffer-local-value 'opencode-pending-permissions buffer)) :id)))
+        (opencode-test-dispatch-until rest "permission.replied")
+        (should-not (opencode-transient-displayed-p 'opencode-permission-transient))
+        (should-not opencode--active-permission)))))
 ;;;; Sending while a request waits
 
 (defvar opencode-test-choices nil
