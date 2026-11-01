@@ -543,7 +543,8 @@ session property, where mode setup and cleanup disturb the transcript."
 Every prompt follows the hidden \"> \", so markdown-ts reads it as a
 block quote; answers keep their quote face.  The input being typed
 shows its Markdown as typed: none of it is hidden or displayed as
-something else."
+something else, and none of it is a link, which RET would follow
+instead of sending the input."
   (let* ((process (get-buffer-process (current-buffer)))
          (pmark (and process (marker-position (process-mark process)))))
     (with-silent-modifications
@@ -553,7 +554,8 @@ something else."
             (when (and pmark (< pos pmark next))
               (setq next pmark))
             (when (and pmark (>= pos pmark))
-              (remove-list-of-text-properties pos next '(invisible display)))
+              (remove-list-of-text-properties
+               pos next '(invisible display button category action help-echo follow-link mouse-face)))
             (when (or (get-text-property pos 'opencode-prompt)
                       (and pmark (>= pos pmark)))
               (opencode--prompt-face-region pos next))

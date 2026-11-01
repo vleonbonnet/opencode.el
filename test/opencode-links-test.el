@@ -213,17 +213,18 @@ BINDINGS is a list (SESSION) of the variable bound to the session's ID."
                          '(("https://think.example" . "https://think.example")))))))))
 
 (ert-deftest opencode-test-url-in-input-is-not-a-link ()
-  "A URL typed in the input stays input: RET sends it, even once redisplay fontified it."
+  "Links typed in the input stay input: RET sends it, even once fontified as Markdown."
   (opencode-test-with-server
     (with-current-buffer (opencode-test-open (opencode-test-scenario "text"))
       (should-not (memq 'markdown-ts--fontify-bare-uri jit-lock-functions))
       (goto-char (point-max))
-      (insert "fetch https://example.com/x please")
+      (insert "fetch https://example.com/x, [the docs](https://example.com/y) and <https://example.com/z>")
       (when jit-lock-mode (jit-lock-fontify-now))
       (font-lock-ensure)
       (should-not (opencode-test-links (opencode-pmark)))
-      (goto-char (+ (opencode-pmark) 10))
-      (should (eq (key-binding (kbd "RET")) 'opencode-send-input)))))
+      (dolist (text '("example.com/x" "the docs" "example.com/z"))
+        (goto-char (opencode-test-find text))
+        (should (eq (key-binding (kbd "RET")) 'opencode-send-input))))))
 
 (provide 'opencode-links-test)
 ;;; opencode-links-test.el ends here
