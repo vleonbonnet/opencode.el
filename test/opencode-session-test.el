@@ -11,11 +11,6 @@
 
 (require 'opencode-test-helpers)
 
-(defconst opencode-test-scenarios
-  '("text" "read-tools" "edit-tools" "shell" "permission" "question" "subagent"
-    "interrupt" "switch" "steer" "history" "shell-input" "reasoning")
-  "Recorded scenarios whose sessions can be opened.")
-
 (ert-deftest opencode-test-replay-every-scenario ()
   "Every recorded session replays without error and ends at an input prompt."
   (opencode-test-with-server
@@ -87,6 +82,20 @@
         (let ((live (opencode-test-open-empty id)))
           (opencode-test-dispatch (opencode-test-events id))
           (should (equal (opencode-test-text live) replayed)))))))
+
+(ert-deftest opencode-test-live-context-matches-replay ()
+  "Streaming a scenario's events leaves the context size replaying its messages finds.
+A step interrupted after the provider answered reports its usage at its
+failure, which its message keeps."
+  (dolist (scenario opencode-test-scenarios)
+    (opencode-test-with-server
+      (let* ((id (opencode-test-scenario scenario))
+             (replayed (buffer-local-value 'opencode-session-tokens (opencode-test-open id))))
+        (kill-buffer (gethash id opencode-session-buffers))
+        (let ((live (opencode-test-open-empty id)))
+          (opencode-test-dispatch (opencode-test-events id))
+          (should (equal (list scenario (buffer-local-value 'opencode-session-tokens live))
+                         (list scenario replayed))))))))
 
 (defun opencode-test-label-boxes (buffer)
   "Return the box colors of BUFFER's tool block labels, in buffer order."

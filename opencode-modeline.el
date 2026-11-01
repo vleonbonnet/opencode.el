@@ -41,31 +41,22 @@
 ;; then details are dropped one step at a time, the model's "Claude "
 ;; prefix, the provider, the variant, the model and last the context.
 ;;
-;; A model can cost more per token once a request exceeds a context size,
-;; as listed in its catalog pricing or in `opencode-long-context-tiers'.
-;; The context turns to the attention face near that size and to the error
-;; face past it, and crossing it is reported once.
+;; The model, variant, provider and context are drawn by the displays of
+;; opencode-display.el, which other packages' session lists share.  A
+;; model can cost more per token once a request exceeds a context size;
+;; crossing it is reported once.
 
 ;;; Code:
 
 (require 'opencode-blocks)
 (require 'opencode-common)
+(require 'opencode-display)
 (require 'opencode-requests)
 (require 'opencode-session)
-(require 'opencode-variant)
 
 (defcustom opencode-mode-line t
   "When non-nil, session buffers show the session mode line."
   :type 'boolean
-  :group 'opencode)
-
-(defcustom opencode-provider-icons
-  '(("\\`github-copilot\\'" . "\uf4b8")  ; nf-oct-copilot
-    ("\\`anthropic\\'" . "\uec82")       ; nf-cod-claude
-    ("\\`openai\\'" . "\uec81"))         ; nf-cod-openai
-  "Alist of (PROVIDER-ID-REGEXP . ICON) for the mode-line provider segment.
-Providers without a match show a generic icon followed by their name."
-  :type '(alist :key-type regexp :value-type string)
   :group 'opencode)
 
 (defcustom opencode-mode-line-agent-faces
@@ -78,76 +69,6 @@ Providers without a match show a generic icon followed by their name."
   "Columns the session title keeps before session details are dropped."
   :type 'natnum
   :group 'opencode)
-
-(defcustom opencode-default-variant-function #'opencode-model-default-variant
-  "Function naming the variant a model runs with when none is selected.
-Called with the provider and model catalog entries; returns a variant ID,
-a string or symbol, or nil when the provider decides.  The default,
-`opencode-model-default-variant', names the variant sending the effort
-such a request sends.  A function returning nil, or nil itself, shows a
-dim \"default\"."
-  :type '(choice (const :tag "Provider default" nil) function)
-  :group 'opencode)
-
-(defcustom opencode-long-context-tiers nil
-  "Context sizes past which models cost more, beyond their catalog pricing.
-Each entry is (PROVIDER-REGEXP MODEL-REGEXP SIZE LABEL): a model whose
-provider and model IDs match costs what LABEL says, such as \"2×\",
-once a request exceeds SIZE tokens."
-  :type '(repeat (list (regexp :tag "Provider ID")
-                       (regexp :tag "Model ID")
-                       (natnum :tag "Tokens")
-                       (string :tag "Label")))
-  :group 'opencode)
-
-(defcustom opencode-long-context-near 0.9
-  "Fraction of a long-context tier's size from which the mode line warns."
-  :type 'number
-  :group 'opencode)
-
-;;;; Long-context pricing
-
-(defun opencode-long-context-threshold (&optional model info)
-  "Return (SIZE . LABEL) of the higher price tier of MODEL, or nil.
-MODEL is a model reference, by default the session's; INFO its catalog
-entry, by default the cached one."
-  (let* ((model (or model opencode-session-model))
-         (info (or info (opencode-model-info model))))
-    (or (when-let* ((entry (seq-find (lambda (entry)
-                                       (and (string-match-p (nth 0 entry) (or (alist-get 'providerID model) ""))
-                                            (string-match-p (nth 1 entry) (or (alist-get 'id model) ""))))
-                                     opencode-long-context-tiers)))
-          (cons (nth 2 entry) (nth 3 entry)))
-        (let* ((costs (alist-get 'cost info))
-               (base (seq-find (lambda (cost) (null (alist-get 'tier cost))) costs))
-               (tier (car (sort (seq-filter (lambda (cost) (alist-get 'tier cost)) costs)
-                                :key (lambda (cost) (alist-get 'size (alist-get 'tier cost)))))))
-          (when tier
-            (cons (alist-get 'size (alist-get 'tier tier))
-                  (let ((from (alist-get 'input base))
-                        (to (alist-get 'input tier)))
-                    (if (and (numberp from) (numberp to) (> from 0))
-                        (format "%g×" (/ (float to) from))
-                      "a higher rate"))))))))
-
-(defun opencode-long-context-tier (&optional model info)
-  "Return (STATE SIZE LABEL) when the session's context nears a price tier.
-STATE is `near' or `over'; MODEL and INFO are as for
-`opencode-long-context-threshold'."
-  (when-let* (((numberp opencode-session-tokens))
-              (threshold (opencode-long-context-threshold model info)))
-    (cond ((> opencode-session-tokens (car threshold))
-           (list 'over (car threshold) (cdr threshold)))
-          ((>= opencode-session-tokens (* opencode-long-context-near (car threshold)))
-           (list 'near (car threshold) (cdr threshold))))))
-
-(defun opencode-long-context-description (tier)
-  "Return the tooltip line describing TIER, from `opencode-long-context-tier'."
-  (pcase-let ((`(,state ,size ,label) tier))
-    (if (eq state 'over)
-        (format "Context over %dk: requests cost %s" (/ size 1000) label)
-      (format "Context %dk/%dk: near the %s tier"
-              (/ opencode-session-tokens 1000) (/ size 1000) label))))
 
 (defvar-local opencode--long-context-notified nil
   "Non-nil after reporting that this session's context passed a price tier.")
@@ -211,66 +132,22 @@ NAME defaults to the current buffer's name; a uniquifying <N> suffix stays."
                                         opencode-mode-line-agent-faces))))
                 'help-echo (format "Agent: %s" name))))
 
-(defun opencode--mode-line-variant (provider model variant)
-  "Return VARIANT for display, or MODEL's default under PROVIDER."
-  (cond
-   ((and variant (not (equal variant "default")))
-    (propertize variant 'face 'success 'help-echo (format "Variant: %s (selected)" variant)))
-   ((alist-get 'variants model)
-    (let ((default (when-let* ((variant (and opencode-default-variant-function
-                                             (funcall opencode-default-variant-function provider model))))
-                     (format "%s" variant))))
-      (propertize (or default "default")
-                  'face 'shadow
-                  'help-echo (if default
-                                 (format "Variant: %s (default)" default)
-                               "Variant: provider default"))))))
-
-(defun opencode--mode-line-provider (provider id)
-  "Return the icon of PROVIDER with ID, or a generic icon and its name."
-  (let ((name (or (alist-get 'name provider) id)))
-    (propertize (or (cdr (seq-find (lambda (entry) (string-match-p (car entry) id))
-                                   opencode-provider-icons))
-                    (concat "\U000F048D " name)) ; nf-md-server_network
-                'help-echo (format "Provider: %s (%s)" name id))))
-
-(defun opencode--mode-line-context (model info)
-  "Return the context use of MODEL, with catalog entry INFO, or nil when unknown."
-  (let ((limit (alist-get 'context (alist-get 'limit info))))
-    (when (and (numberp limit) (> limit 0) (numberp opencode-session-tokens))
-      (let* ((used (/ (* 100.0 opencode-session-tokens) limit))
-             (slice (min 7 (max 0 (1- (ceiling used 12.5)))))
-             (tier (opencode-long-context-tier model info)))
-        (propertize (concat (string (+ #xF0A9E slice)) ; nf-md-circle_slice_1..8
-                            (format " %.0f%%" used)
-                            (when (eq (car tier) 'over) (concat " " (nth 2 tier))))
-                    'face (pcase (car tier) ('over 'error) ('near 'opencode-attention))
-                    'help-echo (concat (format "Context: %dk/%dk tokens"
-                                               (/ opencode-session-tokens 1000) (/ limit 1000))
-                                       (when tier
-                                         (concat "\n" (opencode-long-context-description tier)))))))))
-
 (defun opencode--mode-line-compute-segments ()
-  "Return the session details as an alist of (SEGMENT . STRING-OR-NIL)."
+  "Return the session details as an alist of (SEGMENT . STRING-OR-NIL).
+Until the catalogs arrive, the model and provider go by their IDs."
   (when opencode-session-agent
     (let* ((agents (opencode-catalog-ensure 'agent))
-           (models (opencode-catalog-ensure 'model))
-           (providers (opencode-catalog-ensure 'provider))
            (model opencode-session-model)
-           (provider-id (alist-get 'providerID model))
-           (info (seq-find (lambda (entry)
-                             (and (equal (alist-get 'id entry) (alist-get 'id model))
-                                  (equal (alist-get 'providerID entry) provider-id)))
-                           models))
-           (provider (seq-find (lambda (entry) (equal (alist-get 'id entry) provider-id))
-                               providers))
-           (name (or (alist-get 'name info) (alist-get 'id model))))
+           (id (alist-get 'id model))
+           (provider-id (alist-get 'providerID model)))
       `((agent . ,(opencode--mode-line-agent opencode-session-agent agents))
-        (model . ,name)
-        (short-model . ,(and name (replace-regexp-in-string "\\`Claude " "" name)))
-        (variant . ,(opencode--mode-line-variant provider info (alist-get 'variant model)))
-        (provider . ,(and provider-id (opencode--mode-line-provider provider provider-id)))
-        (context . ,(opencode--mode-line-context model info))))))
+        (model . ,(or (opencode-model-name model) id))
+        (short-model . ,(or (opencode-model-display model) (and id (opencode--model-short-name id))))
+        (variant . ,(opencode-variant-display model))
+        (provider . ,(and provider-id
+                          (or (opencode-provider-display provider-id)
+                              (opencode--provider-string provider-id provider-id))))
+        (context . ,(opencode-context-display opencode-session-tokens model))))))
 
 (defvar-local opencode--mode-line-segments nil
   "(KEY . SEGMENTS) of the session details last computed.")

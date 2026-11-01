@@ -51,6 +51,7 @@
 (require 'opencode-permission)
 (require 'opencode-form)
 (require 'opencode-variant)
+(require 'opencode-display)
 (require 'opencode-modeline)
 (require 'opencode-sessions)
 (require 'opencode-edits)

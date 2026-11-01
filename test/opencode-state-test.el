@@ -995,6 +995,323 @@ DATA are the members of its data besides `sessionID'."
                          (+ opencode-test-state-now 900 opencode-state--cache-margin)))
                  0.5)))))
 
+;;;; Context size
+
+(defun opencode-test-state-usage (input &optional output cached)
+  "Return a token usage of INPUT, OUTPUT and CACHED read tokens, as the service reports it."
+  `((input . ,input) (output . ,(or output 0)) (reasoning . 0)
+    (cache (read . ,(or cached 0)) (write . 0))))
+
+(defun opencode-test-state-assistant (offset &optional tokens)
+  "Return an assistant message created at OFFSET, reporting usage TOKENS when given."
+  `((id . ,(opencode-test-state-id "msg_" offset)) (type . "assistant")
+    (time (created . ,(opencode-test-state-ms offset)))
+    (agent . "build") (model (id . "gpt-test") (providerID . "openai")) (content)
+    ,@(when tokens `((tokens . ,tokens)))))
+
+(defun opencode-test-state-step-ended (session offset tokens &optional type)
+  "Return the end of a step of SESSION at OFFSET reporting TOKENS.
+TYPE is the event type, `session.step.ended' by default."
+  (opencode-test-state-event (or type "session.step.ended") session offset
+                             `(assistantMessageID . ,(opencode-test-state-id "msg_" offset))
+                             '(finish . "stop") '(cost . 0) `(tokens . ,tokens)))
+
+(defun opencode-test-state-fetch-contexts ()
+  "Run the timer starting the queued context-size fetches, as the command loop would."
+  (while (timerp opencode-state--context-timer)
+    (let ((timer opencode-state--context-timer))
+      (cancel-timer timer)
+      (apply (timer--function timer) (timer--args timer)))))
+
+(defun opencode-test-state-message-queries ()
+  "Return the message requests made, oldest first, as (SESSION-ID . QUERY)."
+  (seq-keep (lambda (request)
+              (let ((path (plist-get request :path)))
+                (when (string-match "\\`/api/session/\\([^/]+\\)/message\\'" path)
+                  (cons (match-string 1 path) (plist-get request :query)))))
+            (reverse opencode-test-requests)))
+
+(defvar opencode-test-state-held nil
+  "Answers of the message requests held by `opencode-test-state-holding-messages', newest first.")
+
+(defmacro opencode-test-state-holding-messages (&rest body)
+  "Run BODY with message requests held until `opencode-test-state-answer' answers them.
+A held request is recorded in `opencode-test-requests' when answered,
+from what the server knows then.  Other requests are answered at once."
+  (declare (indent 0) (debug t))
+  `(let ((answer (symbol-function 'opencode-request))
+         (opencode-test-state-held nil))
+     (cl-letf (((symbol-function 'opencode-request)
+                (lambda (method path &rest arguments)
+                  (if (string-suffix-p "/message" path)
+                      (push (lambda () (apply answer method path arguments))
+                            opencode-test-state-held)
+                    (apply answer method path arguments)))))
+       ,@body)))
+
+(defun opencode-test-state-answer ()
+  "Answer the oldest message request held."
+  (let ((oldest (car (last opencode-test-state-held))))
+    (setq opencode-test-state-held (butlast opencode-test-state-held))
+    (funcall oldest)))
+
+(ert-deftest opencode-test-state-context-fetched-when-asked ()
+  "A loaded session's context size is fetched once asked for, from its newest usage."
+  (opencode-test-with-state-server
+      (list :sessions (list (opencode-test-state-info "ses_a" :updated 30)
+                            (opencode-test-state-info "ses_b" :updated 20)
+                            (opencode-test-state-info "ses_c" :updated 10))
+            :messages `(("ses_a"
+                         ;; A step still running reports no usage yet.
+                         ,(opencode-test-state-assistant 30)
+                         ((type . "user") (time (created . ,(opencode-test-state-ms 25))))
+                         ,(opencode-test-state-assistant 20 (opencode-test-state-usage 200 50 1000))
+                         ,(opencode-test-state-assistant 10 (opencode-test-state-usage 100)))
+                        ("ses_b" ,(opencode-test-state-assistant 20 (opencode-test-state-usage 5000)))
+                        ("ses_c" ((type . "user") (time (created . ,(opencode-test-state-ms 5)))))))
+    (opencode-test-state-connect)
+    ;; The bootstrap costs no request per session.
+    (should-not (opencode-test-state-message-queries))
+    (should-not (plist-get (opencode-state-get "ses_a") :context))
+    (opencode-test-state-recording
+      (dolist (id '("ses_a" "ses_a" "ses_b" "ses_c" "ses_unknown"))
+        (should-not (opencode-state-context id)))
+      ;; Asked from redisplay, the requests wait for a timer.
+      (should-not (opencode-test-state-message-queries))
+      (should (equal opencode-state--context-queue '("ses_a" "ses_b" "ses_c")))
+      (opencode-test-state-fetch-contexts)
+      (should (equal (opencode-test-state-message-queries)
+                     `(("ses_a" (limit . 1) (type . "assistant") (order . "desc"))
+                       ("ses_a" (limit . 1) (type . "assistant") (cursor . "1"))
+                       ("ses_b" (limit . 1) (type . "assistant") (order . "desc"))
+                       ("ses_c" (limit . 1) (type . "assistant") (order . "desc")))))
+      (should (equal (opencode-state-context "ses_a") 1250))
+      (should (equal (plist-get (opencode-state-get "ses_a") :context) 1250))
+      (should (equal (opencode-state-context "ses_b") 5000))
+      (should-not (opencode-state-context "ses_c"))
+      ;; A session without usage changes nothing.
+      (should (equal (sort opencode-test-state-updates) '("ses_a" "ses_b")))
+      (should-not opencode-test-state-changes)
+      (setq opencode-test-requests nil)
+      (dolist (id '("ses_a" "ses_b" "ses_c"))
+        (opencode-state-context id))
+      (opencode-test-state-fetch-contexts)
+      (should-not opencode-test-requests))))
+
+(ert-deftest opencode-test-state-context-fetches-capped ()
+  "Context sizes are fetched a few sessions at a time, in the order asked."
+  (let ((ids '("ses_1" "ses_2" "ses_3" "ses_4" "ses_5")))
+    (opencode-test-with-state-server
+        (list :sessions (seq-map-indexed (lambda (id index) (opencode-test-state-info id :updated index)) ids)
+              :messages (seq-map-indexed (lambda (id index)
+                                           (list id (opencode-test-state-assistant
+                                                     index (opencode-test-state-usage (* 1000 (1+ index))))))
+                                         ids))
+      (opencode-test-state-connect)
+      (opencode-test-state-holding-messages
+        (let ((opencode-state-context-requests 2))
+          (mapc #'opencode-state-context ids)
+          (opencode-test-state-fetch-contexts)
+          (should (= (length opencode-test-state-held) 2))
+          (opencode-test-state-answer)
+          (should (equal (opencode-state-context "ses_1") 1000))
+          (opencode-test-state-fetch-contexts)
+          ;; An answer frees a slot for the next session.
+          (should (= (length opencode-test-state-held) 2))
+          (while opencode-test-state-held
+            (should (<= (length opencode-test-state-held) 2))
+            (opencode-test-state-answer)
+            (opencode-test-state-fetch-contexts))
+          (should (equal (mapcar #'car (opencode-test-state-message-queries)) ids))
+          (should (equal (mapcar #'opencode-state-context ids) '(1000 2000 3000 4000 5000))))))))
+
+(ert-deftest opencode-test-state-context-events ()
+  "Step ends keep the context size current without requests; a revert has it fetched again."
+  (opencode-test-with-state-server nil
+    (opencode-test-state-running-session)
+    (plist-put opencode-test-state-server :messages
+               `(("ses_s" ,(opencode-test-state-assistant 50 (opencode-test-state-usage 300)))))
+    (opencode-test-state-recording
+      (opencode-test-dispatch
+       (list `((type . "session.created") (created . ,(opencode-test-state-ms 100))
+               (data (sessionID . "ses_new") (projectID . "prj_test") (title . "fresh")
+                     (location (directory . ,(directory-file-name opencode-test-workspace)))))))
+      ;; A new session has no usage, and nothing to fetch.
+      (should-not (opencode-state-context "ses_new"))
+      (opencode-test-state-fetch-contexts)
+      (setq opencode-test-state-updates nil)
+      (cl-flet ((step (event context)
+                  (opencode-test-dispatch (list event))
+                  (should (equal (opencode-state-context (alist-get 'sessionID (alist-get 'data event)))
+                                 context))))
+        (step (opencode-test-state-step-ended "ses_new" 110 (opencode-test-state-usage 6000 40 2000)) 8040)
+        (should (equal opencode-test-state-updates '("ses_new")))
+        ;; A step reporting no usage leaves it.
+        (step (opencode-test-state-step-ended "ses_new" 120 (opencode-test-state-usage 0)) 8040)
+        (step (opencode-test-state-step-ended "ses_new" 130 nil "session.step.failed") 8040)
+        ;; A step failing after the provider answered reports its usage.
+        (step (opencode-test-state-step-ended "ses_new" 140 (opencode-test-state-usage 9000) "session.step.failed")
+              9000)
+        (should (equal (plist-get (opencode-state-get "ses_new") :updated) (opencode-test-state-time 140)))
+        ;; A loaded session's size known from an event needs no fetch.
+        (step (opencode-test-state-step-ended "ses_s" 150 (opencode-test-state-usage 700)) 700))
+      (opencode-test-state-fetch-contexts)
+      (should-not (opencode-test-state-message-queries))
+      ;; A revert drops messages, maybe the newest usage.
+      (setq opencode-test-state-updates nil)
+      (opencode-test-dispatch
+       (list (opencode-test-state-event "session.revert.committed" "ses_s" 160
+                                        `(to . ,(opencode-test-state-id "msg_" 140)))))
+      (should (equal opencode-test-state-updates '("ses_s")))
+      (should-not (opencode-state-context "ses_s"))
+      (opencode-test-state-fetch-contexts)
+      (should (equal (mapcar #'car (opencode-test-state-message-queries)) '("ses_s")))
+      (should (equal (opencode-state-context "ses_s") 300))
+      ;; The size is no status.
+      (should (equal opencode-test-state-changes '(("ses_new" nil idle)))))))
+
+(ert-deftest opencode-test-state-context-superseded ()
+  "An event settling the context size during its fetch wins over the fetch's answer."
+  (opencode-test-with-state-server nil
+    (opencode-test-state-running-session)
+    (plist-put opencode-test-state-server :messages
+               `(("ses_s" ,(opencode-test-state-assistant 50 (opencode-test-state-usage 300)))))
+    (opencode-test-state-holding-messages
+      (opencode-state-context "ses_s")
+      (opencode-test-state-fetch-contexts)
+      (should (= (length opencode-test-state-held) 1))
+      (opencode-test-dispatch (list (opencode-test-state-step-ended "ses_s" 100 (opencode-test-state-usage 700))))
+      (opencode-test-state-answer)
+      (should (equal (opencode-state-context "ses_s") 700))
+      (opencode-test-state-fetch-contexts)
+      (should-not opencode-test-state-held)
+      ;; A revert during the fetch fetches again: the answer may predate it.
+      (plist-put opencode-test-state-server :messages
+                 `(("ses_s" ,(opencode-test-state-assistant 50 (opencode-test-state-usage 100)))))
+      (opencode-test-dispatch (list (opencode-test-state-event "session.revert.committed" "ses_s" 110
+                                                               '(to . "msg_x"))))
+      (opencode-state-context "ses_s")
+      (opencode-test-state-fetch-contexts)
+      (opencode-test-dispatch (list (opencode-test-state-event "session.revert.committed" "ses_s" 120
+                                                               '(to . "msg_y"))))
+      (opencode-test-state-fetch-contexts)
+      (should (= (length opencode-test-state-held) 2))
+      (plist-put opencode-test-state-server :messages
+                 `(("ses_s" ,(opencode-test-state-assistant 50 (opencode-test-state-usage 40)))))
+      (opencode-test-state-answer)
+      (should-not (opencode-state-context "ses_s"))
+      (opencode-test-state-answer)
+      (should (equal (opencode-state-context "ses_s") 40)))))
+
+(ert-deftest opencode-test-state-context-reconnect ()
+  "A reconnection keeps the sizes of sessions not updated since, and fetches the rest when asked."
+  (opencode-test-with-state-server
+      (list :sessions (list (opencode-test-state-info "ses_a" :updated 10)
+                            (opencode-test-state-info "ses_b" :updated 10)
+                            (opencode-test-state-info "ses_c" :updated 10)
+                            (opencode-test-state-info "ses_d" :updated 10))
+            :messages `(("ses_a" ,(opencode-test-state-assistant 10 (opencode-test-state-usage 100)))
+                        ("ses_b" ,(opencode-test-state-assistant 10 (opencode-test-state-usage 200)))
+                        ("ses_d" ,(opencode-test-state-assistant 10 (opencode-test-state-usage 400)))))
+    (opencode-test-state-connect)
+    (let ((failing (list 'get "\\`/api/session/ses_c/message\\'" (lambda (_) '(:error 500 "busy")))))
+      (let ((opencode-test-routes (cons failing opencode-test-routes)))
+        (mapc #'opencode-state-context '("ses_a" "ses_b" "ses_c"))
+        (opencode-test-state-fetch-contexts))
+      (should (equal (mapcar #'opencode-state-context '("ses_a" "ses_b")) '(100 200)))
+      ;; A failure is not retried on every ask.
+      (setq opencode-test-requests nil)
+      (should-not (opencode-state-context "ses_c"))
+      (opencode-test-state-fetch-contexts)
+      (should-not opencode-test-requests))
+    (opencode-test-state-holding-messages
+      ;; Asked while the stream is down, the fetch waits for the reconnection.
+      (cl-letf (((symbol-function 'opencode-events-connected-p) #'ignore))
+        (opencode-state-context "ses_d")
+        (opencode-test-state-fetch-contexts))
+      (should-not opencode-test-state-held)
+      ;; A step ran in ses_b while the stream was down.
+      (setq opencode-test-state-server
+            (plist-put opencode-test-state-server :sessions
+                       (list (opencode-test-state-info "ses_a" :updated 10)
+                             (opencode-test-state-info "ses_b" :updated 50)
+                             (opencode-test-state-info "ses_c" :updated 10)
+                             (opencode-test-state-info "ses_d" :updated 10))))
+      (plist-put opencode-test-state-server :messages
+                 `(("ses_a" ,(opencode-test-state-assistant 10 (opencode-test-state-usage 100)))
+                   ("ses_b" ,(opencode-test-state-assistant 50 (opencode-test-state-usage 250)))
+                   ("ses_c" ,(opencode-test-state-assistant 10 (opencode-test-state-usage 300)))
+                   ("ses_d" ,(opencode-test-state-assistant 10 (opencode-test-state-usage 400)))))
+      (setq opencode-test-requests nil)
+      (opencode-test-state-recording
+        (opencode-test-state-connect)
+        (should (equal (opencode-state-context "ses_a") 100))
+        (should-not (member "ses_a" opencode-test-state-updates))
+        (should (member "ses_b" opencode-test-state-updates))
+        (should-not (plist-get (opencode-state-get "ses_b") :context))
+        (mapc #'opencode-state-context '("ses_a" "ses_b" "ses_c"))
+        (opencode-test-state-fetch-contexts)
+        (while opencode-test-state-held
+          (opencode-test-state-answer)
+          (opencode-test-state-fetch-contexts))
+        ;; The fetch asked for while down comes first.
+        (should (equal (mapcar #'car (opencode-test-state-message-queries)) '("ses_d" "ses_b" "ses_c")))
+        (should (equal (mapcar #'opencode-state-context '("ses_a" "ses_b" "ses_c" "ses_d"))
+                       '(100 250 300 400))))
+      ;; A fetch in flight when the stream reconnects is made again.
+      (plist-put opencode-test-state-server :messages
+                 `(("ses_a" ,(opencode-test-state-assistant 60 (opencode-test-state-usage 600)))))
+      (opencode-test-dispatch (list (opencode-test-state-event "session.revert.committed" "ses_a" 60
+                                                               '(to . "msg_x"))))
+      (opencode-state-context "ses_a")
+      (opencode-test-state-fetch-contexts)
+      (should (= (length opencode-test-state-held) 1))
+      (setq opencode-test-requests nil)
+      (opencode-test-state-connect)
+      (opencode-test-state-fetch-contexts)
+      (should (= (length opencode-test-state-held) 2))
+      (opencode-test-state-answer)
+      (should-not (opencode-state-context "ses_a"))
+      (opencode-test-state-answer)
+      (should (equal (opencode-state-context "ses_a") 600))
+      ;; A deleted session is forgotten.
+      (opencode-test-dispatch (list (opencode-test-state-event "session.deleted" "ses_a" 70)))
+      (should-not (gethash "ses_a" opencode-state--contexts)))))
+
+(ert-deftest opencode-test-state-context-matches-buffers ()
+  "The registry's context size of every recorded session is its buffer's.
+Fetched, it is what replaying the transcript finds; followed live, what
+the buffer streaming the events finds."
+  (dolist (scenario opencode-test-scenarios)
+    (let* ((id (opencode-test-scenario scenario))
+           (info (alist-get 'data (opencode-test-fixture (format "session-%s.json" id))))
+           (server (list :sessions (list info)
+                         :messages (list (cons id (reverse (alist-get 'data (opencode-test-fixture
+                                                                             (format "messages-%s.json" id)))))))))
+      (opencode-test-with-state-server (copy-sequence server)
+        (opencode-test-state-connect)
+        (let ((replayed (buffer-local-value 'opencode-session-tokens (opencode-test-open id))))
+          ;; Only a shell command ran there.
+          (should (eq (null replayed) (equal scenario "shell-input")))
+          (opencode-state-context id)
+          (opencode-test-state-fetch-contexts)
+          (should (equal (list scenario (opencode-state-context id)) (list scenario replayed)))))
+      (opencode-test-with-state-server (copy-sequence server)
+        (opencode-test-state-connect)
+        (let ((live (opencode-test-open-empty id))
+              (events (opencode-test-events id)))
+          (opencode-test-dispatch events)
+          (setq opencode-test-requests nil)
+          (opencode-state-context id)
+          (opencode-test-state-fetch-contexts)
+          (should (equal (list scenario (opencode-state-context id))
+                         (list scenario (buffer-local-value 'opencode-session-tokens live))))
+          ;; Known from the events, without a fetch, unless no step
+          ;; reported usage or a revert dropped messages, as the buffer
+          ;; then reloads them.
+          (should (eq (and (opencode-test-state-message-queries) t)
+                      (and (member scenario '("history" "shell-input")) t))))))))
+
 ;;;; Actions
 
 (ert-deftest opencode-test-state-view ()

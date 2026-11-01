@@ -3,30 +3,31 @@
 
 * Modules
 
-| Module                    | Responsibility                                                                                                          |
-|---------------------------+-------------------------------------------------------------------------------------------------------------------------|
-| =opencode.el=             | Entry point: loads every module, autoloads the commands and the desktop handler                                         |
-| =opencode-common.el=      | Groups, faces, shared state, key hints, directory normalization, identifiers, small helpers                             |
-| =opencode-service.el=     | Service discovery from =service.json=, probing, =opencode service start/restart=, version checks                        |
-| =opencode-http.el=        | =opencode-request=: authentication, location header, JSON, retries, error reporting                                     |
-| =opencode-events.el=      | The one SSE stream: frame scanning, queued dispatch, heartbeat watchdog, reconnection                                   |
-| =opencode-state.el=       | Session registry: every session's live state and status, bootstrap, the server-side read marker, prompt-cache expiries  |
-| =opencode-render.el=      | Output and prompt management, fontification that survives Markdown, tables, prompt-only undo                            |
-| =opencode-links.el=       | File, Org and Markdown links in the transcript                                                                          |
-| =opencode-blocks.el=      | Collapsible reasoning, tool and notice blocks, their summaries, fitting to the window                                   |
-| =opencode-session.el=     | Session buffers: opening, replay, live events, sending, attachments, agent and model, navigation; actions by session ID |
-| =opencode-requests.el=    | What permissions and questions share: providers, subagent propagation, transients, answering by session ID, send check  |
-| =opencode-permission.el=  | Permission requests, their transient and the hand-off to another agent                                                  |
-| =opencode-form.el=        | Question forms and other forms                                                                                          |
-| =opencode-notify.el=      | Notification log, filters and operating-system backends                                                                 |
-| =opencode-modeline.el=    | The session mode line and long-context pricing tiers                                                                    |
-| =opencode-variant.el=     | The variant a model runs with when none is selected, from the catalogs                                                  |
-| =opencode-sessions.el=    | Session pickers and their status icons, projects, worktree branches, worktrees, MCP servers                             |
-| =opencode-edits.el=       | Post-edit hooks, safe visiting and saving, indentation, Prettier, Flycheck                                              |
-| =opencode-desktop.el=     | Desktop saving and in-place restoring                                                                                   |
-| =opencode-convert.el=     | Markdown transcripts                                                                                                    |
-| =opencode-cache.el=       | Prompt-cache preflight guard, stale-thinking consent, refused turns                                                     |
-| =opencode-diff-parser.el= | Line ranges of unified diffs                                                                                            |
+| Module                    | Responsibility                                                                                                                        |
+|---------------------------+---------------------------------------------------------------------------------------------------------------------------------------|
+| =opencode.el=             | Entry point: loads every module, autoloads the commands and the desktop handler                                                       |
+| =opencode-common.el=      | Groups, faces, shared state, key hints, directory normalization, identifiers, small helpers                                           |
+| =opencode-service.el=     | Service discovery from =service.json=, probing, =opencode service start/restart=, version checks                                      |
+| =opencode-http.el=        | =opencode-request=: authentication, location header, JSON, retries, error reporting                                                   |
+| =opencode-events.el=      | The one SSE stream: frame scanning, queued dispatch, heartbeat watchdog, reconnection                                                 |
+| =opencode-state.el=       | Session registry: every session's live state and status, bootstrap, the server-side read marker, context sizes, prompt-cache expiries |
+| =opencode-render.el=      | Output and prompt management, fontification that survives Markdown, tables, prompt-only undo                                          |
+| =opencode-links.el=       | File, Org and Markdown links in the transcript                                                                                        |
+| =opencode-blocks.el=      | Collapsible reasoning, tool and notice blocks, their summaries, fitting to the window                                                 |
+| =opencode-session.el=     | Session buffers: opening, replay, live events, sending, attachments, agent and model, navigation; actions by session ID               |
+| =opencode-requests.el=    | What permissions and questions share: providers, subagent propagation, transients, answering by session ID, send check                |
+| =opencode-permission.el=  | Permission requests, their transient and the hand-off to another agent                                                                |
+| =opencode-form.el=        | Question forms and other forms                                                                                                        |
+| =opencode-notify.el=      | Notification log, filters and operating-system backends                                                                               |
+| =opencode-display.el=     | Model, provider, variant and context-use displays for any session, long-context pricing tiers                                         |
+| =opencode-modeline.el=    | The session mode line, and reporting a context passing its price tier                                                                 |
+| =opencode-variant.el=     | The variant a model runs with when none is selected, from the catalogs                                                                |
+| =opencode-sessions.el=    | Session pickers and their status icons, projects, worktree branches, worktrees, MCP servers                                           |
+| =opencode-edits.el=       | Post-edit hooks, safe visiting and saving, indentation, Prettier, Flycheck                                                            |
+| =opencode-desktop.el=     | Desktop saving and in-place restoring                                                                                                 |
+| =opencode-convert.el=     | Markdown transcripts                                                                                                                  |
+| =opencode-cache.el=       | Prompt-cache preflight guard, stale-thinking consent, refused turns                                                                   |
+| =opencode-diff-parser.el= | Line ranges of unified diffs                                                                                                          |
 
 * The server is authoritative
 
@@ -51,6 +52,14 @@ The service does not record when an execution started, nor when it asked a reque
 Unread is the service's, shared by every client: a session is unread when its idle time is newer than its viewed watermark. The registry projects both as the service does: an end of execution sets the idle time to the later of the event's time and one millisecond past the previous idle time, and an interruption by the service shutting down changes neither, since the restarted service resumes the turn. An entry fetched after an event may already reflect it, so a held or queued end of execution is not counted again when the entry's idle time already reaches the event's: counted twice, the idle time would run one millisecond ahead of the service's, which ignores a view of an idle time newer than its own, and the session would stay unread. Posting the view only when unread, and once per watermark while it is in flight, keeps the selection hooks from flooding the service.
 
 Prompt-cache expiries, which only my fork reports, are kept apart from the entries, in a table of their own: the service lists them for every session with a live cache entry, the registry's or not, and a session older than the recent page still shows in drover's lists. They are listed whenever the stream connects, alongside the bootstrap; =session.cache.updated= then carries each session's new expiry after every provider response, and events received while a listing is in flight are held and applied over its answer, which may predate them. Nothing reports an entry running out, and once one has, a longer-lived entry of a shorter prefix may still serve the session (a system prompt cached for an hour under a conversation cached for five minutes), or a fork may have refreshed its parent's entry without an event to the parent; so one timer, set a second past the earliest known expiry, forgets the expiries that passed and lists them all again. A listing supersedes the one in flight, and the timer only ever waits for an expiry still ahead, so listings never loop. A service without the route answers an untagged 404: it then has no expiries, and is not asked again until the stream reconnects, maybe to a newer build; any other failure keeps the expiries known until the next one passes.
+
+Each entry carries the session's context size, as the session buffer counts it: the token counts, input, output, reasoning and cache reads and writes, of its newest assistant message reporting usage (=opencode-context-size= is that rule, for both). The end of every step reports it, and so does a step failing after the provider answered, whose message keeps that usage; the buffer notes both, so that streaming a turn leaves the size replaying it finds. Neither a session's info nor the session list has it, and no route lists it for several sessions: =session.tokens= sums every step, and the fork's cache listing covers only live cache entries. The cheapest source is the session's newest assistant message, =GET /api/session/:id/message?type=assistant&order=desc&limit=1=, the next one only when that step still runs or failed before the provider answered. Fetching it for every session the bootstrap loads would cost one request per session, a hundred by default, on every reconnection, and each answer holds a whole step with its tool outputs; most of those sessions are never displayed. So the size is fetched only when a client asks for it (=opencode-state-context=), from a timer since clients ask at redisplay, which also lets one redisplay's asks queue up, coalesced per session, a few at a time (=opencode-state-context-requests=), in the order asked. A session the registry saw created starts with none known to be needed, and the end of a step settles a size without a request.
+
+A fetch in flight is superseded by an event settling the size meanwhile, which is at least as recent as its answer, and by a committed revert, which removes messages the answer may still count; the revert also forgets the size, which is fetched again when asked for, as the buffer reloads its transcript then. A reconnection may have missed steps, and the service updates a session whenever a step ends or a revert is committed, so a bootstrapped entry keeps the size its old entry knew only while the service's update time is not past the old one; fetches queued or in flight are queued again, since their answers belong to the stream that dropped. A failed fetch is not retried on every redisplay, only once the stream reconnects and a client asks again. Sessions the registry does not hold, such as older ones drover lists from =opencode-fetch-sessions=, have no size: there is no entry to keep current, nor events to follow.
+
+* Displays without a buffer
+
+The session mode line's details are functions of a model reference, a token count and a directory, in =opencode-display.el=, so that other packages' lists show every session's model, provider, variant and context as the mode line does, from the registry rather than a buffer. They read the location's cached catalogs and never wait, being called at redisplay: a value needing a catalog not fetched yet is nil, the fetch starts from a timer, once per catalog however many displays asked, and =opencode-catalog-changed-functions= run when it arrives, as they do when an event or a reconnection makes a catalog forgotten. A selected variant needs no catalog; a default one needs both the model and the provider catalogs, as the request it reproduces merges their settings. The mode line falls back to the model and provider IDs until the catalogs arrive, as it always did, and computes its segments again whenever the catalog generation changes.
 
 * No session list
 

@@ -237,6 +237,18 @@ parents of a directory each time to find its project was measurable.")
   (when-let* ((seconds (opencode-time-seconds milliseconds)))
     (- (float-time) seconds)))
 
+(defun opencode-context-size (tokens)
+  "Return the context size TOKENS report, or nil when they report no usage.
+TOKENS is a token usage alist, as an assistant message or the end of a
+step has it.  The context is everything the next request sends again:
+the prompt, read from the cache, written to it or not, and the answer,
+reasoning included."
+  (when tokens
+    (let-alist tokens
+      (let ((total (+ (or .input 0) (or .output 0) (or .reasoning 0)
+                      (or .cache.read 0) (or .cache.write 0))))
+        (and (> total 0) total)))))
+
 (defun opencode-format-time-ago (seconds)
   "Format SECONDS as a human readable duration, or \"-\" when nil."
   (if seconds (seconds-to-string seconds) "-"))

@@ -33,6 +33,8 @@
 (require 'opencode-common)
 (require 'opencode-session)
 
+(declare-function opencode-model-label "opencode-display")
+
 (defun opencode--conversation-json (value)
   "Return VALUE encoded as indented JSON."
   (let ((json-encoding-pretty-print t))

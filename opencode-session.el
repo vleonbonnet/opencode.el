@@ -197,8 +197,22 @@ Each is a plist (:file URI-ALIST) or (:agent NAME).")
 (defvar opencode--catalog-waiters (make-hash-table :test #'equal)
   "Callbacks waiting for a catalog fetch in flight, keyed like `opencode--catalogs'.")
 
+(defvar opencode--catalog-scheduled (make-hash-table :test #'equal)
+  "Keys, like those of `opencode--catalogs', of the fetches a timer is about to start.")
+
 (defvar opencode-catalog-generation 0
   "Count of catalog changes, for caches of values derived from catalogs.")
+
+(defcustom opencode-catalog-changed-functions nil
+  "Abnormal hook run when a location's catalog is fetched or forgotten.
+Each function receives the catalog's kind, `agent', `model', `provider'
+or `command', and the location's normalized directory; both are nil
+when every catalog was forgotten, as when the event stream (re)connects.
+What was computed from a catalog, such as `opencode-model-display', may
+differ afterwards; a forgotten catalog is fetched again when next asked
+for, and this runs once it arrives."
+  :type 'hook
+  :group 'opencode)
 
 (defconst opencode--catalog-paths
   '((agent . "/api/agent") (model . "/api/model") (provider . "/api/provider")
@@ -209,6 +223,12 @@ Each is a plist (:file URI-ALIST) or (:agent NAME).")
   "Return the cached KIND catalog of DIRECTORY, or nil when not fetched."
   (gethash (cons (opencode-normalize-directory (or directory default-directory)) kind)
            opencode--catalogs))
+
+(defun opencode-catalog-cached-p (kind &optional directory)
+  "Return non-nil when the KIND catalog of DIRECTORY is cached, even empty."
+  (not (eq (gethash (cons (opencode-normalize-directory (or directory default-directory)) kind)
+                    opencode--catalogs 'missing)
+           'missing)))
 
 (defun opencode-catalog-fetch (kind callback &optional directory else)
   "Call CALLBACK with the KIND catalog of DIRECTORY, fetching it when needed.
@@ -239,7 +259,9 @@ first request, so an empty answer is fetched again before being cached."
                                    (finish (lambda (waiters data)
                                              (dolist (waiter waiters)
                                                (funcall (car waiter) data)))
-                                           data))))
+                                           data)
+                                   (opencode-state--run-hook 'opencode-catalog-changed-functions
+                                                             kind directory))))
                        :else (lambda (error)
                                (finish (lambda (waiters error)
                                          (when (seq-some (lambda (waiter) (null (cdr waiter))) waiters)
@@ -256,16 +278,23 @@ For commands that prompt with it; see `opencode-wait'."
 
 (defun opencode-catalog-ensure (kind &optional directory)
   "Return the cached KIND catalog of DIRECTORY, else fetch it in the background.
-Return nil while fetching; mode lines are redisplayed once it arrives.
+Return nil while fetching; mode lines are redisplayed once it arrives,
+and `opencode-catalog-changed-functions' run.
 Callers run at redisplay, so the request starts from a timer."
   (let* ((directory (opencode-normalize-directory (or directory default-directory)))
-         (cached (gethash (cons directory kind) opencode--catalogs 'missing)))
+         (key (cons directory kind))
+         (cached (gethash key opencode--catalogs 'missing)))
     (if (not (eq cached 'missing))
         cached
-      (unless (gethash (cons directory kind) opencode--catalog-waiters)
-        (run-at-time 0 nil #'opencode-catalog-fetch kind
-                     (lambda (_) (force-mode-line-update t))
-                     directory))
+      ;; One redisplay may ask several times before the timer runs.
+      (unless (or (gethash key opencode--catalog-waiters)
+                  (gethash key opencode--catalog-scheduled))
+        (puthash key t opencode--catalog-scheduled)
+        (run-at-time 0 nil
+                     (lambda ()
+                       (remhash key opencode--catalog-scheduled)
+                       (opencode-catalog-fetch kind (lambda (_) (force-mode-line-update t))
+                                               directory))))
       nil)))
 
 (defun opencode--invalidate-catalog (event)
@@ -276,13 +305,18 @@ Callers run at redisplay, so the request starts from a timer."
                       ((or "model.updated" "provider.updated" "integration.updated") '(model provider))
                       ("command.updated" '(command)))))
     (dolist (one kind)
-      (remhash (cons directory one) opencode--catalogs))
+      (when (opencode-catalog-cached-p one directory)
+        (remhash (cons directory one) opencode--catalogs)
+        (opencode-state--run-hook 'opencode-catalog-changed-functions one directory)))
     (cl-incf opencode-catalog-generation)))
 
 (defun opencode--clear-catalogs (_event)
   "Forget every catalog when a stream opens: the service may have changed."
-  (clrhash opencode--catalogs)
-  (cl-incf opencode-catalog-generation))
+  (let ((cached (> (hash-table-count opencode--catalogs) 0)))
+    (clrhash opencode--catalogs)
+    (cl-incf opencode-catalog-generation)
+    (when cached
+      (opencode-state--run-hook 'opencode-catalog-changed-functions nil nil))))
 
 (dolist (type '("agent.updated" "model.updated" "provider.updated" "integration.updated"
                 "command.updated"))
@@ -776,13 +810,9 @@ An error already shown during the current turn is not repeated."
 
 (defun opencode--note-tokens (tokens)
   "Record TOKENS as the context use, unless they report no usage."
-  (when tokens
-    (let-alist tokens
-      (let ((total (+ (or .input 0) (or .output 0) (or .reasoning 0)
-                      (or .cache.read 0) (or .cache.write 0))))
-        (when (> total 0)
-          (setq opencode-session-tokens total)
-          (force-mode-line-update))))))
+  (when-let* ((size (opencode-context-size tokens)))
+    (setq opencode-session-tokens size)
+    (force-mode-line-update)))
 
 (defun opencode--unwrap-notification (text tag attributes)
   "Return TEXT without its TAG element wrapper, or TEXT when it has none.
@@ -905,12 +935,7 @@ error face unless the job completed; any other message is a notice."
         (error (message "OpenCode: cannot render message %s: %s"
                         (alist-get 'id message) (error-message-string err)))))))
 
-(defun opencode-model-label (model)
-  "Return a short display name of MODEL, a model reference."
-  (let-alist model
-    (let ((info (opencode-model-info model)))
-      (concat (or (alist-get 'name info) .id "?")
-              (if .variant (concat " " .variant) "")))))
+(declare-function opencode-model-label "opencode-display")
 
 ;;;; Live events
 
@@ -1060,6 +1085,9 @@ reasoning encrypted stream empty blocks, which replay omits too."
   "Handle `session.step.failed' EVENT."
   (opencode--on-session-event event
     (opencode-align-finished-tables t)
+    ;; A step failing after the provider answered records that usage on
+    ;; its message, which replay reads.
+    (opencode--note-tokens (alist-get 'tokens data))
     (unless (or (run-hook-with-args-until-success 'opencode-step-failed-functions data)
                 ;; The execution's interruption notice says it.
                 (equal (alist-get 'type (alist-get 'error data)) "aborted"))

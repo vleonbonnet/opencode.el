@@ -81,6 +81,11 @@ The letter may be followed by a colon or, URI-encoded, by %3A."
             (push event events))))
       (nreverse events))))
 
+(defconst opencode-test-scenarios
+  '("text" "read-tools" "edit-tools" "shell" "permission" "question" "subagent"
+    "interrupt" "switch" "steer" "history" "shell-input" "reasoning")
+  "Recorded scenarios whose sessions can be opened.")
+
 (defun opencode-test-scenario (name)
   "Return the session ID recorded for scenario NAME."
   (with-temp-buffer
@@ -205,6 +210,9 @@ The service refuses message pages asked for so."
          (opencode-state--retry-timer nil)
          (opencode-state--retry-delay 1)
          (opencode-state--viewing (make-hash-table :test #'equal))
+         (opencode-state--contexts (make-hash-table :test #'equal))
+         (opencode-state--context-queue nil)
+         (opencode-state--context-timer nil)
          (opencode-state--caches (make-hash-table :test #'equal))
          (opencode-state--cache-timer nil)
          (opencode-state--cache-generation 0)
@@ -212,7 +220,8 @@ The service refuses message pages asked for so."
          (opencode-state--cache-held nil)
          (opencode-state--cache-unsupported nil))
      (unwind-protect (progn ,@body)
-       (dolist (timer (list opencode-state--retry-timer opencode-state--cache-timer))
+       (dolist (timer (list opencode-state--retry-timer opencode-state--cache-timer
+                            opencode-state--context-timer))
          (when (timerp timer)
            (cancel-timer timer))))))
 
@@ -229,6 +238,7 @@ session registry starts empty and follows events once a test dispatches
            (opencode--projects nil)
            (opencode--catalogs (make-hash-table :test #'equal))
            (opencode--catalog-waiters (make-hash-table :test #'equal))
+           (opencode--catalog-scheduled (make-hash-table :test #'equal))
            (opencode-last-session-buffer nil)
            (opencode-alerted-sessions nil)
            (opencode-test-notifications nil)

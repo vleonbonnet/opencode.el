@@ -47,6 +47,15 @@
 ;; provider response, and listed again once the earliest known expiry
 ;; passes, since nothing reports an entry running out.  One timer serves
 ;; every session.
+;;
+;; Each entry also carries the session's context size, as the session
+;; buffer's mode line shows it: the token counts of its newest assistant
+;; message reporting usage.  Every step's end reports it, but neither a
+;; session's info nor its listing does, so a session the registry loaded
+;; rather than saw created has it fetched, newest assistant message
+;; first, only when a client asks (`opencode-state-context'), a few
+;; sessions at a time.  A reconnection keeps the sizes of the sessions
+;; the service has not updated since.
 
 ;;; Code:
 
@@ -61,6 +70,12 @@ joins the registry when an event concerns it."
   :type 'natnum
   :group 'opencode)
 
+(defcustom opencode-state-context-requests 4
+  "Number of sessions whose context size is fetched at once, at most.
+See `opencode-state-context'."
+  :type 'natnum
+  :group 'opencode)
+
 (defcustom opencode-state-change-functions nil
   "Abnormal hook run when the derived status of a session changes.
 Each function receives the session ID, its old status and its new one,
@@ -71,14 +86,15 @@ session new to the registry, the new one nil for a session removed."
 
 (defcustom opencode-state-updated-functions nil
   "Abnormal hook run with a session ID whenever its registry entry changes.
-Creation and removal count as changes, and so does a change of the
+Creation and removal count as changes, and so do the arrival of a
+context size fetched for `opencode-state-context' and a change of the
 session's prompt-cache expiry (`opencode-state-cache'), even for a
 session the registry holds no entry of."
   :type 'hook
   :group 'opencode)
 
 (defconst opencode-state--keys
-  '(:id :title :directory :project-id :parent-id :agent :model :running :retry :requests
+  '(:id :title :directory :project-id :parent-id :agent :model :context :running :retry :requests
         :outcome :error :idle :viewed :archived :created :updated :started)
   "Keys of a registry entry, in order.")
 
@@ -118,6 +134,19 @@ Events are applied only while they come from this stream.")
 
 (defvar opencode-state--caches (make-hash-table :test #'equal)
   "Session IDs mapped to their live prompt-cache expiry, as `opencode-state-cache' returns it.")
+
+(defvar opencode-state--contexts (make-hash-table :test #'equal)
+  "Session IDs mapped to how their context size stands.
+`known' once events or a fetch settled it, `failed' when its fetch
+failed, `queued' while waiting to be fetched, and a list unique to the
+fetch while one runs.  The size of a session absent from it is not
+known; one is fetched when a client asks for it.")
+
+(defvar opencode-state--context-queue nil
+  "IDs of the sessions whose context size waits to be fetched, oldest first.")
+
+(defvar opencode-state--context-timer nil
+  "Timer starting the context-size fetches queued.")
 
 (defvar opencode-state--cache-timer nil
   "Timer listing the expiries again once the earliest known one passes.")
@@ -216,12 +245,14 @@ KIND is `permission', whose REQUEST is a permission request, or
 (defun opencode-state-get (id)
   "Return the registry entry of session ID, or nil.
 An entry is a plist with the keys :id, :title, :directory (normalized),
-:project-id, :parent-id, :agent, :model (a model reference), :running,
+:project-id, :parent-id, :agent, :model (a model reference), :context (the
+context size in tokens, or nil; see `opencode-state-context'), :running,
 :retry (a plist :attempt :at :message, or nil), :requests (plists :kind
 :id :summary :time, oldest first), :outcome (`succeeded', `failed' or
 `interrupted'), :error (the last failure's message while the outcome is
 `failed'), :idle, :viewed, :archived, :created, :updated and :started.
-Times are float seconds since the epoch."
+Times are float seconds since the epoch.  Read the context size with
+`opencode-state-context', which fetches it when not known."
   (gethash id opencode-state--sessions))
 
 (defun opencode-state-sessions (&optional archived)
@@ -340,7 +371,8 @@ after the stream reconnects, it is taken to be able to."
       (if entry
           (puthash id entry opencode-state--sessions)
         (remhash id opencode-state--sessions)
-        (remhash id opencode-state--viewing))
+        (remhash id opencode-state--viewing)
+        (remhash id opencode-state--contexts))
       (let ((before (and old (opencode-state-status old)))
             (after (and entry (opencode-state-status entry))))
         (unless (eq before after)
@@ -382,7 +414,15 @@ execution whose idle time ENTRY already has is then not counted again."
                (viewed (opencode-state--ms (plist-get entry :viewed))))
            (when (and (numberp idle) (or (null viewed) (> idle viewed)))
              (assign :viewed (opencode-time-seconds idle)))))
-        ((or "session.step.ended" "session.inbox.enqueued") (assign :updated created))
+        ((or "session.step.ended" "session.step.failed")
+         (assign :updated created)
+         ;; A step failing after the provider answered reports that usage too.
+         (when-let* ((size (opencode-context-size (alist-get 'tokens data))))
+           (assign :context size)))
+        ("session.inbox.enqueued" (assign :updated created))
+        ;; The messages after the boundary are gone, and with them maybe
+        ;; the newest usage; the size is fetched again when asked for.
+        ("session.revert.committed" (assign :context nil :updated created))
         ("session.step.started" (assign :retry nil :updated created))
         ("session.execution.started"
          (assign :running t :started created :retry nil :requests nil))
@@ -610,6 +650,8 @@ REPLAY is passed to `opencode-state--apply'."
        (push event (gethash id opencode-state--fetching)))
       ;; A known session's entry is at least as recent as its creation.
       ((not (opencode-state-get id))
+       ;; A new session has no usage yet.
+       (puthash id 'known opencode-state--contexts)
        (opencode-state--store id (opencode-state--created-entry event)))))
     ("session.deleted"
      (remhash id opencode-state--fetching)
@@ -621,8 +663,10 @@ REPLAY is passed to `opencode-state--apply'."
       ((gethash id opencode-state--fetching)
        (push event (gethash id opencode-state--fetching)))
       ((opencode-state-get id)
-       (opencode-state--store id (opencode-state--apply (copy-sequence (opencode-state-get id))
-                                                        event replay)))
+       (let ((entry (opencode-state--apply (copy-sequence (opencode-state-get id)) event replay)))
+         ;; Before the hooks run, which may ask for the context size.
+         (opencode-state--context-follow id event)
+         (opencode-state--store id entry)))
       (t (opencode-state--fetch id event))))))
 
 (defun opencode-state--handle (event)
@@ -656,11 +700,13 @@ them to, and the next bootstrap covers them."
   (setq opencode-state--bootstrapping nil
         opencode-state--ready t
         opencode-state--retry-delay 1)
+  (opencode-state--context-rebuild entries)
   (opencode-state--install entries)
   (let ((held (reverse opencode-state--held)))
     (setq opencode-state--held nil)
     (dolist (event held)
       (opencode-state--dispatch (opencode-state--event-session event) event t)))
+  (opencode-state--context-schedule)
   (let ((waiters (reverse opencode-state--waiters)))
     (setq opencode-state--waiters nil)
     (dolist (waiter waiters)
@@ -787,10 +833,150 @@ registry missed, having been loaded after it."
                 "session.execution.started" "session.execution.succeeded"
                 "session.execution.failed" "session.execution.interrupted"
                 "session.retry.scheduled" "session.step.started" "session.step.ended"
-                "session.inbox.enqueued" "session.agent.selected" "session.model.selected"
+                "session.step.failed" "session.revert.committed" "session.inbox.enqueued"
+                "session.agent.selected" "session.model.selected"
                 "permission.asked" "permission.replied"
                 "form.created" "form.replied" "form.cancelled"))
   (opencode-events-register type #'opencode-state--handle))
+
+;;;; Context size
+
+(defun opencode-state-context (id)
+  "Return the context size of session ID in tokens, or nil.
+That is what the session's next request sends again, as its buffer's
+mode line shows it: the token counts of its newest assistant message
+reporting usage, which `opencode-context-display' shows against its
+model's context size.  Every step's end updates it.
+
+Nil when no step reported usage yet, the registry holds no entry of ID,
+or the size is not known yet.  Neither a session's info nor its listing
+has it, so the first call for a session loaded rather than seen created
+fetches it in the background, at most `opencode-state-context-requests'
+sessions at a time; `opencode-state-updated-functions' run once it
+arrives, as on every change.  A failed fetch leaves it nil until the
+stream reconnects.  This never waits, and is safe at redisplay."
+  (when-let* ((entry (opencode-state-get id)))
+    (unless (gethash id opencode-state--contexts)
+      (opencode-state--context-enqueue id))
+    (plist-get entry :context)))
+
+(defun opencode-state--context-pending-p (id)
+  "Return non-nil when the context size of session ID is queued or being fetched."
+  (let ((state (gethash id opencode-state--contexts)))
+    (or (eq state 'queued) (consp state))))
+
+(defun opencode-state--context-enqueue (id)
+  "Queue the fetch of session ID's context size, superseding one in flight."
+  (puthash id 'queued opencode-state--contexts)
+  (unless (member id opencode-state--context-queue)
+    (setq opencode-state--context-queue (nconc opencode-state--context-queue (list id))))
+  (opencode-state--context-schedule))
+
+(defun opencode-state--context-schedule ()
+  "Start the queued context-size fetches from a timer.
+Clients ask from redisplay, and a timer also lets the asks of one
+redisplay queue up before any starts."
+  (when (and opencode-state--context-queue (not (timerp opencode-state--context-timer)))
+    (setq opencode-state--context-timer
+          (run-at-time 0 nil #'opencode-state--context-pump))))
+
+(defun opencode-state--context-running ()
+  "Return the number of context-size fetches in flight."
+  (let ((count 0))
+    (maphash (lambda (_id state) (when (consp state) (cl-incf count)))
+             opencode-state--contexts)
+    count))
+
+(defun opencode-state--context-pump ()
+  "Start the queued context-size fetches, up to `opencode-state-context-requests'.
+While the registry is not ready they wait: its bootstrap queues them
+again and starts them."
+  (setq opencode-state--context-timer nil)
+  (when (opencode-state-ready-p)
+    (while (and opencode-state--context-queue
+                (< (opencode-state--context-running) (max 1 opencode-state-context-requests)))
+      (let ((id (pop opencode-state--context-queue)))
+        (when (and (eq (gethash id opencode-state--contexts) 'queued)
+                   (opencode-state-get id))
+          (opencode-state--context-fetch id))))))
+
+(defun opencode-state--context-fetch (id)
+  "Fetch the context size of session ID into its entry.
+Assistant messages are fetched one at a time from the newest until one
+reports usage, usually the first: only a step still running, or one
+that failed before the provider answered, reports none.  An event
+settling the size meanwhile supersedes the fetch, since the answer may
+predate it."
+  (let ((token (list 'fetching))
+        (directory (plist-get (opencode-state-get id) :directory)))
+    (puthash id token opencode-state--contexts)
+    (cl-labels ((current-p () (eq (gethash id opencode-state--contexts) token))
+                (settle (state &optional size)
+                  (when (current-p)
+                    (puthash id state opencode-state--contexts)
+                    (when-let* (((eq state 'known))
+                                (entry (opencode-state-get id)))
+                      (opencode-state--store id (plist-put (copy-sequence entry) :context size))))
+                  (opencode-state--context-schedule))
+                (page (cursor)
+                  (opencode-request
+                   'get (format "/api/session/%s/message" id)
+                   :directory directory :buffer nil
+                   ;; A cursor carries its order, and the service refuses both.
+                   :query `((limit . 1) (type . "assistant")
+                            ,@(if cursor `((cursor . ,cursor)) '((order . "desc"))))
+                   :else (lambda (_) (settle 'failed))
+                   :then (lambda (response)
+                           (let ((messages (opencode-request-data response))
+                                 (next (alist-get 'next (alist-get 'cursor response))))
+                             (if-let* ((size (seq-some (lambda (message)
+                                                         (opencode-context-size (alist-get 'tokens message)))
+                                                       messages)))
+                                 (settle 'known size)
+                               (if (and messages next (current-p))
+                                   (page next)
+                                 (settle 'known nil))))))))
+      (page nil))))
+
+(defun opencode-state--context-follow (id event)
+  "Note how EVENT of session ID leaves its context size known."
+  (pcase (alist-get 'type event)
+    ((or "session.step.ended" "session.step.failed")
+     (when (opencode-context-size (alist-get 'tokens (alist-get 'data event)))
+       ;; Newer than the answer of a fetch in flight, which is dropped.
+       (puthash id 'known opencode-state--contexts)))
+    ("session.revert.committed"
+     (if (opencode-state--context-pending-p id)
+         ;; The answer in flight may predate the revert.
+         (opencode-state--context-enqueue id)
+       (remhash id opencode-state--contexts)))))
+
+(defun opencode-state--context-rebuild (entries)
+  "Give bootstrapped ENTRIES the context sizes still current, and queue the others asked for.
+A size stays current while the service has not updated its session
+since: the end of a step updates it.  The sizes queued or in flight
+are queued again, the fetches in flight being superseded; a failed
+fetch is tried again when next asked for."
+  (let ((contexts (make-hash-table :test #'equal))
+        (flying nil))
+    (dolist (entry entries)
+      (let* ((id (plist-get entry :id))
+             (old (opencode-state-get id))
+             (state (gethash id opencode-state--contexts))
+             (before (opencode-state--ms (plist-get old :updated)))
+             (after (opencode-state--ms (plist-get entry :updated))))
+        (cond
+         ((and (eq state 'known) before after (<= after before))
+          (plist-put entry :context (plist-get old :context))
+          (puthash id 'known contexts))
+         ((eq state 'queued) (puthash id 'queued contexts))
+         ((consp state)
+          (puthash id 'queued contexts)
+          (push id flying)))))
+    (setq opencode-state--context-queue
+          (seq-filter (lambda (id) (eq (gethash id contexts) 'queued))
+                      (delete-dups (append (nreverse flying) opencode-state--context-queue nil)))
+          opencode-state--contexts contexts)))
 
 ;;;; Prompt-cache expiry
 
