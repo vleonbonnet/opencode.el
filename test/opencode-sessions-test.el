@@ -303,7 +303,11 @@ sorted by its display sort function, then affixed."
                                 :project-id "repo" :running t :updated (- now 10))
                        opencode-state--sessions)
               (opencode-test-picking (opencode-test-choose "Renamed")
-                (should (eq (opencode-read-session "Session: " (list older untitled stale moved) root)
+                ;; Ages under a minute show hundredths: the clock must not move under them.
+                (should (eq (cl-letf* ((real (symbol-function 'float-time))
+                                       ((symbol-function 'float-time)
+                                        (lambda (&optional time) (if time (funcall real time) now))))
+                              (opencode-read-session "Session: " (list older untitled stale moved) root))
                             stale))
                 (should (equal (plist-get (car opencode-test-offers) :prompt) "Session: "))
                 (should (equal (opencode-test-offered-names) '("New session" "Renamed" "ses_2" "Older" "Moved")))
