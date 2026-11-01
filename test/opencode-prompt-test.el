@@ -386,7 +386,7 @@ command loop applies key remapping as typing them would."
             (opencode-revert-to-point)
             (should (equal (opencode-test-requests-to 'post "/revert/stage")
                            `(((messageID . ,second) (files . t)))))
-            (should (zerop (hash-table-count opencode--sent-inputs)))))))))
+            (should (zerop (hash-table-count (opencode--sent-input-table))))))))))
 
 (ert-deftest opencode-test-typed-prompt-delivered-before-reply ()
   "A prompt delivered before the service answers its request gets its ID too."
@@ -404,7 +404,21 @@ command loop applies key remapping as typing them would."
         (opencode-test-send-typed "quick one")
         (should (equal (opencode-message-at (opencode-test-find "quick one")) (opencode-test-sent-id)))
         (should (= (how-many "quick one" (point-min) (point-max)) 1))
-        (should (zerop (hash-table-count opencode--sent-inputs)))))))
+        (should (zerop (hash-table-count (opencode--sent-input-table))))))))
+
+(ert-deftest opencode-test-typed-prompt-in-older-buffer ()
+  "A session buffer made before the table of sent inputs existed still sends.
+opencode.el may be reloaded under open session buffers, which then never
+ran the mode's setup of that table."
+  (opencode-test-with-server
+    (let ((session (opencode-test-scenario "text")))
+      (with-current-buffer (opencode-test-open-empty session)
+        (setq opencode--sent-inputs nil)
+        (opencode-test-send-typed "still works")
+        (let ((id (opencode-test-sent-id)))
+          (opencode-test-dispatch (opencode-test-inbox-events session id "still works"))
+          (should (equal (opencode-message-at (opencode-test-find "still works")) id))
+          (should (zerop (hash-table-count (opencode--sent-input-table)))))))))
 
 (ert-deftest opencode-test-steering-prompts-get-their-ids ()
   "Prompts sent while a turn streams each get their ID, in any order, and cut in the conversation's order."
@@ -431,7 +445,7 @@ command loop applies key remapping as typing them would."
               (data ,@base (text . "Working on it after steer one after steer two")))))
           (pcase-let ((`(,two ,one ,start) ids))
             (should (= (length (delete-dups (copy-sequence ids))) 3))
-            (should (= (hash-table-count opencode--sent-inputs) 2))
+            (should (= (hash-table-count (opencode--sent-input-table)) 2))
             ;; The second one is reported delivered first.
             (opencode-test-dispatch (cdr (opencode-test-inbox-events session two "steer two")))
             (should (equal (opencode-message-at (opencode-test-find "steer two")) two))
@@ -465,7 +479,7 @@ command loop applies key remapping as typing them would."
         (let ((id (opencode-test-sent-id)))
           (should (string-match-p "boom" (buffer-string)))
           (should-not (opencode-message-at (opencode-test-find "doomed")))
-          (should (zerop (hash-table-count opencode--sent-inputs)))
+          (should (zerop (hash-table-count (opencode--sent-input-table))))
           (should-not (gethash id opencode--own-inputs))
           ;; Had the service taken it after all, its prompt shows as delivered, with its ID.
           (opencode-test-dispatch (opencode-test-inbox-events session id "doomed"))
@@ -486,7 +500,7 @@ command loop applies key remapping as typing them would."
                  `((type . "session.inbox.cancelled") (data (sessionID . ,session) (inboxID . ,id)))))
           (should (string-match-p "A queued prompt was cancelled" (buffer-string)))
           (should-not (opencode-message-at (opencode-test-find "later maybe")))
-          (should (zerop (hash-table-count opencode--sent-inputs))))))))
+          (should (zerop (hash-table-count (opencode--sent-input-table)))))))))
 
 (ert-deftest opencode-test-reloaded-pending-prompt-shown-once-delivered ()
   "A prompt whose input a reload erased before its delivery is shown when delivered."
@@ -503,7 +517,7 @@ command loop applies key remapping as typing them would."
           (opencode-test-dispatch (cdr (opencode-test-inbox-events session id "survive the reload")))
           (should (= (how-many "survive the reload" (point-min) (point-max)) 1))
           (should (equal (opencode-message-at (opencode-test-find "survive the reload")) id))
-          (should (zerop (hash-table-count opencode--sent-inputs))))))))
+          (should (zerop (hash-table-count (opencode--sent-input-table)))))))))
 
 (ert-deftest opencode-test-typed-command-gets-its-prompt-id ()
   "A slash command's input gets the ID of the prompt the service made for it."
@@ -525,7 +539,7 @@ command loop applies key remapping as typing them would."
           (opencode-test-turn session "started")
           (opencode-test-answer session "msg_review_answer" "Looks fine.")
           (should (equal (opencode--message-boundary (opencode-test-find "/review HEAD")) "msg_review_answer"))
-          (should (zerop (hash-table-count opencode--sent-inputs))))))))
+          (should (zerop (hash-table-count (opencode--sent-input-table)))))))))
 
 (ert-deftest opencode-test-command-without-prompt-forgotten ()
   "A command whose prompt never comes, as one running a subagent, is forgotten in time."
@@ -535,18 +549,18 @@ command loop applies key remapping as typing them would."
         (opencode-test-send-typed "/delegate it")
         (let ((key (alist-get opencode--command-key
                               (alist-get 'metadata (car (opencode-test-requests-to 'post "/command"))))))
-          (should (plist-get (gethash key opencode--sent-inputs) :answered))
+          (should (plist-get (gethash key (opencode--sent-input-table)) :answered))
           ;; Its prompt may still come.
           (opencode-test-send-typed "first prompt")
           (let ((first (opencode-test-sent-id)))
-            (should (gethash key opencode--sent-inputs))
+            (should (gethash key (opencode--sent-input-table)))
             ;; Its request returned longer ago than its prompt may take.
-            (plist-put (gethash key opencode--sent-inputs) :answered
+            (plist-put (gethash key (opencode--sent-input-table)) :answered
                        (- (float-time) opencode--command-wait 1))
             (opencode-test-send-typed "next prompt")
-            (should-not (gethash key opencode--sent-inputs))
+            (should-not (gethash key (opencode--sent-input-table)))
             ;; Prompts wait for their delivery however long it takes.
-            (should (equal (sort (hash-table-keys opencode--sent-inputs) #'string<)
+            (should (equal (sort (hash-table-keys (opencode--sent-input-table)) #'string<)
                            (sort (list first (opencode-test-sent-id)) #'string<)))))))))
 
 (ert-deftest opencode-test-shell-input-gets-no-id ()
@@ -555,7 +569,7 @@ command loop applies key remapping as typing them would."
     (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
       (opencode-test-send-typed "!ls")
       (should (opencode-test-requests-to 'post "/shell"))
-      (should (zerop (hash-table-count opencode--sent-inputs)))
+      (should (zerop (hash-table-count (opencode--sent-input-table))))
       (should-not (opencode-message-at (opencode-test-find "!ls"))))))
 
 ;;;; Agents

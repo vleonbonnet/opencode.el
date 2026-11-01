@@ -144,7 +144,15 @@ They run in the session buffer, after it is registered or unregistered.")
 Keys are message IDs; a command's key is its correlation key until the
 prompt it makes is admitted.  Values are plists (:start MARKER :end
 MARKER), with :command for a command, :answered for one whose request
-returned at that time, and :lost once a reload erased the region.")
+returned at that time, and :lost once a reload erased the region.
+Read it with `opencode--sent-input-table'.")
+
+(defun opencode--sent-input-table ()
+  "Return `opencode--sent-inputs', made on first use.
+A buffer made before this table existed, such as one open while
+opencode.el was reloaded, has none until then."
+  (or opencode--sent-inputs
+      (setq opencode--sent-inputs (make-hash-table :test #'equal))))
 
 (defvar-local opencode--delivery-points nil
   "Hash table of the message IDs of input typed here to (MARKER . COUNT).
@@ -405,7 +413,6 @@ interrupt the turn or are refused (`opencode-comint-unsupported'), and
   (opencode-render-setup)
   (opencode-blocks-setup)
   (setq opencode--own-inputs (make-hash-table :test #'equal)
-        opencode--sent-inputs (make-hash-table :test #'equal)
         opencode--text-blocks (make-hash-table :test #'equal))
   (add-hook 'kill-buffer-hook #'opencode--session-cleanup nil t)
   (add-hook 'comint-input-filter-functions
@@ -1333,12 +1340,12 @@ too long for their prompt are forgotten first."
   ;; Text inserted at either end, such as output, stays outside.
   (puthash key (list :start (copy-marker (car region) t) :end (copy-marker (cdr region))
                      :command command)
-           opencode--sent-inputs))
+           (opencode--sent-input-table)))
 
 (defun opencode--release-sent-input (key)
   "Forget the input sent under KEY and return its entry, or nil."
-  (when-let* ((entry (gethash key opencode--sent-inputs)))
-    (remhash key opencode--sent-inputs)
+  (when-let* ((entry (gethash key (opencode--sent-input-table))))
+    (remhash key (opencode--sent-input-table))
     (dolist (marker (list (plist-get entry :start) (plist-get entry :end)))
       (when (markerp marker) (set-marker marker nil)))
     entry))
@@ -1351,22 +1358,22 @@ too long for their prompt are forgotten first."
                (when-let* ((answered (plist-get entry :answered)))
                  (when (> (- now answered) opencode--command-wait)
                    (push key stale))))
-             opencode--sent-inputs)
+             (opencode--sent-input-table))
     (mapc #'opencode--release-sent-input stale)))
 
 (defun opencode--claim-command-prompt (id item)
   "Let the command that made ITEM, admitted as ID, wait for its delivery."
   (when-let* ((key (alist-get opencode--command-key
                               (alist-get 'metadata (alist-get 'payload item))))
-              (entry (gethash key opencode--sent-inputs)))
-    (remhash key opencode--sent-inputs)
+              (entry (gethash key (opencode--sent-input-table))))
+    (remhash key (opencode--sent-input-table))
     (puthash id (list :start (plist-get entry :start) :end (plist-get entry :end) :command t)
-             opencode--sent-inputs)))
+             (opencode--sent-input-table))))
 
 (defun opencode--stamp-sent-input (id)
   "Give the input sent as message ID, now delivered, that ID; return its entry.
 Return nil when no input of this buffer waits for ID."
-  (when-let* ((entry (gethash id opencode--sent-inputs)))
+  (when-let* ((entry (gethash id (opencode--sent-input-table))))
     (let ((start (plist-get entry :start))
           (end (plist-get entry :end)))
       (when (and (markerp start) (eq (marker-buffer start) (current-buffer)) (< start end))
@@ -1400,8 +1407,8 @@ is in the conversation's order, so delivery points are forgotten."
                    (push key commands)
                  (dolist (marker (list (plist-get entry :start) (plist-get entry :end)))
                    (when (markerp marker) (set-marker marker nil)))
-                 (puthash key (list :lost t) opencode--sent-inputs)))
-             opencode--sent-inputs)
+                 (puthash key (list :lost t) (opencode--sent-input-table))))
+             (opencode--sent-input-table))
     (mapc #'opencode--release-sent-input commands)))
 
 ;;;; Sending
@@ -1499,7 +1506,7 @@ METADATA, which the service passes on to it."
              (metadata . ,metadata)
              (delivery . ,(symbol-name opencode-prompt-delivery)))
      :then (lambda (_)
-             (when-let* ((entry (and key (gethash key opencode--sent-inputs))))
+             (when-let* ((entry (and key (gethash key (opencode--sent-input-table)))))
                (plist-put entry :answered (float-time)))
              (when then (funcall then nil)))
      :else (lambda (error)
