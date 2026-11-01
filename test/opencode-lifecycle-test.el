@@ -176,6 +176,126 @@ does, at once."
             (should-not (opencode-events-connected-p)))
         (kill-buffer buffer)))))
 
+(defmacro opencode-test-with-clock (offset &rest body)
+  "Run BODY with `float-time' running OFFSET seconds ahead of the real clock.
+OFFSET is a variable BODY may change, as a machine waking from sleep
+finds the clock moved on."
+  (declare (indent 1) (debug t))
+  (let ((real (make-symbol "real")))
+    `(let ((,real (symbol-function 'float-time)))
+       (cl-letf (((symbol-function 'float-time)
+                  (lambda (&optional time) (if time (funcall ,real time) (+ (funcall ,real) ,offset)))))
+         ,@body))))
+
+(defmacro opencode-test-with-watched-stream (bindings &rest body)
+  "Run BODY watching a stream that stands for an open one, at a clock BODY sets.
+BINDINGS is a list (NOW DROPS): NOW is the variable holding what
+`float-time' returns, and DROPS the variable counting the times the
+watchdog dropped the stream and asked for a reconnection."
+  (declare (indent 1) (debug t))
+  (pcase-let ((`(,now ,drops) bindings))
+    `(let ((,now 1000.0)
+           (,drops 0)
+           (opencode-events-heartbeat-timeout 45)
+           (opencode-events--wanted t)
+           (opencode-events--opening nil)
+           (opencode-events--reconnect-timer nil)
+           (opencode-events--last-output 1000.0)
+           (opencode-events--last-watch 1000.0)
+           (opencode-events--resumed 0))
+       (cl-letf (((symbol-function 'float-time) (lambda (&optional _) ,now))
+                 ((symbol-function 'opencode-events-connected-p) (lambda () t))
+                 ((symbol-function 'opencode-events--drop) (lambda () (cl-incf ,drops)))
+                 ((symbol-function 'opencode-events--schedule-reconnect) #'ignore))
+         ,@body))))
+
+(ert-deftest opencode-test-watchdog-drops-silent-stream ()
+  "A stream silent past the heartbeat timeout while the watchdog runs on time is dropped."
+  (opencode-test-with-watched-stream (now drops)
+    (dolist (tick '(15 30 45))
+      (setq now (+ 1000.0 tick))
+      (opencode-events--watch))
+    (should (= drops 0))
+    (setq now 1060.0)
+    (opencode-events--watch)
+    (should (= drops 1))))
+
+(ert-deftest opencode-test-watchdog-tolerates-sleep ()
+  "A stream silent while the machine slept gets a heartbeat timeout from the wake to show it lives."
+  (opencode-test-with-watched-stream (now drops)
+    (setq now 1010.0 opencode-events--last-output 1005.0)
+    (opencode-events--watch)
+    ;; An hour asleep: the first check is late, and the timer catches up
+    ;; with checks in a row.
+    (setq now 4610.0)
+    (dotimes (_ 3) (opencode-events--watch))
+    (should (= drops 0))
+    (should (= opencode-events--resumed 4610.0))
+    ;; A heartbeat after the wake keeps it, as before the sleep.
+    (setq now 4620.0 opencode-events--last-output 4618.0)
+    (opencode-events--watch)
+    (dolist (tick '(4635 4650))
+      (setq now (float tick))
+      (opencode-events--watch))
+    (should (= drops 0))
+    (setq now 4665.0)
+    (opencode-events--watch)
+    (should (= drops 1))))
+
+(ert-deftest opencode-test-watchdog-dead-after-sleep ()
+  "A stream that died during the sleep is dropped a heartbeat timeout after the wake."
+  (opencode-test-with-watched-stream (now drops)
+    (setq now 1100.0)
+    (opencode-events--watch)
+    (should (= drops 0))
+    (dolist (tick '(1115 1130 1145))
+      (setq now (float tick))
+      (opencode-events--watch))
+    (should (= drops 0))
+    (setq now 1160.0)
+    (opencode-events--watch)
+    (should (= drops 1))))
+
+(ert-deftest opencode-test-watchdog-clock-back ()
+  "A clock set back neither drops the stream nor hides that it died."
+  (opencode-test-with-watched-stream (now drops)
+    (setq now 1010.0 opencode-events--last-output 1010.0)
+    (opencode-events--watch)
+    (setq now 500.0)
+    (opencode-events--watch)
+    (should (= drops 0))
+    (dolist (tick '(515 530 545))
+      (setq now (float tick))
+      (opencode-events--watch))
+    (should (= drops 0))
+    (setq now 560.0)
+    (opencode-events--watch)
+    (should (= drops 1))))
+
+(ert-deftest opencode-test-stream-survives-sleep ()
+  "An open stream is kept through a sleep, and dropped once it stays silent after the wake."
+  (opencode-test-with-service
+    (let ((connections (opencode-test-count-connections))
+          (offset 0))
+      (opencode-events-connect)
+      (opencode-test-wait-for (lambda () (= (funcall connections) 1)))
+      (opencode-test-with-clock offset
+        (setq offset 3600)
+        (opencode-events--watch)
+        (opencode-test-send-raw ": heartbeat\n\n")
+        (opencode-test-wait-for (lambda () (> opencode-events--last-output (+ (float-time) -5))))
+        (setq offset 3615)
+        (opencode-events--watch)
+        (accept-process-output nil 0.2)
+        (should (= (funcall connections) 1))
+        (should (opencode-events-connected-p))
+        ;; Silent from then on, though Emacs reads it: it is dropped.
+        (setq opencode-events--backoff 0.1)
+        (dolist (seconds '(3630 3645 3660 3675))
+          (setq offset seconds)
+          (opencode-events--watch))
+        (opencode-test-wait-for (lambda () (= (funcall connections) 2)))))))
+
 ;;;; Restarts
 
 (ert-deftest opencode-test-restart-reopens-stream-at-once ()

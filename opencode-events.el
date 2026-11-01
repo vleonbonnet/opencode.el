@@ -34,9 +34,12 @@
 ;; A wanted stream comes back however it ends: after a backoff when it
 ;; drops, at once when a service is ready for Emacs again or a prompt is
 ;; sent, and from the heartbeat watchdog when it was left closed with
-;; nothing reopening it.  `opencode-disconnect' alone keeps it closed;
-;; after `opencode-service-stop', it reopens only for the clients of
-;; `opencode-events-wanted-functions', once something starts a service.
+;; nothing reopening it.  The watchdog drops a stream that stays silent,
+;; counting only the time Emacs could have read it, so that a machine
+;; waking from sleep keeps its healthy stream.  `opencode-disconnect'
+;; alone keeps it closed; after `opencode-service-stop', it reopens only
+;; for the clients of `opencode-events-wanted-functions', once something
+;; starts a service.
 ;;
 ;; Modules register handlers per event type with `opencode-events-register'.
 
@@ -90,11 +93,21 @@ stream only when one of them returns non-nil.")
 (defvar opencode-events--reconnect-timer nil
   "Timer of the pending reconnection attempt.")
 
+(defconst opencode-events--watch-interval 15
+  "Seconds between two checks of the heartbeat watchdog.")
+
 (defvar opencode-events--watchdog nil
   "Timer checking that the stream still delivers heartbeats.")
 
 (defvar opencode-events--last-output 0
   "Time the stream last produced output.")
+
+(defvar opencode-events--last-watch nil
+  "Time of the watchdog's previous check, or nil before its first one.")
+
+(defvar opencode-events--resumed 0
+  "Time the watchdog last resumed after it could not run for a while.
+Silence before it is no evidence that the stream died.")
 
 (defvar opencode-events--queue nil
   "Queued events, a `tconc'-style cons (FIRST . LAST) of a list.")
@@ -264,21 +277,39 @@ That is a client of `opencode-events-wanted-functions'."
     (when (process-live-p process)
       (delete-process process))))
 
+(defun opencode-events--note-resumption (now)
+  "Note when the watchdog, checking at NOW, could not run for a while.
+Emacs reads no output while the machine sleeps or while it is busy, so
+the silence of such a gap says nothing of the stream: on a late check,
+or when the clock went back, the silence counts from NOW, which gives
+the stream a whole heartbeat timeout to show it is alive.  A late timer
+then fires several times in a row to catch up, and only the first one
+is late."
+  (let ((gap (and opencode-events--last-watch (- now opencode-events--last-watch))))
+    (when (and gap (or (< gap 0) (> gap (* 2 opencode-events--watch-interval))))
+      (setq opencode-events--resumed now
+            opencode-events--last-output (min opencode-events--last-output now)))
+    (setq opencode-events--last-watch now)))
+
 (defun opencode-events--watch ()
   "Reopen a stream that stopped producing heartbeats, or one left closed.
-Nothing should leave a wanted stream closed with no reconnection
-scheduled or waiting for a service, but if anything does, this
-reopens it rather than leave session buffers stale."
-  (cond
-   ((opencode-events-connected-p)
-    (when (> (- (float-time) opencode-events--last-output)
-             opencode-events-heartbeat-timeout)
-      (opencode-events--drop)
-      (opencode-events--schedule-reconnect)))
-   ((and opencode-events--wanted
-         (not opencode-events--opening)
-         (not (timerp opencode-events--reconnect-timer)))
-    (opencode-events--schedule-reconnect))))
+A stream counts as silent only for the time Emacs could have read its
+output, see `opencode-events--note-resumption'.  Nothing should leave a
+wanted stream closed with no reconnection scheduled or waiting for a
+service, but if anything does, this reopens it rather than leave
+session buffers stale."
+  (let ((now (float-time)))
+    (opencode-events--note-resumption now)
+    (cond
+     ((opencode-events-connected-p)
+      (when (> (- now (max opencode-events--last-output opencode-events--resumed))
+               opencode-events-heartbeat-timeout)
+        (opencode-events--drop)
+        (opencode-events--schedule-reconnect)))
+     ((and opencode-events--wanted
+           (not opencode-events--opening)
+           (not (timerp opencode-events--reconnect-timer)))
+      (opencode-events--schedule-reconnect)))))
 
 (defun opencode-events--start (connection)
   "Open the stream on CONNECTION's service, unless it is open or unwanted."
@@ -332,7 +363,10 @@ reopens it rather than leave session buffers stale."
   (setq opencode-events--wanted t
         opencode-events--closed-for-stop nil)
   (unless (timerp opencode-events--watchdog)
-    (setq opencode-events--watchdog (run-at-time 15 15 #'opencode-events--watch))))
+    (setq opencode-events--last-watch (float-time)
+          opencode-events--watchdog (run-at-time opencode-events--watch-interval
+                                                 opencode-events--watch-interval
+                                                 #'opencode-events--watch))))
 
 (defun opencode-events-connect (&optional callback)
   "Open the event stream, then call CALLBACK with the service connection."
@@ -359,6 +393,7 @@ so that it shows even when the stream was lost.  A stream closed by
     (when (timerp timer) (cancel-timer timer)))
   (setq opencode-events--reconnect-timer nil
         opencode-events--watchdog nil
+        opencode-events--last-watch nil
         opencode-events--connection nil)
   ;; Its wait for a service would otherwise start one again after a stop.
   (when (consp opencode-events--opening)
