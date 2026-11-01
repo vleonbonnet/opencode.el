@@ -107,10 +107,6 @@ They run before `opencode-session-idle-functions'.")
   "Functions called in each session buffer after the stream reconnects.
 Each receives the session info fetched from the server.")
 
-(defvar opencode-session-buffer-functions nil
-  "Functions called with a session ID after its buffer registration changes.
-They run in the session buffer, after it is registered or unregistered.")
-
 (defvar opencode-last-model nil
   "Model reference (alist id, providerID, variant) of the last prompt sent.")
 (add-to-list 'savehist-additional-variables 'opencode-last-model)

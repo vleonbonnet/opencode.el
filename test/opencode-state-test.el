@@ -55,8 +55,60 @@ the tests' times stay close to the present.")
 :permissions, :forms and :messages (alists of session IDs to lists, the
 messages newest first), :caches (an alist of session IDs to prompt-cache
 expiries), :list-error and :cache-error (the failures of the session and
-expiry listings), and :on-list and :on-cache, functions called when the
-sessions or the expiries are listed.")
+expiry listings), :on-list and :on-cache, functions called when the
+sessions or the expiries are listed, and :defer-pages, non-nil to hold
+back the answers to session pages asked by cursor until released.")
+
+(defun opencode-test-state--session-key (info)
+  "Return the key the service orders session INFO by: its update time, then its ID."
+  (cons (alist-get 'updated (alist-get 'time info)) (alist-get 'id info)))
+
+(defun opencode-test-state--key< (a b)
+  "Return non-nil when session key A sorts before B in ascending order."
+  (or (< (car a) (car b)) (and (= (car a) (car b)) (string< (cdr a) (cdr b)))))
+
+(defun opencode-test-state--list (query)
+  "Answer the session listing QUERY as the service pages it.
+Sessions are ordered by update time, then ID; a cursor anchors on a
+session's key and carries the first page's filters and order, which a
+request with a cursor does not send again."
+  (let* ((cursor (and (alist-get 'cursor query) (car (read-from-string (alist-get 'cursor query)))))
+         (filter (if cursor (plist-get cursor :filter)
+                   (list :archived (alist-get 'archived query) :order (or (alist-get 'order query) "desc"))))
+         (anchor (plist-get cursor :anchor))
+         (direction (or (plist-get cursor :direction) 'next))
+         (limit (string-to-number (format "%s" (alist-get 'limit query))))
+         (descending (equal (plist-get filter :order) "desc"))
+         ;; The way the rows are read: from the anchor, toward older or newer.
+         (forward (if (eq direction 'previous) (not descending) descending))
+         (sessions (seq-filter (lambda (info)
+                                 (let ((archived (alist-get 'archived (alist-get 'time info))))
+                                   (pcase (plist-get filter :archived)
+                                     ("false" (not archived))
+                                     ("true" archived)
+                                     (_ t))))
+                               (plist-get opencode-test-state-server :sessions)))
+         (rows (sort (seq-filter (lambda (info)
+                                   (or (null anchor)
+                                       (let ((key (opencode-test-state--session-key info)))
+                                         (if forward
+                                             (opencode-test-state--key< key anchor)
+                                           (opencode-test-state--key< anchor key)))))
+                                 sessions)
+                     :key #'opencode-test-state--session-key :lessp #'opencode-test-state--key<
+                     :reverse forward))
+         (data (seq-take rows limit))
+         (data (if (eq direction 'previous) (reverse data) data)))
+    (when cursor
+      (should-not (assq 'archived query))
+      (should-not (assq 'order query)))
+    (cl-flet ((cursor (info direction)
+                (prin1-to-string (list :filter filter :direction direction
+                                       :anchor (opencode-test-state--session-key info)))))
+      `((data . ,data)
+        (cursor ,@(when data
+                    `((previous . ,(cursor (car data) 'previous))
+                      (next . ,(cursor (car (last data)) 'next)))))))))
 
 (defun opencode-test-state--messages (request)
   "Answer the message page REQUEST asks for, as the service pages them."
@@ -84,21 +136,15 @@ sessions or the expiries are listed.")
     (list
      (list 'get "\\`/api/session\\'"
            (lambda (request)
-             (let* ((query (plist-get request :query))
-                    (limit (string-to-number (format "%s" (alist-get 'limit query)))))
+             (let ((query (plist-get request :query)))
                (when-let* ((hook (plist-get opencode-test-state-server :on-list)))
                  (funcall hook))
-               (if-let* ((failure (plist-get opencode-test-state-server :list-error)))
-                   failure
-                 `((data . ,(seq-take
-                             (sort (seq-remove (lambda (info)
-                                                 (and (equal (alist-get 'archived query) "false")
-                                                      (alist-get 'archived (alist-get 'time info))))
-                                               (plist-get opencode-test-state-server :sessions))
-                                   :key (lambda (info) (alist-get 'updated (alist-get 'time info)))
-                                   :reverse t)
-                             limit))
-                   (cursor))))))
+               (cond
+                ((plist-get opencode-test-state-server :list-error))
+                ((and (alist-get 'cursor query) (plist-get opencode-test-state-server :defer-pages))
+                 ;; Answered as the service stands when released.
+                 (cons :defer (lambda () (opencode-test-state--list query))))
+                (t (opencode-test-state--list query))))))
      (list 'get "\\`/api/session/active\\'"
            (lambda (_)
              `((data . ,(mapcar (lambda (id) (cons (intern id) '((type . "running"))))
@@ -208,7 +254,8 @@ DATA are the members of its data besides `sessionID'."
       (should (< (abs (- (opencode-identifier-time id) (float-time))) 1)))))
 
 (ert-deftest opencode-test-state-bootstrap ()
-  "The registry loads the newest unarchived sessions, the running ones and their requests."
+  "The registry loads the newest unarchived sessions, the running ones and their requests.
+The message of a failure is fetched only while the failure is unseen."
   (let ((user (opencode-test-state-permission "ses_b" 20 '(action . "shell") '(resources "make test\nmake lint")))
         (asked (opencode-test-state-permission "ses_b" 25 '(action . "edit") '(resources "x.el")
                                                '(message . "Edit x.el?")))
@@ -220,6 +267,8 @@ DATA are the members of its data besides `sessionID'."
                               (opencode-test-state-info "ses_c" :created 0 :updated 1 :parent "ses_b")
                               (opencode-test-state-info "ses_d" :created 3 :updated 60 :archived 60)
                               (opencode-test-state-info "ses_e" :created 4 :updated 40 :idle 40 :viewed 41
+                                                        :outcome "failed")
+                              (opencode-test-state-info "ses_f" :created 5 :updated 30 :idle 30 :viewed 20
                                                         :outcome "failed"))
               :active '("ses_b" "ses_c")
               :permissions `(("ses_b" ,asked ,user))
@@ -234,8 +283,11 @@ DATA are the members of its data besides `sessionID'."
                            ((type . "user") (time (created . ,(opencode-test-state-ms 3)))))
                           ("ses_e"
                            ((type . "idle") (outcome . "failed") (time (created . ,(opencode-test-state-ms 40)))
-                            (error (type . "provider") (message . "Provider exploded\nat line 3"))))))
-      (let ((opencode-state-recent-limit 3)
+                            (error (type . "provider") (message . "Provider exploded\nat line 3"))))
+                          ("ses_f"
+                           ((type . "idle") (outcome . "failed") (time (created . ,(opencode-test-state-ms 30)))
+                            (error (type . "provider") (message . "Rate limited"))))))
+      (let ((opencode-state-recent-limit 4)
             (ready 0))
         (opencode-state-ensure (lambda () (cl-incf ready)))
         (should-not (opencode-state-ready-p))
@@ -248,12 +300,12 @@ DATA are the members of its data besides `sessionID'."
         (should (= ready 2))
         (let ((list (car (last opencode-test-requests))))
           (should (equal (plist-get list :path) "/api/session"))
-          (should (equal (plist-get list :query) '((archived . "false") (order . "desc") (limit . 3)))))
+          (should (equal (plist-get list :query) '((archived . "false") (order . "desc") (limit . 4)))))
         ;; The archived session is left out; the running one older than the page is fetched.
         (should (equal (opencode-test-state-statuses)
-                       '(("ses_a" done) ("ses_b" waiting) ("ses_c" waiting) ("ses_e" idle))))
+                       '(("ses_a" done) ("ses_b" waiting) ("ses_c" waiting) ("ses_e" idle) ("ses_f" failed))))
         (should (equal (mapcar (lambda (entry) (plist-get entry :id)) (opencode-state-sessions t))
-                       '("ses_a" "ses_b" "ses_e" "ses_c")))
+                       '("ses_a" "ses_b" "ses_e" "ses_f" "ses_c")))
         (should (member "/api/session/ses_c" (opencode-test-state-requests)))
         (dolist (id '("ses_a" "ses_e"))
           (should-not (member (format "/api/session/%s/permission" id) (opencode-test-state-requests))))
@@ -288,8 +340,10 @@ DATA are the members of its data besides `sessionID'."
           (should-not (plist-get c :started)))
         (let ((e (opencode-state-get "ses_e")))
           (should (eq (plist-get e :outcome) 'failed))
-          (should (equal (plist-get e :error) "Provider exploded …"))
-          (should-not (opencode-state-unread-p e)))))))
+          (should-not (plist-get e :error))
+          (should-not (opencode-state-unread-p e)))
+        (should-not (member "/api/session/ses_e/message" (opencode-test-state-requests)))
+        (should (equal (plist-get (opencode-state-get "ses_f") :error) "Rate limited"))))))
 
 (ert-deftest opencode-test-state-bootstrap-pages-turn-start ()
   "A running turn's start is found past the first page of its transcript."
@@ -376,6 +430,248 @@ DATA are the members of its data besides `sessionID'."
       (should-not opencode-state--retry-timer)
       (should (opencode-state-get "ses_a")))))
 
+;;;; Listing every session
+
+(defun opencode-test-state-numbered (count &optional from)
+  "Return the infos of COUNT idle sessions, ses_01 the newest, numbered from FROM or 1.
+Session N was updated at 1000 - 10N."
+  (mapcar (lambda (number)
+            (opencode-test-state-info (format "ses_%02d" number) :created number
+                                      :updated (- 1000 (* 10 number))))
+          (number-sequence (or from 1) (+ (or from 1) count -1))))
+
+(defun opencode-test-state-ids (&optional archived)
+  "Return the IDs of the registry's entries, sorted; ARCHIVED as `opencode-state-sessions' takes it."
+  (sort (mapcar (lambda (entry) (plist-get entry :id)) (opencode-state-sessions archived)) #'string<))
+
+(defun opencode-test-state-lists ()
+  "Return the queries of the session listings asked for, oldest first."
+  (seq-keep (lambda (request)
+              (when (equal (plist-get request :path) "/api/session")
+                (plist-get request :query)))
+            (reverse opencode-test-requests)))
+
+(defun opencode-test-state-session-requests ()
+  "Return the paths of the requests about one session, oldest first."
+  (seq-filter (lambda (path) (string-match-p "\\`/api/session/ses_" path))
+              (opencode-test-state-requests)))
+
+(ert-deftest opencode-test-state-lists-every-session ()
+  "Every unarchived session is loaded, a page at a time and newest first, by the cursor.
+Loading them asks nothing about any session, and an unarchived one
+the first page did not hold is neither running nor waiting."
+  (let ((opencode-state--page-size 3))
+    (opencode-test-with-state-server
+        (list :sessions (cons (opencode-test-state-info "ses_arch" :updated 2000 :archived 2000)
+                              (opencode-test-state-numbered 8)))
+      (should-not (opencode-state-loaded-p))
+      (opencode-test-state-connect)
+      (should (opencode-state-loaded-p))
+      (should (equal (opencode-test-state-ids t) (mapcar (lambda (n) (format "ses_%02d" n)) (number-sequence 1 8))))
+      (let ((lists (opencode-test-state-lists)))
+        (should (equal (car lists) '((archived . "false") (order . "desc") (limit . 3))))
+        ;; Two pages after the first, then the sessions updated since the first.
+        (should (= (length lists) 4))
+        (dolist (query (cdr lists))
+          (should (equal (mapcar #'car query) '(cursor limit)))))
+      (should-not (opencode-test-state-session-requests))
+      (should (equal (opencode-state-status "ses_08") 'idle)))))
+
+(ert-deftest opencode-test-state-pages-arrive ()
+  "The registry is ready with the first page; each later page lands with one notification."
+  (let ((opencode-state--page-size 3))
+    (opencode-test-with-state-server
+        (list :sessions (opencode-test-state-numbered 8) :defer-pages t)
+      (opencode-test-state-recording
+        (let ((ready nil))
+          (opencode-state-ensure (lambda () (setq ready (opencode-test-state-ids))))
+          (opencode-test-state-connect)
+          ;; The newest first, at once.
+          (should (equal ready '("ses_01" "ses_02" "ses_03")))
+          (should (opencode-state-ready-p))
+          (should-not (opencode-state-loaded-p))
+          ;; One notification per page, statuses one by one.
+          (should (equal opencode-test-state-updates '(nil)))
+          (should (equal (sort (mapcar #'car opencode-test-state-changes) #'string<) ready))
+          (setq opencode-test-state-updates nil)
+          (should (opencode-test-release))
+          (should (equal (opencode-test-state-ids) (mapcar (lambda (n) (format "ses_%02d" n)) (number-sequence 1 6))))
+          (should (equal opencode-test-state-updates '(nil)))
+          (should (opencode-test-release))
+          (should (= (length (opencode-state-sessions)) 8))
+          (should (equal opencode-test-state-updates '(nil nil)))
+          (should-not (opencode-state-loaded-p))
+          ;; The sessions updated since the first page come last; none was.
+          (should (opencode-test-release))
+          (should (opencode-state-loaded-p))
+          (should (equal opencode-test-state-updates '(nil nil)))
+          (should-not opencode-test-deferred))))))
+
+(ert-deftest opencode-test-state-pages-meanwhile ()
+  "Sessions updated, renamed or deleted while the pages arrive end as the service has them."
+  (let ((opencode-state--page-size 3))
+    (opencode-test-with-state-server
+        (list :sessions (opencode-test-state-numbered 9) :defer-pages t)
+      (opencode-test-state-connect)
+      (should (equal (opencode-test-state-ids) '("ses_01" "ses_02" "ses_03")))
+      (cl-flet ((info (id) (seq-find (lambda (info) (equal (alist-get 'id info) id))
+                                     (plist-get opencode-test-state-server :sessions))))
+        ;; ses_07 is updated without an event the registry follows, which
+        ;; moves it ahead of the first page, out of the pages to come.
+        (setf (alist-get 'updated (alist-get 'time (info "ses_07"))) (opencode-test-state-ms 2000))
+        (setf (alist-get 'title (info "ses_07")) "moved ahead")
+        ;; ses_05 is renamed; the page will tell the name it had.
+        (setq opencode-test-requests nil)
+        (opencode-test-dispatch (list (opencode-test-state-event "session.renamed" "ses_05" 995 '(title . "renamed"))))
+        (should (equal (opencode-test-state-session-requests) '("/api/session/ses_05")))
+        (should (equal (plist-get (opencode-state-get "ses_05") :title) "renamed"))
+        ;; ses_04 is deleted, after the page holding it was read.
+        (opencode-test-dispatch (list (opencode-test-state-event "session.deleted" "ses_04" 996)))
+        (should-not (opencode-state-get "ses_04"))
+        (while (opencode-test-release))
+        (should (opencode-state-loaded-p))
+        (should (equal (opencode-test-state-ids)
+                       '("ses_01" "ses_02" "ses_03" "ses_05" "ses_06" "ses_07" "ses_08" "ses_09")))
+        (should (equal (plist-get (opencode-state-get "ses_05") :title) "renamed"))
+        (should (equal (plist-get (opencode-state-get "ses_07") :title) "moved ahead"))
+        (should (equal (plist-get (opencode-state-get "ses_07") :updated) (opencode-test-state-time 2000)))))))
+
+(ert-deftest opencode-test-state-limit-option ()
+  "A number in `opencode-state-recent-limit' still caps the sessions listed."
+  (let ((opencode-state--page-size 3)
+        (opencode-state-recent-limit 4))
+    (opencode-test-with-state-server
+        (list :sessions (opencode-test-state-numbered 8) :active '("ses_07"))
+      (opencode-test-state-connect)
+      (should (opencode-state-loaded-p))
+      (should (equal (mapcar (lambda (query) (alist-get 'limit query)) (opencode-test-state-lists))
+                     '(3 1 3)))
+      ;; Running sessions join whatever the cap.
+      (should (equal (opencode-test-state-ids) '("ses_01" "ses_02" "ses_03" "ses_04" "ses_07"))))
+    ;; None but the running ones: the service refuses an empty page.
+    (let ((opencode-state-recent-limit 0))
+      (opencode-test-with-state-server
+          (list :sessions (opencode-test-state-numbered 3) :active '("ses_02"))
+        (opencode-test-state-connect)
+        (should (opencode-state-loaded-p))
+        (should-not (opencode-test-state-lists))
+        (should (equal (opencode-test-state-ids) '("ses_02")))))))
+
+(ert-deftest opencode-test-state-listing-asks-little ()
+  "Loading sessions fetches the message of unseen failures only, and no context size."
+  (let ((opencode-state--page-size 4))
+    (opencode-test-with-state-server
+        (list :sessions (append (opencode-test-state-numbered 6)
+                                (list (opencode-test-state-info "ses_seen" :updated 300 :idle 300 :viewed 300
+                                                                :outcome "failed")
+                                      (opencode-test-state-info "ses_unseen" :updated 200 :idle 200 :viewed 100
+                                                                :outcome "failed")))
+              :messages `(("ses_unseen"
+                           ((type . "idle") (outcome . "failed") (time (created . ,(opencode-test-state-ms 200)))
+                            (error (type . "provider") (message . "Quota exceeded"))))))
+      (opencode-test-state-connect)
+      (should (opencode-state-loaded-p))
+      (should (= (length (opencode-state-sessions)) 8))
+      (should (equal (opencode-test-state-session-requests) '("/api/session/ses_unseen/message")))
+      (should (eq (opencode-state-status "ses_unseen") 'failed))
+      (should (equal (plist-get (opencode-state-get "ses_unseen") :error) "Quota exceeded"))
+      (should-not (plist-get (opencode-state-get "ses_seen") :error)))))
+
+(ert-deftest opencode-test-state-page-retried ()
+  "A page that fails is asked again later, the registry staying ready meanwhile."
+  (let ((opencode-state--page-size 3)
+        (failures 1)
+        (messages nil))
+    (opencode-test-with-state-server
+        (list :sessions (opencode-test-state-numbered 5))
+      (setq opencode-test-routes
+            (cons (list 'get "\\`/api/session\\'"
+                        (lambda (request)
+                          (if (and (alist-get 'cursor (plist-get request :query)) (> failures 0))
+                              (progn (cl-decf failures) '(:error 503 "busy"))
+                            (opencode-test-state--list (plist-get request :query)))))
+                  opencode-test-routes))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format &rest arguments) (push (apply #'format format arguments) messages))))
+        (opencode-test-state-connect))
+      (should (opencode-state-ready-p))
+      (should-not (opencode-state-loaded-p))
+      (should (string-match-p "cannot list the sessions, retrying.*busy" (car messages)))
+      (should (timerp opencode-state--list-timer))
+      (funcall (timer--function opencode-state--list-timer))
+      (should (opencode-state-loaded-p))
+      (should (= (length (opencode-state-sessions)) 5)))))
+
+(defun opencode-test-state-open (id)
+  "Open the buffer of session ID, as the service knows it, without display."
+  (opencode-session-open
+   (seq-find (lambda (info) (equal (alist-get 'id info) id)) (plist-get opencode-test-state-server :sessions))
+   :no-display t))
+
+(ert-deftest opencode-test-state-keeps-open-sessions ()
+  "A session whose buffer is open is in the registry, archived, older or opened later."
+  (let ((opencode-state--page-size 3))
+    (opencode-test-with-state-server
+        (list :sessions (append (list (opencode-test-state-info "ses_arch" :updated 2000 :archived 1500)
+                                      (opencode-test-state-info "ses_later" :updated 50 :archived 60))
+                                (opencode-test-state-numbered 5)))
+      (opencode-test-state-open "ses_arch")
+      (opencode-test-state-connect)
+      (should (opencode-state-loaded-p))
+      (should (opencode-state-get "ses_arch"))
+      (should (plist-get (opencode-state-get "ses_arch") :archived))
+      ;; Archived, it is listed with the others while its buffer is open.
+      (should (member "ses_arch" (opencode-test-state-ids)))
+      (should-not (opencode-state-get "ses_later"))
+      (setq opencode-test-requests nil)
+      (opencode-test-state-open "ses_later")
+      (should (equal (seq-take (opencode-test-state-session-requests) 1) '("/api/session/ses_later")))
+      (should (opencode-state-get "ses_later"))
+      ;; A buffer of a session the registry holds asks nothing more of it.
+      (setq opencode-test-requests nil)
+      (opencode-test-state-open "ses_02")
+      (should-not (member "/api/session/ses_02" (opencode-test-state-requests)))
+      ;; Closed, its session is let go at the next rebuild.
+      (kill-buffer (gethash "ses_later" opencode-session-buffers))
+      (opencode-test-state-connect)
+      (should (opencode-state-get "ses_arch"))
+      (should-not (opencode-state-get "ses_later")))))
+
+(ert-deftest opencode-test-state-rebuild-keeps-entries ()
+  "A rebuild keeps the previous entries until the listing ends, then drops those gone."
+  (let ((opencode-state--page-size 3))
+    (opencode-test-with-state-server
+        (list :sessions (opencode-test-state-numbered 7))
+      (opencode-test-state-open "ses_06")
+      (opencode-test-state-connect)
+      (should (= (length (opencode-state-sessions)) 7))
+      ;; While away, ses_05 and ses_06 were archived, and ses_07 renamed.
+      (cl-flet ((info (id) (seq-find (lambda (info) (equal (alist-get 'id info) id))
+                                     (plist-get opencode-test-state-server :sessions))))
+        (dolist (id '("ses_05" "ses_06"))
+          (setf (alist-get 'archived (alist-get 'time (info id))) (opencode-test-state-ms 900)))
+        (setf (alist-get 'title (info "ses_07")) "renamed away"))
+      (plist-put opencode-test-state-server :defer-pages t)
+      (opencode-test-state-recording
+        (setq opencode-test-requests nil)
+        (opencode-test-state-connect)
+        (should (opencode-state-ready-p))
+        ;; The entries not listed yet stay, but events no longer apply to them.
+        (should (equal (opencode-test-state-ids)
+                       (mapcar (lambda (n) (format "ses_%02d" n)) (number-sequence 1 7))))
+        (should-not opencode-test-state-changes)
+        (opencode-test-dispatch (list (opencode-test-state-event "session.agent.selected" "ses_07" 999
+                                                                 '(agent . "plan"))))
+        (should (member "/api/session/ses_07" (opencode-test-state-requests)))
+        (should (equal (plist-get (opencode-state-get "ses_07") :title) "renamed away"))
+        (should (equal (plist-get (opencode-state-get "ses_07") :agent) "plan"))
+        (while (opencode-test-release))
+        (should (opencode-state-loaded-p))
+        ;; ses_06 has a buffer: fetched archived, and kept.
+        (should (equal (opencode-test-state-ids) '("ses_01" "ses_02" "ses_03" "ses_04" "ses_06" "ses_07")))
+        (should (plist-get (opencode-state-get "ses_06") :archived))
+        (should-not (opencode-state-get "ses_05"))
+        (should (equal opencode-test-state-changes '(("ses_05" idle nil))))))))
 ;;;; Statuses
 
 (defun opencode-test-state-running-session ()
@@ -778,9 +1074,8 @@ PROMPT-TOKENS is as for `opencode-test-state-expiry'."
           (should-not (opencode-state-cache "ses_none"))
           (should (< (abs (- (opencode-state-cache-remaining "ses_a") 300)) 0.01))
           (should (opencode-state-cache-supported-p))
-          (should (member "ses_a" opencode-test-state-updates))
-          (should (member "ses_old" opencode-test-state-updates))
-          (should-not (member "ses_gone" opencode-test-state-updates))
+          ;; The page of one session reports it; the expiries, several, all at once.
+          (should (equal opencode-test-state-updates '(nil "ses_a")))
           ;; The status hook is about statuses only.
           (should-not (assoc "ses_old" opencode-test-state-changes)))
         ;; One timer, set past the earliest expiry.

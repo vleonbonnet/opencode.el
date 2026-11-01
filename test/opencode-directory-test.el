@@ -28,6 +28,38 @@
   (should (equal list-buffers-directory default-directory))
   (should (equal (opencode--session-directory opencode-session-info) default-directory)))
 
+(ert-deftest opencode-test-directory-resolved-once-a-while ()
+  "A directory's links are resolved once for many lookups, and again once the reuse time passes."
+  (skip-unless (not (memq system-type '(windows-nt ms-dos))))
+  (let* ((root (file-name-as-directory (make-temp-file "opencode-links-" t)))
+         (first (file-name-as-directory (expand-file-name "first" root)))
+         (second (file-name-as-directory (expand-file-name "second" root)))
+         (link (expand-file-name "link" root))
+         (opencode--directory-names (make-hash-table :test #'equal))
+         (resolved 0)
+         (now (float-time))
+         (truename (symbol-function 'file-truename)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'file-truename)
+                   (lambda (name &rest arguments)
+                     (when (equal name link) (cl-incf resolved))
+                     (apply truename name arguments)))
+                  ((symbol-function 'float-time) (lambda (&optional _) now)))
+          (make-directory first)
+          (make-directory second)
+          (make-symbolic-link first link)
+          (dotimes (_ 100)
+            (should (equal (opencode-normalize-directory link) (file-name-as-directory (funcall truename first)))))
+          (should (= resolved 1))
+          ;; The link moves; it is seen once the reuse time passed.
+          (delete-file link)
+          (make-symbolic-link second link)
+          (should (equal (opencode-normalize-directory link) (file-name-as-directory (funcall truename first))))
+          (setq now (+ now opencode--directory-name-ttl))
+          (should (equal (opencode-normalize-directory link) (file-name-as-directory (funcall truename second))))
+          (should (= resolved 2)))
+      (delete-directory root t))))
+
 (ert-deftest opencode-test-cd-waits-for-server-move ()
   "Relative cd requests a move; only its delivery updates the session and buffer."
   (opencode-test-with-server

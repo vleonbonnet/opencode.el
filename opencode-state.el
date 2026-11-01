@@ -28,11 +28,18 @@
 ;; instead of asking the service.
 ;;
 ;; The service is authoritative.  Whenever the event stream (re)opens,
-;; whoever opened it, the registry is rebuilt from REST: the newest
-;; unarchived sessions, the running ones, and what those wait on.
-;; Events received meanwhile are held and applied over the result; after
-;; that, events keep it current, and an event of a session it does not
-;; know fetches that session first.
+;; whoever opened it, the registry is rebuilt from REST: the first page
+;; of the newest unarchived sessions, the running ones, and what those
+;; wait on.  Events received meanwhile are held and applied over the
+;; result, and the registry is then ready; after that, events keep it
+;; current, and an event of a session it does not hold current fetches
+;; that session first.  The other unarchived sessions are listed after,
+;; a page at a time, newest first, each page parsed as it comes and
+;; reported to clients at once.  Until the listing ends, a rebuild keeps
+;; the entries of the previous stream not listed yet; it then drops the
+;; ones the service no longer lists, except sessions whose buffer is
+;; open, which are fetched, archived or not.  A session buffer opening
+;; fetches its session too when the registry does not hold it.
 ;;
 ;; Unread is the service's, shared by every client: a session is unread
 ;; when its last idle transition is newer than the watermark
@@ -63,12 +70,17 @@
 (require 'opencode-events)
 (require 'opencode-http)
 
-(defcustom opencode-state-recent-limit 100
-  "Number of the newest unarchived sessions loaded when the stream connects.
-Running sessions are loaded whatever their age, and any other session
-joins the registry when an event concerns it."
-  :type 'natnum
+(defcustom opencode-state-recent-limit nil
+  "Number of the newest unarchived sessions loaded when the stream connects, or nil.
+Nil loads them all, a page at a time.  Running sessions, sessions whose
+buffer is open and any other session an event concerns join the
+registry whatever this number."
+  :type '(choice (const :tag "All" nil) natnum)
   :group 'opencode)
+
+(defvar opencode-state--page-size 250
+  "Number of sessions asked for per page of the listing.
+Each page is parsed and installed at once, on the main thread.")
 
 (defcustom opencode-state-context-requests 4
   "Number of sessions whose context size is fetched at once, at most.
@@ -89,7 +101,9 @@ session new to the registry, the new one nil for a session removed."
 Creation and removal count as changes, and so do the arrival of a
 context size fetched for `opencode-state-context' and a change of the
 session's prompt-cache expiry (`opencode-state-cache'), even for a
-session the registry holds no entry of."
+session the registry holds no entry of.  When many sessions change at
+once, such as when a page of the session listing arrives, it runs once
+with nil instead: clients then read the registry again."
   :type 'hook
   :group 'opencode)
 
@@ -118,7 +132,30 @@ Events are applied only while they come from this stream.")
   "Events received while bootstrapping, newest first.")
 
 (defvar opencode-state--fetching (make-hash-table :test #'equal)
-  "IDs of unknown sessions being fetched, mapped to their events, newest first.")
+  "IDs of sessions being fetched, mapped to (fetching . EVENTS).
+EVENTS are those received meanwhile, newest first, applied once the
+session's entry is in.")
+
+(defvar opencode-state--current (make-hash-table :test #'equal)
+  "IDs of the sessions whose entry is current on this stream, mapped to t.
+A session deleted on this stream maps to `deleted'.  Entries of the
+previous stream are not current, and events do not apply to them: their
+session is fetched first.")
+
+(defvar opencode-state--listing nil
+  "Non-nil while the sessions after the first page are listed.")
+
+(defvar opencode-state--loaded nil
+  "Non-nil once every unarchived session was listed on this stream.")
+
+(defvar opencode-state--list-timer nil
+  "Timer retrying the page of the listing that failed.")
+
+(defvar opencode-state--list-delay 1
+  "Seconds before the next retry of a page of the listing that failed.")
+
+(defvar opencode-state--batch nil
+  "While changes are batched, a list whose cdr holds the IDs changed, newest first.")
 
 (defvar opencode-state--waiters nil
   "Functions waiting for the registry to be ready, newest first.")
@@ -240,10 +277,22 @@ KIND is `permission', whose REQUEST is a permission request, or
 ;;;; Queries
 
 (defun opencode-state-ready-p ()
-  "Return non-nil once the registry is bootstrapped on the current event stream."
+  "Return non-nil once the registry is bootstrapped on the current event stream.
+It then holds the newest sessions and the running ones, and follows
+events; the older sessions may still be listed (see
+`opencode-state-loaded-p')."
   (and opencode-state--ready
        (eq opencode-state--stream opencode-events--process)
        (opencode-events-connected-p)))
+
+(defun opencode-state-loaded-p ()
+  "Return non-nil once the registry holds every unarchived session of the stream.
+That is once the listing that follows a bootstrap ended."
+  (and opencode-state--loaded (opencode-state-ready-p)))
+
+(defun opencode-state--retained-p (id)
+  "Return non-nil when session ID has a buffer, which keeps it in the registry."
+  (buffer-live-p (gethash id opencode-session-buffers)))
 
 (defun opencode-state-get (id)
   "Return the registry entry of session ID, or nil.
@@ -252,18 +301,23 @@ An entry is a plist with the keys :id, :title, :directory (normalized),
 context size in tokens, or nil; see `opencode-state-context'), :running,
 :retry (a plist :attempt :at :message, or nil), :requests (plists :kind
 :id :summary :time, oldest first), :outcome (`succeeded', `failed' or
-`interrupted'), :error (the last failure's message while the outcome is
-`failed'), :idle, :viewed, :archived, :created, :updated and :started.
-Times are float seconds since the epoch.  Read the context size with
-`opencode-state-context', which fetches it when not known."
+`interrupted'), :error (the last failure's message while it is unseen,
+the status being `failed'; nil for a failure seen before the registry
+loaded the session), :idle, :viewed, :archived, :created, :updated and
+:started.  Times are float seconds since the epoch.  Read the context
+size with `opencode-state-context', which fetches it when not known.
+The registry holds every unarchived session, every session whose buffer
+is open, and every other one an event concerned; lookups are constant
+time."
   (gethash id opencode-state--sessions))
 
 (defun opencode-state-sessions (&optional archived)
   "Return every registry entry, most recently updated first.
-Archived sessions are included only when ARCHIVED is non-nil."
+Archived sessions are included only when ARCHIVED is non-nil, or when
+their buffer is open."
   (let ((entries nil))
-    (maphash (lambda (_id entry)
-               (when (or archived (not (plist-get entry :archived)))
+    (maphash (lambda (id entry)
+               (when (or archived (not (plist-get entry :archived)) (opencode-state--retained-p id))
                  (push entry entries)))
              opencode-state--sessions)
     (sort entries :key (lambda (entry) (or (plist-get entry :updated) 0)) :reverse t)))
@@ -370,6 +424,26 @@ after the stream reconnects, it is taken to be able to."
            nil)
          arguments))
 
+(defun opencode-state--updated (id)
+  "Report a change of session ID, or note it for the batch of changes being made."
+  (if opencode-state--batch
+      (push id (cdr opencode-state--batch))
+    (opencode-state--run-hook 'opencode-state-updated-functions id)))
+
+(defun opencode-state--batched (function)
+  "Call FUNCTION, reporting the sessions it changes once rather than one by one.
+`opencode-state-updated-functions' then runs once: with the session ID
+when only one changed, else with nil.  A batch within a batch joins it."
+  (if opencode-state--batch
+      (funcall function)
+    (let ((batch (list 'batch)))
+      (unwind-protect
+          (let ((opencode-state--batch batch))
+            (funcall function))
+        (let ((ids (delete-dups (cdr batch))))
+          (when ids
+            (opencode-state--run-hook 'opencode-state-updated-functions (and (null (cdr ids)) (car ids)))))))))
+
 (defun opencode-state--store (id entry)
   "Make ENTRY the entry of session ID, nil removing it, and run the hooks on a change."
   (let ((old (gethash id opencode-state--sessions)))
@@ -383,7 +457,15 @@ after the stream reconnects, it is taken to be able to."
             (after (and entry (opencode-state-status entry))))
         (unless (eq before after)
           (opencode-state--run-hook 'opencode-state-change-functions id before after)))
-      (opencode-state--run-hook 'opencode-state-updated-functions id))))
+      (opencode-state--updated id))))
+
+(defun opencode-state--put (entry)
+  "Make ENTRY, built from the service or an event on this stream, its session's current entry.
+A stale entry's context size is kept while the service has not updated
+the session since."
+  (let ((id (plist-get entry :id)))
+    (puthash id t opencode-state--current)
+    (opencode-state--store id (opencode-state--context-carry entry))))
 
 (defun opencode-state--apply (entry event replay)
   "Return ENTRY, a fresh copy of a registry entry, updated by EVENT.
@@ -554,10 +636,13 @@ kept; others come from their IDs, which hold their creation time."
 
 (defun opencode-state--complete (entries then else)
   "Fill in the live parts of ENTRIES from the service, then call THEN with them.
-Running sessions get their pending requests, start and retry, failed
-ones the message of their failure, reused when the registry knows that
-failure already.  ELSE receives the `opencode-error' of a failed request
-for pending requests; the rest is best effort."
+Running sessions get their pending requests, start and retry, sessions
+whose failure is unseen the message of that failure, reused when the
+registry knows that failure already.  A failure seen already is shown
+by no status, so its message is not fetched: loading every session
+would otherwise ask for one per failed session.  ELSE receives the
+`opencode-error' of a failed request for pending requests; the rest is
+best effort."
   (let ((pending 1)
         (failed nil))
     (cl-labels ((done ()
@@ -579,53 +664,88 @@ for pending requests; the rest is best effort."
                      (plist-put entry :retry retry)
                      (done))))
           (when (eq (plist-get entry :outcome) 'failed)
-            (if (and (eq (plist-get known :outcome) 'failed)
-                     (plist-get known :error)
-                     (equal (plist-get known :idle) (plist-get entry :idle)))
-                (plist-put entry :error (plist-get known :error))
+            (cond
+             ((and (eq (plist-get known :outcome) 'failed)
+                   (plist-get known :error)
+                   (equal (plist-get known :idle) (plist-get entry :idle)))
+              (plist-put entry :error (plist-get known :error)))
+             ((opencode-state-unread-p entry)
               (cl-incf pending)
               (opencode-state--fetch-error
-               entry (lambda (message) (plist-put entry :error message) (done)))))))
+               entry (lambda (message) (plist-put entry :error message) (done))))))))
       (done))))
 
-(defun opencode-state--load (id then else)
-  "Call THEN with the entry of session ID built from the service.
-ELSE receives the `opencode-error' of a failed request."
-  (opencode-request
-   'get (concat "/api/session/" id) :directory nil :buffer nil :else else
-   :then (lambda (response)
-           (let ((info (opencode-request-data response)))
-             (opencode-request
-              'get "/api/session/active" :directory nil :buffer nil :else else
-              :then (lambda (response)
-                      (opencode-state--complete
-                       (list (opencode-state--info-entry
-                              info (member id (opencode-state--active-ids response))))
-                       (lambda (entries) (funcall then (car entries)))
-                       else)))))))
+(defun opencode-state--load (ids then)
+  "Build the entries of sessions IDS from the service, then call THEN with them.
+THEN receives an alist mapping each ID to its entry, to nil when the
+service has no such session, or to the `opencode-error' of a failure.
+The infos come first, then the running sessions, once for all of them,
+so that a turn ending in between shows as ended."
+  (let ((pending (length ids))
+        (infos nil)
+        (results nil))
+    (cl-labels ((failed (error)
+                  (funcall then (append results
+                                        (mapcar (lambda (info) (cons (alist-get 'id info) error)) infos))))
+                (fetched ()
+                  (when (zerop (cl-decf pending))
+                    (if (null infos)
+                        (funcall then results)
+                      (opencode-request
+                       'get "/api/session/active" :directory nil :buffer nil :else #'failed
+                       :then (lambda (response)
+                               (let ((active (opencode-state--active-ids response)))
+                                 (opencode-state--complete
+                                  (mapcar (lambda (info)
+                                            (opencode-state--info-entry info (member (alist-get 'id info) active)))
+                                          (nreverse infos))
+                                  (lambda (entries)
+                                    (funcall then (append results
+                                                          (mapcar (lambda (entry) (cons (plist-get entry :id) entry))
+                                                                  entries))))
+                                  #'failed))))))))
+      (if (null ids)
+          (funcall then nil)
+        (dolist (id ids)
+          (opencode-request
+           'get (concat "/api/session/" id) :directory nil :buffer nil
+           :then (lambda (response)
+                   (push (opencode-request-data response) infos)
+                   (fetched))
+           :else (lambda (error)
+                   (push (cons id (unless (eql (opencode-error-status error) 404) error)) results)
+                   (fetched))))))))
 
-(defun opencode-state--fetch (id event)
-  "Fetch unknown session ID, then apply EVENT and those that follow it."
-  (puthash id (list event) opencode-state--fetching)
-  (let ((generation opencode-state--generation))
-    (cl-flet ((current-p ()
-                (and (= generation opencode-state--generation)
-                     (gethash id opencode-state--fetching))))
-      (opencode-state--load
-       id
-       (lambda (entry)
-         (when (current-p)
-           (let ((events (reverse (gethash id opencode-state--fetching))))
-             (remhash id opencode-state--fetching)
-             (opencode-state--store id entry)
-             (dolist (event events)
-               (opencode-state--dispatch id event t)))))
-       (lambda (error)
-         (when (current-p)
-           (remhash id opencode-state--fetching)
-           ;; A deleted session has nothing to follow.
-           (unless (eql (opencode-error-status error) 404)
-             (message "OpenCode: cannot follow session %s: %s" id (opencode-error-describe error)))))))))
+(defun opencode-state--fetch (ids &optional event)
+  "Fetch sessions IDS, which the registry does not hold current, and follow them.
+EVENT, of the one session of IDS that called for it, and the events of
+each session received meanwhile are applied once its entry is in.  A
+session the service does not have is dropped quietly."
+  (dolist (id ids)
+    (puthash id (cons 'fetching (and event (list event))) opencode-state--fetching))
+  (let ((generation opencode-state--generation)
+        (fetching (mapcar (lambda (id) (cons id (gethash id opencode-state--fetching))) ids)))
+    (opencode-state--load
+     ids
+     (lambda (results)
+       (when (= generation opencode-state--generation)
+         (opencode-state--batched
+          (lambda ()
+            (pcase-dolist (`(,id . ,result) results)
+              ;; Unless deleted meanwhile.
+              (when (eq (gethash id opencode-state--fetching) (alist-get id fetching nil nil #'equal))
+                (let ((events (reverse (cdr (gethash id opencode-state--fetching)))))
+                  (remhash id opencode-state--fetching)
+                  (cond
+                   ((opencode-error-p result)
+                    (message "OpenCode: cannot follow session %s: %s" id (opencode-error-describe result)))
+                   ((null result)
+                    (puthash id 'deleted opencode-state--current)
+                    (opencode-state--store id nil))
+                   (t
+                    (opencode-state--put result)
+                    (dolist (event events)
+                      (opencode-state--dispatch id event t))))))))))))))
 
 ;;;; Events
 
@@ -646,34 +766,41 @@ ELSE receives the `opencode-error' of a failed request."
      :agent (alist-get 'agent data) :model (alist-get 'model data)
      :created created :updated created)))
 
+(defun opencode-state--current-p (id)
+  "Return non-nil when the registry's entry of session ID is current on this stream."
+  (eq (gethash id opencode-state--current) t))
+
 (defun opencode-state--dispatch (id event replay)
-  "Apply EVENT of session ID, fetching the session first when unknown.
+  "Apply EVENT of session ID, fetching the session first unless its entry is current.
 REPLAY is passed to `opencode-state--apply'."
   (pcase (alist-get 'type event)
     ("session.created"
      (cond
       ((gethash id opencode-state--fetching)
-       (push event (gethash id opencode-state--fetching)))
-      ;; A known session's entry is at least as recent as its creation.
-      ((not (opencode-state-get id))
+       (push event (cdr (gethash id opencode-state--fetching))))
+      ;; A current entry is at least as recent as its creation.
+      ((opencode-state--current-p id))
+      ((opencode-state-get id) (opencode-state--fetch (list id) event))
+      (t
        ;; A new session has no usage yet.
        (puthash id 'known opencode-state--contexts)
-       (opencode-state--store id (opencode-state--created-entry event)))))
+       (opencode-state--put (opencode-state--created-entry event)))))
     ("session.deleted"
      (remhash id opencode-state--fetching)
+     (puthash id 'deleted opencode-state--current)
      (opencode-state--cache-set id nil)
      (opencode-state--cache-schedule)
      (opencode-state--store id nil))
     (_
      (cond
       ((gethash id opencode-state--fetching)
-       (push event (gethash id opencode-state--fetching)))
-      ((opencode-state-get id)
+       (push event (cdr (gethash id opencode-state--fetching))))
+      ((opencode-state--current-p id)
        (let ((entry (opencode-state--apply (copy-sequence (opencode-state-get id)) event replay)))
          ;; Before the hooks run, which may ask for the context size.
          (opencode-state--context-follow id event)
          (opencode-state--store id entry)))
-      (t (opencode-state--fetch id event))))))
+      (t (opencode-state--fetch (list id) event))))))
 
 (defun opencode-state--handle (event)
   "Apply EVENT to the registry when it follows the stream that delivered it.
@@ -690,40 +817,43 @@ them to, and the next bootstrap covers them."
 
 ;;;; Bootstrap
 
-(defun opencode-state--install (entries)
-  "Replace the registry with ENTRIES, running the hooks of every change."
-  (let ((ids (make-hash-table :test #'equal)))
-    (dolist (entry entries)
-      (puthash (plist-get entry :id) t ids))
-    (dolist (id (hash-table-keys opencode-state--sessions))
-      (unless (gethash id ids)
-        (opencode-state--store id nil)))
-    (dolist (entry entries)
-      (opencode-state--store (plist-get entry :id) entry))))
+(defun opencode-state--page-limit (count)
+  "Return how many sessions to ask for after COUNT listed, or 0 once enough are."
+  (if opencode-state-recent-limit
+      (max 0 (min opencode-state--page-size (- opencode-state-recent-limit count)))
+    opencode-state--page-size))
 
-(defun opencode-state--bootstrapped (entries)
-  "Install bootstrapped ENTRIES, apply the events held meanwhile, call the waiters."
+(defun opencode-state--bootstrapped (entries listing)
+  "Install bootstrapped ENTRIES, apply the events held meanwhile, call the waiters.
+Then list the other sessions from LISTING, a plist (:next :previous
+:count) of the first page's cursors and size."
   (setq opencode-state--bootstrapping nil
         opencode-state--ready t
         opencode-state--retry-delay 1)
-  (opencode-state--context-rebuild entries)
-  (opencode-state--install entries)
-  (let ((held (reverse opencode-state--held)))
-    (setq opencode-state--held nil)
-    (dolist (event held)
-      (opencode-state--dispatch (opencode-state--event-session event) event t)))
+  (opencode-state--batched
+   (lambda ()
+     (mapc #'opencode-state--put entries)
+     (let ((held (reverse opencode-state--held)))
+       (setq opencode-state--held nil)
+       (dolist (event held)
+         (opencode-state--dispatch (opencode-state--event-session event) event t)))))
   (opencode-state--context-schedule)
-  (let ((waiters (reverse opencode-state--waiters)))
-    (setq opencode-state--waiters nil)
+  (let ((generation opencode-state--generation)
+        (waiters (reverse opencode-state--waiters)))
+    (setq opencode-state--waiters nil
+          opencode-state--listing t)
     (dolist (waiter waiters)
       (with-demoted-errors "OpenCode session state waiter: %S"
-        (funcall waiter)))))
+        (funcall waiter)))
+    (opencode-state--list generation listing)))
 
 (defun opencode-state--cancel-retry ()
-  "Cancel the pending retry of a failed bootstrap."
-  (when (timerp opencode-state--retry-timer)
-    (cancel-timer opencode-state--retry-timer))
-  (setq opencode-state--retry-timer nil))
+  "Cancel the pending retries of a failed bootstrap or page of the listing."
+  (dolist (timer (list opencode-state--retry-timer opencode-state--list-timer))
+    (when (timerp timer)
+      (cancel-timer timer)))
+  (setq opencode-state--retry-timer nil
+        opencode-state--list-timer nil))
 
 (defun opencode-state--bootstrap-failed (error)
   "Report the bootstrap's ERROR and retry later while the stream stays open."
@@ -749,57 +879,202 @@ them to, and the next bootstrap covers them."
 
 (defun opencode-state--bootstrap ()
   "Rebuild the registry from the service.
-The newest unarchived sessions and the running ones are fetched, with
-what the running ones wait on.  Events received before the requests
-are covered by their answers; those received meanwhile are held."
-  (let ((generation (cl-incf opencode-state--generation)))
+The first page of the newest unarchived sessions and the running ones
+are fetched, with what the running ones wait on; the registry is then
+ready, and lists the other sessions.  Events received before the
+requests are covered by their answers; those received meanwhile are
+held.  The entries of the previous stream stay until the listing ends,
+none of them current."
+  (let ((generation (cl-incf opencode-state--generation))
+        (limit (opencode-state--page-limit 0)))
     (setq opencode-state--bootstrapping t
           opencode-state--ready nil
-          opencode-state--held nil)
+          opencode-state--held nil
+          opencode-state--listing nil
+          opencode-state--loaded nil
+          opencode-state--list-delay 1)
     (clrhash opencode-state--fetching)
+    (clrhash opencode-state--current)
     (opencode-state--cancel-retry)
+    (opencode-state--context-reset)
     (cl-labels ((current-p () (= generation opencode-state--generation))
                 (fail (error) (when (current-p) (opencode-state--bootstrap-failed error)))
-                (finish (infos active)
+                (finish (infos active listing)
                   (opencode-state--complete
                    (mapcar (lambda (info)
                              (opencode-state--info-entry info (member (alist-get 'id info) active)))
                            infos)
-                   (lambda (entries) (when (current-p) (opencode-state--bootstrapped entries)))
+                   (lambda (entries) (when (current-p) (opencode-state--bootstrapped entries listing)))
                    #'fail))
-                (add-missing (infos active missing)
+                (add-missing (infos active missing listing)
                   ;; Running sessions older than the page are fetched one by one.
                   (if (null missing)
-                      (finish infos active)
+                      (finish infos active listing)
                     (opencode-request
                      'get (concat "/api/session/" (car missing)) :directory nil :buffer nil
                      :then (lambda (response)
                              (when (current-p)
                                (add-missing (append infos (list (opencode-request-data response)))
-                                            active (cdr missing))))
+                                            active (cdr missing) listing)))
                      :else (lambda (error)
                              (when (current-p)
                                (if (eql (opencode-error-status error) 404)
-                                   (add-missing infos active (cdr missing))
-                                 (fail error))))))))
-      (opencode-request
-       'get "/api/session" :directory nil :buffer nil :else #'fail
-       :query `((archived . "false") (order . "desc") (limit . ,opencode-state-recent-limit))
-       :then (lambda (response)
-               (when (current-p)
-                 (let ((infos (opencode-request-data response)))
-                   ;; Fetched after the list, a turn that ended in between shows as ended.
-                   (opencode-request
-                    'get "/api/session/active" :directory nil :buffer nil :else #'fail
-                    :then (lambda (response)
-                            (when (current-p)
-                              (let ((active (opencode-state--active-ids response)))
-                                (add-missing infos active
-                                             (seq-remove (lambda (id)
-                                                           (seq-find (lambda (info)
-                                                                       (equal (alist-get 'id info) id))
-                                                                     infos))
-                                                         active)))))))))))))
+                                   (add-missing infos active (cdr missing) listing)
+                                 (fail error)))))))
+                (listed (infos cursor)
+                  (let ((listing (list :next (and (= (length infos) limit) (alist-get 'next cursor))
+                                       :previous (alist-get 'previous cursor)
+                                       :count (length infos))))
+                    ;; Fetched after the list, a turn that ended in between shows as ended.
+                    (opencode-request
+                     'get "/api/session/active" :directory nil :buffer nil :else #'fail
+                     :then (lambda (response)
+                             (when (current-p)
+                               (let ((active (opencode-state--active-ids response)))
+                                 (add-missing infos active
+                                              (seq-remove (lambda (id)
+                                                            (seq-find (lambda (info)
+                                                                        (equal (alist-get 'id info) id))
+                                                                      infos))
+                                                          active)
+                                              listing))))))))
+      ;; The service refuses an empty page.
+      (if (zerop limit)
+          (listed nil nil)
+        (opencode-request
+         'get "/api/session" :directory nil :buffer nil :else #'fail
+         :query `((archived . "false") (order . "desc") (limit . ,limit))
+         :then (lambda (response)
+                 (when (current-p)
+                   (listed (opencode-request-data response) (alist-get 'cursor response)))))))))
+
+;;;; Listing
+
+;; After the first page, the other unarchived sessions are listed a page
+;; at a time, newest first, by the cursor each page answers with, which
+;; anchors the next page on the last session's update time.  A session
+;; updated meanwhile moves ahead of the first page, where the pages
+;; after never find it: it is listed last, from the first page's cursor
+;; going the other way.  The sessions of a page are neither running, the
+;; running ones were fetched with the first page, nor waiting on anything
+;; then; one an event concerned since is fetched by the event and left
+;; alone, its entry being newer.
+
+(defun opencode-state--install (infos then fail)
+  "Install the entries of session INFOS the registry holds no current entry of.
+THEN is called with no argument once they are in, FAIL with the
+`opencode-error' of a failed request."
+  (let ((generation opencode-state--generation))
+    (cl-flet ((fresh-p (id)
+                (not (or (gethash id opencode-state--current)
+                         (gethash id opencode-state--fetching)))))
+      (opencode-state--complete
+       (seq-keep (lambda (info) (when (fresh-p (alist-get 'id info)) (opencode-state--info-entry info)))
+                 infos)
+       (lambda (entries)
+         (when (= generation opencode-state--generation)
+           ;; An event may have settled one meanwhile.
+           (opencode-state--batched
+            (lambda ()
+              (dolist (entry entries)
+                (when (fresh-p (plist-get entry :id))
+                  (opencode-state--put entry)))))
+           (funcall then)))
+       fail))))
+
+(defun opencode-state--list (generation listing)
+  "List the sessions after the first page of bootstrap GENERATION.
+LISTING is a plist: :next, the cursor of the next page, or nil once
+none follows; :previous, the cursor of the sessions updated since the
+first page; :count, the number of sessions listed so far."
+  (cl-labels ((current-p () (= generation opencode-state--generation))
+              (page (query then)
+                (opencode-request
+                 'get "/api/session" :directory nil :buffer nil :query query
+                 :then (lambda (response)
+                         (when (current-p)
+                           (let ((infos (opencode-request-data response)))
+                             (opencode-state--install
+                              infos
+                              (lambda ()
+                                (setq opencode-state--list-delay 1)
+                                (funcall then infos (alist-get 'cursor response)))
+                              (lambda (error) (retry error query then))))))
+                 :else (lambda (error) (when (current-p) (retry error query then)))))
+              (retry (error query then)
+                (when (current-p)
+                  (message "OpenCode: cannot list the sessions, retrying: %s" (opencode-error-describe error))
+                  (opencode-state--cancel-retry)
+                  (let ((timer nil))
+                    (setq timer (run-at-time
+                                 opencode-state--list-delay nil
+                                 (lambda ()
+                                   (when (eq opencode-state--list-timer timer)
+                                     (setq opencode-state--list-timer nil)
+                                     (when (and (current-p) (opencode-state-ready-p))
+                                       (page query then)))))
+                          opencode-state--list-timer timer
+                          opencode-state--list-delay (min 60 (* 2 opencode-state--list-delay))))))
+              (newer (cursor)
+                (if (null cursor)
+                    (opencode-state--listed generation)
+                  (page `((cursor . ,cursor) (limit . ,opencode-state--page-size))
+                        (lambda (infos cursor)
+                          (newer (and (= (length infos) opencode-state--page-size)
+                                      (alist-get 'previous cursor)))))))
+              (older (cursor count paged)
+                (let ((limit (opencode-state--page-limit count)))
+                  (cond
+                   ((and cursor (> limit 0))
+                    ;; A cursor carries the first page's filters and order.
+                    (page `((cursor . ,cursor) (limit . ,limit))
+                          (lambda (infos cursor)
+                            (older (and (= (length infos) limit) (alist-get 'next cursor))
+                                   (+ count (length infos)) t))))
+                   ;; With the first page alone, nothing could move ahead of it unseen.
+                   (paged (newer (plist-get listing :previous)))
+                   (t (opencode-state--listed generation))))))
+    (when (current-p)
+      (older (plist-get listing :next) (plist-get listing :count) nil))))
+
+(defun opencode-state--listed (generation)
+  "End the listing of bootstrap GENERATION.
+Entries still not current are of sessions the service no longer lists
+unarchived: they are dropped, except those whose buffer is open, which
+are fetched, as are the sessions of open buffers the registry lacks."
+  (when (= generation opencode-state--generation)
+    (let ((stale nil)
+          (wanted nil))
+      (maphash (lambda (id _entry)
+                 (unless (or (gethash id opencode-state--current) (gethash id opencode-state--fetching))
+                   (if (opencode-state--retained-p id) (push id wanted) (push id stale))))
+               opencode-state--sessions)
+      (maphash (lambda (id buffer)
+                 (when (and (buffer-live-p buffer)
+                            (not (gethash id opencode-state--sessions))
+                            (not (gethash id opencode-state--current)))
+                   (push id wanted)))
+               opencode-session-buffers)
+      (setq opencode-state--listing nil
+            opencode-state--loaded t)
+      (opencode-state--batched
+       (lambda ()
+         (dolist (id stale)
+           (opencode-state--store id nil))))
+      (when-let* ((ids (seq-remove (lambda (id) (gethash id opencode-state--fetching)) wanted)))
+        (opencode-state--fetch ids)))))
+
+(defun opencode-state--buffer-changed (id)
+  "Have the registry hold session ID once its buffer opened.
+Until the listing that follows a bootstrap ends, its end does.  For
+`opencode-session-buffer-functions'."
+  (when (and (opencode-state--retained-p id)
+             (opencode-state-loaded-p)
+             (not (gethash id opencode-state--current))
+             (not (gethash id opencode-state--fetching)))
+    (opencode-state--fetch (list id))))
+
+(add-hook 'opencode-session-buffer-functions #'opencode-state--buffer-changed)
 
 (defun opencode-state--connected (_event)
   "Bootstrap the registry and list the expiries on the stream that just (re)connected.
@@ -964,32 +1239,40 @@ predate it."
          (opencode-state--context-enqueue id)
        (remhash id opencode-state--contexts)))))
 
-(defun opencode-state--context-rebuild (entries)
-  "Give bootstrapped ENTRIES the context sizes still current, and queue the others asked for.
-A size stays current while the service has not updated its session
-since: the end of a step updates it.  The sizes queued or in flight
-are queued again, the fetches in flight being superseded; a failed
-fetch is tried again when next asked for."
-  (let ((contexts (make-hash-table :test #'equal))
-        (flying nil))
-    (dolist (entry entries)
-      (let* ((id (plist-get entry :id))
-             (old (opencode-state-get id))
-             (state (gethash id opencode-state--contexts))
-             (before (opencode-state--ms (plist-get old :updated)))
-             (after (opencode-state--ms (plist-get entry :updated))))
-        (cond
-         ((and (eq state 'known) before after (<= after before))
-          (plist-put entry :context (plist-get old :context))
-          (puthash id 'known contexts))
-         ((eq state 'queued) (puthash id 'queued contexts))
-         ((consp state)
-          (puthash id 'queued contexts)
-          (push id flying)))))
+(defun opencode-state--context-reset ()
+  "Ready the context sizes for a rebuild of the registry.
+Fetches in flight answer for the stream that dropped: they are queued
+again, ahead of those a client asked for meanwhile.  A failed fetch is
+tried again when next asked for.  Known sizes stay until a fresh entry
+replaces their session's (see `opencode-state--context-carry')."
+  (let ((flying nil)
+        (failed nil))
+    (maphash (lambda (id state)
+               (cond ((consp state) (push id flying))
+                     ((eq state 'failed) (push id failed))))
+             opencode-state--contexts)
+    (dolist (id failed)
+      (remhash id opencode-state--contexts))
+    (dolist (id flying)
+      (puthash id 'queued opencode-state--contexts))
     (setq opencode-state--context-queue
-          (seq-filter (lambda (id) (eq (gethash id contexts) 'queued))
-                      (delete-dups (append (nreverse flying) opencode-state--context-queue nil)))
-          opencode-state--contexts contexts)))
+          (seq-filter (lambda (id) (eq (gethash id opencode-state--contexts) 'queued))
+                      (delete-dups (append (nreverse flying) opencode-state--context-queue nil))))))
+
+(defun opencode-state--context-carry (entry)
+  "Return ENTRY, about to replace its session's entry, with the context size still current.
+The old entry's size stays current while the service has not updated
+the session since: the end of a step updates it.  Otherwise it is
+forgotten, and fetched again when asked for."
+  (let* ((id (plist-get entry :id))
+         (old (opencode-state-get id)))
+    (when (and old (eq (gethash id opencode-state--contexts) 'known))
+      (let ((before (opencode-state--ms (plist-get old :updated)))
+            (after (opencode-state--ms (plist-get entry :updated))))
+        (if (and before after (<= after before))
+            (setq entry (plist-put entry :context (plist-get old :context)))
+          (remhash id opencode-state--contexts))))
+    entry))
 
 ;;;; Prompt-cache expiry
 
@@ -1008,7 +1291,7 @@ The update hook runs when it changed."
     (if cache
         (puthash id cache opencode-state--caches)
       (remhash id opencode-state--caches))
-    (opencode-state--run-hook 'opencode-state-updated-functions id)))
+    (opencode-state--updated id)))
 
 (defun opencode-state--cache-install (data)
   "Replace the known expiries with DATA, the service's listing."
@@ -1016,10 +1299,12 @@ The update hook runs when it changed."
     (dolist (pair data)
       (when-let* ((cache (opencode-state--cache-expiry (cdr pair))))
         (puthash (format "%s" (car pair)) cache caches)))
-    (dolist (id (hash-table-keys opencode-state--caches))
-      (unless (gethash id caches)
-        (opencode-state--cache-set id nil)))
-    (maphash #'opencode-state--cache-set caches)))
+    (opencode-state--batched
+     (lambda ()
+       (dolist (id (hash-table-keys opencode-state--caches))
+         (unless (gethash id caches)
+           (opencode-state--cache-set id nil)))
+       (maphash #'opencode-state--cache-set caches)))))
 
 (defun opencode-state--cache-prune ()
   "Forget the expiries that passed."

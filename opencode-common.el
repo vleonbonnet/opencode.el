@@ -91,6 +91,10 @@ them avoids an expensive fallback search on every redisplay."
 (defvar opencode-session-buffers (make-hash-table :test #'equal)
   "Session IDs mapped to their live session buffers.")
 
+(defvar opencode-session-buffer-functions nil
+  "Functions called with a session ID after its buffer registration changes.
+They run in the session buffer, after it is registered or unregistered.")
+
 (defvar-local opencode-session-id nil
   "ID of the session shown in this buffer.")
 
@@ -186,16 +190,38 @@ its names reaches it until it reconnects."
                      (opencode--network-drives)))
       name))
 
+(defvar opencode--directory-names (make-hash-table :test #'equal)
+  "Directory names mapped to (TIME . NORMALIZED), as last resolved.
+Absolute names are keyed as given, relative ones once expanded.")
+
+(defconst opencode--directory-name-ttl 5
+  "Seconds a directory name resolved by `opencode-normalize-directory' is reused.
+Lists of thousands of sessions name a few directories, several times
+per session at every redisplay, and resolving the symbolic links of one
+costs a file system call per component.  A link changed meanwhile is
+seen once this passes.")
+
 (defun opencode-normalize-directory (directory)
   "Return DIRECTORY as a canonical absolute directory name.
 Symbolic links are resolved, so one project reached through two paths
 maps to one location.  On Windows a network share is named by the drive
 mapped to it, as a link to the drive resolves, and the drive letter is
 upcased, as the server spells it: it keys locations by the exact string
-it receives."
-  (opencode--upcase-drive
-   (opencode--mapped-drive-name
-    (file-name-as-directory (file-truename (expand-file-name directory))))))
+it receives.  A name resolved in the last `opencode--directory-name-ttl'
+seconds is not resolved again."
+  (let* ((name (if (file-name-absolute-p directory) directory (expand-file-name directory)))
+         (now (float-time))
+         (known (gethash name opencode--directory-names)))
+    (if (and known (< (abs (- now (car known))) opencode--directory-name-ttl))
+        (cdr known)
+      (let ((normalized (opencode--upcase-drive
+                         (opencode--mapped-drive-name
+                          (file-name-as-directory (file-truename (expand-file-name name)))))))
+        ;; Directories visited once would otherwise accumulate.
+        (when (> (hash-table-count opencode--directory-names) 1000)
+          (clrhash opencode--directory-names))
+        (puthash name (cons now normalized) opencode--directory-names)
+        normalized))))
 
 (defun opencode-directory-name (directory)
   "Return DIRECTORY as the server names it: normalized, with no trailing slash.

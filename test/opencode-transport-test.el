@@ -359,5 +359,46 @@ Any request starts a service by itself, and open buffers must not go stale."
       (opencode-test-wait-for (lambda () (= connected 2)) 15)
       (should (opencode-events-connected-p)))))
 
+(ert-deftest opencode-test-registry-pages-over-http ()
+  "The registry lists every session page by page, ready with the first.
+Each later page's cursor goes alone with the page size."
+  (opencode-test-with-service
+    (let* ((count 600)
+           (infos (vconcat (mapcar (lambda (number)
+                                     `((id . ,(format "ses_%04d" number)) (title . ,(format "Session %d" number))
+                                       (time (created . ,(- 1792531215759 number))
+                                             (updated . ,(- 1792531215759 number)))
+                                       (location (directory . ,(directory-file-name opencode-test-workspace)))))
+                                   (number-sequence 1 count))))
+           (queries nil)
+           (ready nil))
+      (setf (opencode-test-service-routes opencode-test-service)
+            (list (cons "/api/session"
+                        (lambda (request)
+                          (let* ((query (url-parse-query-string (or (cadr (split-string (plist-get request :path) "?"))
+                                                                    "")))
+                                 (cursor (cadr (assoc "cursor" query)))
+                                 (limit (string-to-number (cadr (assoc "limit" query))))
+                                 ;; The first page's cursor back to newer sessions finds none.
+                                 (start (cond ((null cursor) 0)
+                                              ((string-prefix-p "next-" cursor) (string-to-number (substring cursor 5)))
+                                              (t count)))
+                                 (end (min count (+ start limit))))
+                            (push (reverse query) queries)
+                            (cons 200 `((data . ,(seq-subseq infos start end))
+                                        (cursor (previous . ,(format "previous-%d" start))
+                                                (next . ,(format "next-%d" end))))))))
+                  (cons "/api/session/active" (lambda (_) '(200 . ((data . nil)))))))
+      (opencode-state-ensure (lambda () (setq ready (length (opencode-state-sessions)))))
+      (opencode-test-wait-for #'opencode-state-loaded-p 20)
+      (should (= ready opencode-state--page-size))
+      (should (= (length (opencode-state-sessions)) count))
+      (should (equal (plist-get (opencode-state-get "ses_0600") :title) "Session 600"))
+      (should (equal (reverse queries)
+                     '((("archived" "false") ("order" "desc") ("limit" "250"))
+                       (("cursor" "next-250") ("limit" "250"))
+                       (("cursor" "next-500") ("limit" "250"))
+                       (("cursor" "previous-0") ("limit" "250"))))))))
+
 (provide 'opencode-transport-test)
 ;;; opencode-transport-test.el ends here

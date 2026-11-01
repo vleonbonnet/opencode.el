@@ -161,6 +161,11 @@ The service refuses message pages asked for so."
    (list 'get "\\`/api/command\\'" (lambda (_) (opencode-test-fixture "command.json")))
    (list t "" (lambda (_) '((data))))))
 
+(defvar opencode-test-deferred nil
+  "Answers held back under `opencode-test-with-server', oldest first.
+A route defers its answer by returning (:defer . FUNCTION): FUNCTION
+returns the answer once `opencode-test-release' releases it.")
+
 (defun opencode-test--request (method path &rest arguments)
   "Answer METHOD on PATH with ARGUMENTS from `opencode-test-routes'."
   (let* ((query (plist-get arguments :query))
@@ -178,16 +183,28 @@ The service refuses message pages asked for so."
              (response (funcall (caddr route) request))
              (then (or (plist-get arguments :then) #'ignore))
              (else (plist-get arguments :else)))
-        (cl-flet ((deliver (function value)
-                    (if (null buffer)
-                        (funcall function value)
-                      (when (buffer-live-p buffer)
-                        (with-current-buffer buffer (funcall function value))))))
-          (if (eq (car-safe response) :error)
-              (let ((error (opencode-error--make :status (nth 1 response) :message (nth 2 response)
-                                                 :method method :path path)))
-                (if else (deliver else error) (error "%s" (opencode-error-describe error))))
-            (deliver then response)))))))
+        (cl-labels ((deliver (function value)
+                      (if (null buffer)
+                          (funcall function value)
+                        (when (buffer-live-p buffer)
+                          (with-current-buffer buffer (funcall function value)))))
+                    (answer (response)
+                      (if (eq (car-safe response) :error)
+                          (let ((error (opencode-error--make :status (nth 1 response) :message (nth 2 response)
+                                                             :method method :path path)))
+                            (if else (deliver else error) (error "%s" (opencode-error-describe error))))
+                        (deliver then response))))
+          (if (eq (car-safe response) :defer)
+              (setq opencode-test-deferred
+                    (append opencode-test-deferred
+                            (list (lambda () (answer (funcall (cdr response)))))))
+            (answer response)))))))
+
+(defun opencode-test-release ()
+  "Deliver the oldest answer held back, returning non-nil when there was one."
+  (when-let* ((answer (pop opencode-test-deferred)))
+    (funcall answer)
+    t))
 
 (defvar opencode-test-notifications nil
   "Notifications shown under `opencode-test-with-server', newest first.")
@@ -206,6 +223,12 @@ The service refuses message pages asked for so."
          (opencode-state--generation 0)
          (opencode-state--held nil)
          (opencode-state--fetching (make-hash-table :test #'equal))
+         (opencode-state--current (make-hash-table :test #'equal))
+         (opencode-state--listing nil)
+         (opencode-state--loaded nil)
+         (opencode-state--list-timer nil)
+         (opencode-state--list-delay 1)
+         (opencode-state--batch nil)
          (opencode-state--waiters nil)
          (opencode-state--wanted nil)
          (opencode-state--retry-timer nil)
@@ -222,7 +245,7 @@ The service refuses message pages asked for so."
          (opencode-state--cache-unsupported nil))
      (unwind-protect (progn ,@body)
        (dolist (timer (list opencode-state--retry-timer opencode-state--cache-timer
-                            opencode-state--context-timer))
+                            opencode-state--context-timer opencode-state--list-timer))
          (when (timerp timer)
            (cancel-timer timer))))))
 
@@ -234,6 +257,7 @@ session registry starts empty and follows events once a test dispatches
   (declare (indent 0) (debug t))
   `(opencode-test-with-state
      (let ((opencode-test-requests nil)
+           (opencode-test-deferred nil)
            (opencode-test-routes (opencode-test-default-routes))
            (opencode-session-buffers (make-hash-table :test #'equal))
            (opencode--projects nil)
