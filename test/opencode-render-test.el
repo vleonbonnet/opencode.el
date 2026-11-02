@@ -71,5 +71,39 @@
                                (invisible-p position)))
                         (number-sequence (point-min) (1- prompt)))))))
 
+(ert-deftest opencode-test-kept-display-survives-fontification ()
+  "A display kept by `opencode-keep-display' outlasts fontification, which drops any other."
+  (opencode-test-with-input
+    (let ((inhibit-read-only t)
+          (spacer '(space :width (5))))
+      (goto-char (point-min))
+      (insert "kept: x\nlost: x\n")
+      (put-text-property 6 7 'display spacer)
+      (put-text-property 14 15 'display spacer)
+      (opencode-keep-display 1 9)
+      (opencode-mark-fontify 1 17 'verbatim)
+      (font-lock-fontify-region (point-min) (point-max))
+      (should (equal (get-text-property 6 'display) spacer))
+      (should-not (get-text-property 14 'display))
+      (should-not (text-property-not-all 7 17 'opencode-display nil))
+      ;; Keeping again forgets a display since removed.
+      (remove-text-properties 1 9 '(display nil))
+      (opencode-keep-display 1 9)
+      (font-lock-fontify-region (point-min) (point-max))
+      (should-not (text-property-not-all 1 17 'display nil)))))
+
+(ert-deftest opencode-test-kept-display-not-typed-on ()
+  "Text typed right after a kept display does not take it on."
+  (opencode-test-with-input
+    (let ((pmark (opencode-pmark))
+          (spacer '(space :width (5))))
+      (opencode-test-self-insert "a")
+      (with-silent-modifications
+        (put-text-property pmark (1+ pmark) 'display spacer))
+      (opencode-keep-display pmark (1+ pmark))
+      (opencode-test-self-insert "b")
+      (should (equal (get-text-property pmark 'opencode-display) spacer))
+      (should-not (get-text-property (1+ pmark) 'opencode-display)))))
+
 (provide 'opencode-render-test)
 ;;; opencode-render-test.el ends here

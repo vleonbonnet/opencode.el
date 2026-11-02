@@ -36,7 +36,10 @@
 ;; nothing (Org link brackets), and `link' text gets the link face on
 ;; top.  markdown-ts also turns links it parses into buttons, overwriting
 ;; any action already there, so buttons made with `opencode-make-button'
-;; keep their properties in `opencode-button', reasserted by that pass.
+;; keep their properties in `opencode-button', reasserted by that pass,
+;; and a layout drawn with `display', such as a rendered table's
+;; pixel-wide padding, is kept in `opencode-display' by
+;; `opencode-keep-display'.
 
 ;;; Code:
 
@@ -57,13 +60,17 @@ or builds grammars lets the first session on a fresh machine set them up."
   "Function rendering the completed Markdown table between BEG and END.
 It replaces the region in the session buffer and must keep the Comint
 output properties, as `opencode-output-properties' returns them, on
-whatever it inserts.  The default aligns the table's pipes with
-markdown-ts and keeps its markup."
+whatever it inserts.  Font-lock owns `display' in session buffers, so
+a rendering laid out with it keeps it with `opencode-keep-display'.
+The default aligns the table's pipes with markdown-ts and keeps its
+markup."
   :type 'function
   :group 'opencode)
 
 (defcustom opencode-rerender-tables-function nil
-  "Function reflowing rendered tables after a window resize, or nil."
+  "Function reflowing rendered tables after a window resize, or nil.
+Like `opencode-render-table-function', it keeps any `display' it lays
+the tables out with by `opencode-keep-display'."
   :type '(choice (const :tag "Never reflow" nil) function)
   :group 'opencode)
 
@@ -415,10 +422,11 @@ the output FUNCTION writes, as Comint's points do: see
   (ensure-list (get-text-property position 'opencode-fontify)))
 
 (defun opencode-apply-fontify-properties (start end &optional _loudly)
-  "Reassert `opencode-fontify' effects and durable buttons between START and END.
+  "Reassert `opencode-fontify' effects and durable properties between START and END.
 Text may be marked with several kinds, such as a link in verbatim text:
 verbatim and hidden text first lose what Markdown gave them, then links
-get their face."
+get their face.  Displays kept by `opencode-keep-display' and buttons
+made by `opencode-make-button' are put back last."
   (with-silent-modifications
     (let ((pos start))
       (while (< pos end)
@@ -433,6 +441,12 @@ get their face."
             (put-text-property pos next 'display ""))
           (when (memq 'link kinds)
             (add-face-text-property pos next 'link))
+          (setq pos next))))
+    (let ((pos start))
+      (while (< pos end)
+        (let ((next (next-single-property-change pos 'opencode-display nil end)))
+          (when-let* ((display (get-text-property pos 'opencode-display)))
+            (put-text-property pos next 'display display))
           (setq pos next))))
     (let ((pos start))
       (while (< pos end)
@@ -457,6 +471,21 @@ replacing them, as a link does in verbatim text."
                                  (if kinds (append kinds (list kind)) kind)))
             (setq pos next))))))
   (opencode-apply-fontify-properties start end))
+
+(defun opencode-keep-display (start end)
+  "Keep the `display' properties between START and END through fontification.
+Font-lock owns `display' in session buffers, so a layout made with it,
+such as the pixel-wide spaces aligning a rendered table's columns, is
+lost at the next fontification unless recorded here.  Recording again
+forgets what an earlier call kept between START and END."
+  (with-silent-modifications
+    (remove-text-properties start end '(opencode-display nil))
+    (let ((pos start))
+      (while (< pos end)
+        (let ((next (next-single-property-change pos 'display nil end)))
+          (when-let* ((display (get-text-property pos 'display)))
+            (put-text-property pos next 'opencode-display display))
+          (setq pos next))))))
 
 (defun opencode-make-button (start end &rest properties)
   "Make a text button from START to END with PROPERTIES surviving fontification.
@@ -602,9 +631,11 @@ instead of sending the input."
   (setq-local treesit-font-lock-settings (mapcar #'copy-sequence treesit-font-lock-settings))
   (treesit-font-lock-recompute-features nil '(error))
   ;; Typed text inherits from the text before it, and redisplay never
-  ;; fontifies hidden text, so text typed after hidden markup would stay hidden.
+  ;; fontifies hidden text, so text typed after hidden markup would stay
+  ;; hidden; text typed after a kept display would take it on.
   (setq-local text-property-default-nonsticky
-              (append '((invisible . t) (display . t)) text-property-default-nonsticky))
+              (append '((invisible . t) (display . t) (opencode-display . t))
+                      text-property-default-nonsticky))
   (setq-local comint-prompt-read-only t)
   (when opencode-remap-headings
     (dolist (face '(markdown-ts-heading-1 markdown-ts-heading-2 markdown-ts-heading-3
