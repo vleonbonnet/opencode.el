@@ -2067,7 +2067,7 @@ Until then neither is called, so that a caller acts on the outcome only."
                                 (lambda (_) '(:error 409 "Session is busy")))
                           (list 'patch "\\`/api/session/\\(ses_[a-z]+\\)\\'"
                                 (lambda (request)
-                                  (cons :defer (lambda () `((id . ,(plist-get request :match))))))))
+                                  (cons :defer (lambda () `((data (id . ,(plist-get request :match)))))))))
                     opencode-test-routes)))
       (opencode-session-archive "ses_held" nil then else)
       (opencode-session-archive "ses_held" t then else)

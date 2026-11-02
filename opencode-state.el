@@ -524,6 +524,15 @@ the session since."
     (puthash id t opencode-state--current)
     (opencode-state--store id (opencode-state--context-carry entry))))
 
+(defun opencode-state--note-archived (id archived)
+  "Record that the service archived session ID at ARCHIVED, or restored it when nil.
+ARCHIVED is in float seconds.  For the answer to a request archiving or
+restoring the session, which may come before the event saying so; the
+event then changes nothing.  A session the registry does not hold is
+left alone."
+  (when-let* ((entry (opencode-state-get id)))
+    (opencode-state--store id (plist-put (copy-sequence entry) :archived archived))))
+
 (defun opencode-state--apply (entry event replay)
   "Return ENTRY, a fresh copy of a registry entry, updated by EVENT.
 REPLAY means ENTRY was fetched after EVENT may have happened: an end of

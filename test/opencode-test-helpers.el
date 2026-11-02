@@ -340,6 +340,7 @@ session registry starts empty and follows events once a test dispatches
              (opencode-test-deferred nil)
              (opencode-test-routes (opencode-test-default-routes))
              (opencode-session-buffers (make-hash-table :test #'equal))
+             (opencode--restores (make-hash-table :test #'equal))
              ;; Answers come synchronously, and so does the transcript.
              (opencode-replay-slice nil)
              (opencode--resync-epoch 0)
