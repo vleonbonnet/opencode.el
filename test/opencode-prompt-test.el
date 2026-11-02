@@ -43,6 +43,7 @@
   (should (equal (opencode-test-own-keys opencode-session-mode-map)
                  (sort (list "/" "<backtab>" "@" "C-c C-o" "M-n" "M-p" "RET" "TAB"
                              "<remap> <comint-clear-buffer>" "<remap> <comint-continue-subjob>"
+                             "<remap> <comint-copy-old-input>" "<remap> <comint-insert-input>"
                              "<remap> <comint-delchar-or-maybe-eof>" "<remap> <comint-delete-output>"
                              "<remap> <comint-interrupt-subjob>" "<remap> <comint-kill-subjob>"
                              "<remap> <comint-quit-subjob>" "<remap> <comint-send-eof>"

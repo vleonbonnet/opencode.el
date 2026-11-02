@@ -92,6 +92,20 @@ Each function receives a plist (:kind :text :name) and may return
   :type 'hook
   :group 'opencode)
 
+(defcustom opencode-old-input-function nil
+  "Function given an earlier prompt to edit, or nil to edit it in the input.
+\\<opencode-session-mode-map>\\[opencode-send-input] or \\[opencode-mouse-old-input] on an earlier prompt of a session buffer calls
+it with the prompt's whole text and the session buffer, in that buffer;
+nothing is sent.  The labels of the attachments that can go with a
+prompt again, subagent mentions and files still on disk, carry the
+attachment as their `opencode-sent-attachment' property (see
+`opencode-old-input').  Nil stands for `opencode-put-old-input', which
+puts the text in the session's own input.  Packages that write prompts
+elsewhere, such as drover, set it when it is nil, so that a function
+of the user's own stays."
+  :type '(choice (const :tag "Into the session's input" nil) function)
+  :group 'opencode)
+
 (defvar opencode-step-ended-functions nil
   "Functions called in the session buffer with each `session.step.ended' data.")
 
@@ -635,6 +649,9 @@ first selectable entry of the cached catalog."
   ;; Any key sending input goes through the checks, the archive and the
   ;; attachments, as RET does.
   "<remap> <comint-send-input>" #'opencode-send-input
+  ;; An earlier prompt is edited, whole, never sent as it is.
+  "<remap> <comint-insert-input>" #'opencode-mouse-old-input
+  "<remap> <comint-copy-old-input>" #'opencode-copy-old-input
   ;; C-c C-o opens links, as in Org, instead of deleting the last output.
   "C-c C-o" #'opencode-open-link-at-point
   "/" #'opencode-electric-slash
@@ -1315,13 +1332,29 @@ Input still being typed is lifted out and put back afterwards."
       (set-marker (process-mark process) (opencode--put-back-input pending)))))
 
 (defun opencode--user-message-text (message)
-  "Return the prompt text of user MESSAGE with its attachments named."
+  "Return the prompt text of user MESSAGE with its attachments named.
+The label of a file read from a file URI, and of a subagent mention,
+carries its attachment as its `opencode-sent-attachment' property,
+for the prompt to be edited again with it (see `opencode-old-input');
+a file sent inline carries none, as its data would stay in the buffer."
   (let-alist message
     (string-join
      (delq nil (append (list .text)
-                       (mapcar (lambda (file) (format "`%s`" (or (alist-get 'name file) "file")))
+                       (mapcar (lambda (file)
+                                 (let ((label (format "`%s`" (or (alist-get 'name file) "file")))
+                                       (uri (and (equal (map-nested-elt file '(source type)) "uri")
+                                                 (map-nested-elt file '(source uri)))))
+                                   (if (and (stringp uri) (string-prefix-p "file:" uri))
+                                       (propertize label 'opencode-sent-attachment
+                                                   (list :file `((uri . ,uri)
+                                                                 (name . ,(or (alist-get 'name file) "file")))))
+                                     label)))
                                .files)
-                       (mapcar (lambda (agent) (concat "@" (alist-get 'name agent))) .agents)))
+                       (mapcar (lambda (agent)
+                                 (let ((name (alist-get 'name agent)))
+                                   (propertize (concat "@" name)
+                                               'opencode-sent-attachment (list :agent name))))
+                               .agents)))
      " ")))
 
 (defun opencode--render-assistant-content (message &optional open)
@@ -2795,20 +2828,23 @@ any asynchronous step.  `opencode-before-send-functions' run first."
 Checks run before Comint takes the input, so declining leaves it as typed.
 An archived session is restored from the archive once the checks passed,
 and the input sent once the service restored it; were the restore
-refused, the input stays at the prompt."
+refused, the input stays at the prompt.  On an earlier prompt, nothing
+is sent: the prompt goes, whole, to `opencode-old-input-function', to
+be edited and sent again."
   (interactive)
-  (if (not (and opencode-session-id (get-buffer-process (current-buffer))))
-      (opencode--comint-send)
-    (let ((input (if (>= (point) (opencode-pmark))
-                     (buffer-substring-no-properties (opencode-pmark) (point-max))
-                   (funcall comint-get-old-input))))
-      (cond
-       (opencode--input-awaits-restore
-        (message "The session is being restored from the archive; the input is sent then"))
-       ;; An empty prompt would start a turn about nothing.
-       ((string-blank-p input)
-        (message "Nothing to send"))
-       (t
+  (cond
+   ((not (and opencode-session-id (get-buffer-process (current-buffer))))
+    (opencode--comint-send))
+   ((< (point) (opencode-pmark))
+    (unless (opencode--reuse-old-input (point))
+      (message "Not on an earlier prompt; nothing sent")))
+   (opencode--input-awaits-restore
+    (message "The session is being restored from the archive; the input is sent then"))
+   (t
+    (let ((input (buffer-substring-no-properties (opencode-pmark) (point-max))))
+      (if (string-blank-p input)
+          ;; An empty prompt would start a turn about nothing.
+          (message "Nothing to send")
         (let* ((opencode--send-cancel-quietly nil)
                (decision (opencode-check-send (opencode-input-request input))))
           (if (eq decision 'cancel)
@@ -2817,21 +2853,19 @@ refused, the input stays at the prompt."
             (opencode--send-checked-input (or decision t)))))))))
 
 (defun opencode--send-checked-input (decision)
-  "Have Comint send the input at point, checked with DECISION.
+  "Have Comint send the input at the prompt, checked with DECISION.
 DECISION is t, or the metadata the checks attach.  An archived session
 is restored first: the input waits at the prompt, where it can still
-be edited, and is sent as if RET were pressed again where it was, at
-the prompt or on an earlier input; were the restore refused, it stays."
-  (let ((old (unless (>= (point) (opencode-pmark)) (point-marker)))
-        (delivery opencode-prompt-delivery)
+be edited, and is sent as if RET were pressed again there; were the
+restore refused, it stays."
+  (let ((delivery opencode-prompt-delivery)
         (settled nil))
     (opencode--after-restore
      (lambda ()
        (setq settled t
              opencode--input-awaits-restore nil)
-       (goto-char (or old (max (point) (opencode-pmark))))
-       (when old (set-marker old nil))
-       (if (and (not old) (string-blank-p (buffer-substring-no-properties (opencode-pmark) (point-max))))
+       (goto-char (max (point) (opencode-pmark)))
+       (if (string-blank-p (buffer-substring-no-properties (opencode-pmark) (point-max)))
            (message "Nothing to send")
          (let ((opencode--send-decision decision)
                (opencode-prompt-delivery delivery))
@@ -2839,12 +2873,137 @@ the prompt or on an earlier input; were the restore refused, it stays."
      (lambda (error)
        (setq settled t
              opencode--input-awaits-restore nil)
-       (when old (set-marker old nil))
        (opencode-output-notice
         (concat (opencode--restore-failure error) "; the input is still at the prompt")
         'error)))
     (unless settled
       (setq opencode--input-awaits-restore t))))
+
+;;;; Earlier prompts
+
+(defun opencode--prompt-bounds (position)
+  "Return (START . END) of the earlier prompt at POSITION, or nil.
+POSITION may be at the end of the prompt, where its last line ends."
+  (when-let* ((process (get-buffer-process (current-buffer)))
+              (pmark (marker-position (process-mark process)))
+              ((< position pmark))
+              (at (cond ((get-text-property position 'opencode-prompt) position)
+                        ((and (> position (point-min))
+                              (get-text-property (1- position) 'opencode-prompt))
+                         (1- position)))))
+    (cons (or (previous-single-property-change (1+ at) 'opencode-prompt) (point-min))
+          (next-single-property-change at 'opencode-prompt nil pmark))))
+
+(defun opencode--uri-file (uri)
+  "Return the local file name of file URI, or nil for another URI."
+  (let ((parsed (url-generic-parse-url uri)))
+    (when (and (equal (url-type parsed) "file")
+               (member (url-host parsed) '(nil "" "localhost")))
+      (let ((file (url-unhex-string (car (url-path-and-query parsed)))))
+        ;; A drive letter follows the slash of the path.
+        (if (string-match-p "\\`/[A-Za-z]:" file) (substring file 1) file)))))
+
+(defun opencode--reattachable-p (attachment)
+  "Return non-nil when sent ATTACHMENT can go with a prompt again.
+A subagent mention can; a file can while it is on disk."
+  (or (plist-get attachment :agent)
+      (when-let* ((uri (alist-get 'uri (plist-get attachment :file)))
+                  (file (opencode--uri-file uri)))
+        (file-exists-p file))))
+
+(defun opencode-old-input (&optional position)
+  "Return the text of the earlier prompt at POSITION, or nil when none.
+POSITION defaults to point, and may be at the end of the prompt.  The
+text is the whole prompt, all its lines, without text properties but
+on the labels of the attachments it can take along again: subagent
+mentions, and files still on disk, whose label carries the attachment,
+\(:file URI-ALIST) or (:agent NAME), as its `opencode-sent-attachment'
+property.  The labels of other attachments, such as a buffer or region
+sent inline, are text."
+  (when-let* ((bounds (opencode--prompt-bounds (or position (point)))))
+    (pcase-let* ((`(,start . ,end) bounds)
+                 (text (string-trim-right (buffer-substring-no-properties start end)))
+                 (limit (+ start (length text)))
+                 (pos start))
+      (while (< pos limit)
+        (let ((attachment (get-text-property pos 'opencode-sent-attachment))
+              (next (next-single-property-change pos 'opencode-sent-attachment nil limit)))
+          (when (and attachment (opencode--reattachable-p attachment))
+            (put-text-property (- pos start) (- next start) 'opencode-sent-attachment attachment text))
+          (setq pos next)))
+      text)))
+
+(defun opencode--reuse-old-input (position)
+  "Give the earlier prompt at POSITION to `opencode-old-input-function'.
+Return non-nil when there is one."
+  (when-let* ((text (opencode-old-input position)))
+    (funcall (or opencode-old-input-function #'opencode-put-old-input) text (current-buffer))
+    t))
+
+(defun opencode--insert-old-input (text)
+  "Insert TEXT, as `opencode-old-input' returns it, at point in the input.
+Its labels carrying an attachment stand for it again, as typed ones do."
+  (let ((pos 0)
+        (length (length text)))
+    (while (< pos length)
+      (let ((attachment (get-text-property pos 'opencode-sent-attachment text))
+            (next (or (next-single-property-change pos 'opencode-sent-attachment text) length)))
+        (if attachment
+            (opencode--insert-attachment
+             (string-remove-prefix "`" (string-remove-suffix "`" (substring-no-properties text pos next)))
+             ;; Each label drops its own attachment.
+             (copy-tree attachment))
+          (insert (substring-no-properties text pos next)))
+        (setq pos next)))))
+
+(defun opencode-put-old-input (text buffer)
+  "Put TEXT, an earlier prompt of session BUFFER, in BUFFER's input.
+TEXT is as `opencode-old-input' returns it: its labels carrying an
+attachment stand for it again.  A blank input is replaced; input typed
+already stays, TEXT following it after a blank line, which the echo
+area tells.  Point goes to the end of TEXT.  Nothing is sent.  This is
+what nil stands for in `opencode-old-input-function'."
+  (with-current-buffer buffer
+    (let* ((pmark (opencode-pmark))
+           (draft (not (string-blank-p (buffer-substring-no-properties pmark (point-max))))))
+      (if draft
+          (progn
+            (goto-char (point-max))
+            (insert (cond ((string-suffix-p "\n\n" (buffer-substring-no-properties pmark (point))) "")
+                          ((eq (char-before) ?\n) "\n")
+                          (t "\n\n"))))
+        (delete-region pmark (point-max))
+        (goto-char pmark))
+      (opencode--insert-old-input text)
+      (when draft
+        (message "The earlier prompt follows the input already typed")))))
+
+(defun opencode-mouse-old-input (event)
+  "Edit the earlier prompt clicked, as RET on it does.
+The prompt goes, whole, to `opencode-old-input-function'; nothing is
+sent.  Elsewhere, Comint's `comint-insert-input' runs, which falls back
+to the global binding of the click.  EVENT is the click."
+  (interactive "e")
+  (let* ((end (event-end event))
+         (window (posn-window end))
+         (position (posn-point end)))
+    (if (and (windowp window) (integerp position)
+             (with-current-buffer (window-buffer window)
+               (and (derived-mode-p 'opencode-session-mode)
+                    (opencode--prompt-bounds position))))
+        (with-selected-window window
+          (opencode--reuse-old-input position))
+      (comint-insert-input event))))
+
+(defun opencode-copy-old-input ()
+  "Put the earlier prompt at point, whole, in the input, to be edited.
+This is `opencode-put-old-input' whatever `opencode-old-input-function'
+says.  Elsewhere in the transcript, Comint's `comint-copy-old-input'
+copies the line at point."
+  (interactive)
+  (if-let* ((text (opencode-old-input)))
+      (opencode-put-old-input text (current-buffer))
+    (comint-copy-old-input)))
 
 (defun opencode-queue-input ()
   "Send the input at the prompt to start after the running turn, not steer it."
@@ -2884,10 +3043,13 @@ the service delivers it, which reverting and forking at point need; a
 shell command makes no prompt, only a shell message and its result,
 which like other messages between prompts never start a cut.  The
 prompt's attachments are those whose labels the input held; Comint
-leaves their overlays emptied, which go."
+leaves their overlays emptied, which go, the labels' text keeping the
+attachments that can go with a prompt again (see
+`opencode--mark-sent-attachments')."
   (opencode-highlight-input)
   (opencode-output "\n")
   (opencode--forget-attachment-labels comint-last-input-start comint-last-input-end)
+  (opencode--mark-sent-attachments comint-last-input-start comint-last-input-end)
   (let* ((opencode--sending-input nil)
          (request (opencode-input-request string))
          (string (plist-get request :text))
@@ -2921,6 +3083,25 @@ Comint taking the input to send it leaves them there, emptied."
   (dolist (overlay (overlays-in start end))
     (when (overlay-get overlay 'opencode-attachment)
       (delete-overlay overlay))))
+
+(defun opencode--mark-sent-attachments (start end)
+  "Mark the labels of the input sent from START to END with their attachments.
+The labels are those of `opencode--input-sent', the input as it was
+before Comint took it.  A subagent mention, or a file read from a file
+URI, goes on its label's text as its `opencode-sent-attachment'
+property, for the prompt to be edited again with it, as the transcript
+rendered from the server gives it (see `opencode--user-message-text');
+a file sent inline does not, as its data would stay in the buffer."
+  (when-let* ((input (plist-get opencode--input-sent :text))
+              ((<= (+ start (length input)) end))
+              ((string= (substring-no-properties input)
+                        (buffer-substring-no-properties start (+ start (length input))))))
+    (with-silent-modifications
+      (pcase-dolist (`(,from ,to ,attachment ,_display) (plist-get opencode--input-sent :labels))
+        (when (or (plist-get attachment :agent)
+                  (when-let* ((uri (alist-get 'uri (plist-get attachment :file))))
+                    (opencode--uri-file uri)))
+          (put-text-property (+ start from) (+ start to) 'opencode-sent-attachment attachment))))))
 
 (defun opencode--in-attachment-p ()
   "Return non-nil when point is inside an attachment label."
