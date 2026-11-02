@@ -11,12 +11,18 @@
 
 ;; `opencode-test-with-service' runs a local HTTP server standing for the
 ;; OpenCode service, registered in a temporary service.json, so requests
-;; go through curl and plz as they do against the real service.  Routes
-;; answer JSON, or a string as it is, or never when they answer `hang';
+;; go over sockets as they do against the real service.  Routes answer
+;; JSON, or a string as it is, or never when they answer `hang', or
+;; close the connection without answering when they answer `close';
 ;; `/api/info' reports the registered process ID, and `/api/event' keeps
-;; its connection open for `opencode-test-send-event'.  The CLI is
-;; stood for by `opencode-test-with-cli'.  The server listens on IPv4
-;; only: Winsock's IPv6 loopback is unreliable here.
+;; its connection open for `opencode-test-send-event'.  Connections stay
+;; open between requests, as Node's server keeps them, unless the
+;; service's KEEP-ALIVE is nil; answers are framed by Content-Length, or
+;; in chunks of CHUNKED bytes when that is a number, and are written
+;; SPLIT bytes at a time, a timer apart, when that is a number, so that
+;; Emacs reads them in pieces.  The CLI is stood for by
+;; `opencode-test-with-cli'.  The server listens on IPv4 only: Winsock's
+;; IPv6 loopback is unreliable here.
 
 ;;; Code:
 
@@ -24,7 +30,8 @@
 
 (cl-defstruct (opencode-test-service (:constructor opencode-test-service--make))
   server port password (pid 4242) registration
-  (info-status 200) routes requests streams held)
+  (info-status 200) routes requests streams held
+  (keep-alive t) chunked split)
 
 (defvar opencode-test-service nil
   "The fake service of the running test.")
@@ -43,17 +50,61 @@
                (pid . ,(opencode-test-service-pid service))
                (password . ,(opencode-test-service-password service)))))))
 
-(defun opencode-test--respond (connection status body &optional content-type)
-  "Answer CONNECTION with STATUS and BODY, then close it."
-  (let ((payload (encode-coding-string (or body "") 'utf-8)))
-    (process-send-string
+(defun opencode-test--chunk (bytes)
+  "Return BYTES as one chunk of a chunked body."
+  (format "%x\r\n%s\r\n" (length bytes) bytes))
+
+(defun opencode-test--write (connection bytes &optional close)
+  "Write BYTES on CONNECTION, then close it when CLOSE.
+With the service's SPLIT, they go a few at a time, a timer apart."
+  (let ((split (and opencode-test-service (opencode-test-service-split opencode-test-service))))
+    (if (not split)
+        (progn
+          (when (process-live-p connection)
+            (process-send-string connection bytes))
+          (when (and close (process-live-p connection))
+            (delete-process connection)))
+      (let ((queue (process-get connection 'output-queue)))
+        (process-put connection 'output-queue
+                     (append queue (list (cons bytes close))))
+        (unless queue
+          (opencode-test--write-next connection split))))))
+
+(defun opencode-test--write-next (connection split)
+  "Write the next SPLIT bytes queued for CONNECTION."
+  (when-let* ((entry (car (process-get connection 'output-queue))))
+    (let ((bytes (car entry)))
+      (when (process-live-p connection)
+        (process-send-string connection (substring bytes 0 (min split (length bytes)))))
+      (if (> (length bytes) split)
+          (setcar entry (substring bytes split))
+        (process-put connection 'output-queue (cdr (process-get connection 'output-queue)))
+        (when (and (cdr entry) (process-live-p connection))
+          (delete-process connection)))
+      (when (process-get connection 'output-queue)
+        (run-at-time 0.001 nil #'opencode-test--write-next connection split)))))
+
+(defun opencode-test--respond (connection status body &optional content-type close)
+  "Answer CONNECTION with STATUS and BODY, keeping it open as the service does.
+CLOSE, or a service without keep-alive, closes it after the answer."
+  (let* ((payload (encode-coding-string (or body "") 'utf-8))
+         (service opencode-test-service)
+         (close (or close (not (and service (opencode-test-service-keep-alive service)))))
+         (chunked (and service (opencode-test-service-chunked service))))
+    (opencode-test--write
      connection
      (concat (format "HTTP/1.1 %d %s\r\n" status (if (< status 400) "OK" "Error"))
              (format "Content-Type: %s\r\n" (or content-type "application/json"))
-             (format "Content-Length: %d\r\n" (length payload))
-             "Connection: close\r\n\r\n"
-             payload))
-    (delete-process connection)))
+             (if chunked
+                 "Transfer-Encoding: chunked\r\n"
+               (format "Content-Length: %d\r\n" (length payload)))
+             (if close "Connection: close\r\n" "Connection: keep-alive\r\nKeep-Alive: timeout=5\r\n")
+             "\r\n"
+             (if chunked
+                 (concat (mapconcat #'opencode-test--chunk (seq-partition payload chunked) "")
+                         "0\r\n\r\n")
+               payload))
+     close)))
 
 (defun opencode-test--authorized-p (service headers)
   "Return non-nil when HEADERS carry SERVICE's credentials."
@@ -62,7 +113,7 @@
                            (concat "opencode:" (opencode-test-service-password service)) t))))
 
 (defun opencode-test--handle (service connection request)
-  "Answer REQUEST, a plist (:method :path :headers :body), on CONNECTION."
+  "Answer REQUEST, a plist (:method :path :headers :body :connection), on CONNECTION."
   (push request (opencode-test-service-requests service))
   (let ((path (car (split-string (plist-get request :path) "?"))))
     (cond
@@ -75,9 +126,14 @@
                                 (json-serialize `((pid . ,(opencode-test-service-pid service))
                                                   (version . "2.0.0-test"))))))
      ((equal path "/api/event")
-      (process-send-string connection
-                           (concat "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-                                   "Cache-Control: no-cache\r\n\r\n"))
+      (process-put connection 'chunked (opencode-test-service-chunked service))
+      (opencode-test--write connection
+                            (concat "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                                    "Cache-Control: no-cache\r\n"
+                                    (if (process-get connection 'chunked)
+                                        "Transfer-Encoding: chunked\r\n"
+                                      "")
+                                    "\r\n"))
       (push connection (opencode-test-service-streams service))
       (opencode-test-send-event '((type . "server.connected") (data)) connection))
      (t
@@ -85,44 +141,61 @@
                              (opencode-test-service-routes service))))
         (if route
             (pcase-let ((`(,status . ,body) (funcall (cdr route) request)))
-              (if (eq status 'hang)
-                  (push connection (opencode-test-service-held opencode-test-service))
-                (opencode-test--respond connection status
-                                        (if (stringp body) body (json-serialize body)))))
+              (pcase status
+                ('hang (push connection (opencode-test-service-held opencode-test-service)))
+                ('close (delete-process connection))
+                ;; Bytes written as they are, closing the connection.
+                ('raw (opencode-test--write connection body t))
+                (_ (opencode-test--respond connection status
+                                           (if (stringp body) body (json-serialize body))))))
           (opencode-test--respond connection 404 "{\"message\":\"Not found\"}")))))))
 
 (defun opencode-test--filter (service connection output)
-  "Collect OUTPUT of CONNECTION and handle SERVICE's request once complete."
-  (let ((input (concat (or (process-get connection 'input) "") output)))
-    (process-put connection 'input input)
-    (when-let* ((end (string-search "\r\n\r\n" input)))
-      (let* ((lines (split-string (substring input 0 end) "\r\n"))
-             (start (split-string (car lines) " "))
-             (headers (mapcar (lambda (line)
-                                (when (string-match "\\`\\([^:]+\\): *\\(.*\\)\\'" line)
-                                  (cons (downcase (match-string 1 line)) (match-string 2 line))))
-                              (cdr lines)))
-             (length (string-to-number (or (cdr (assoc "content-length" headers)) "0")))
-             (body (substring input (+ end 4))))
-        (when (and (>= (string-bytes body) length) (not (process-get connection 'handled)))
-          (process-put connection 'handled t)
-          (opencode-test--handle service connection
-                                 (list :method (car start) :path (cadr start) :headers headers
-                                       :body (decode-coding-string body 'utf-8))))))))
+  "Collect OUTPUT of CONNECTION and handle each of SERVICE's requests once complete.
+A connection kept open carries one request after another."
+  (let ((input (concat (or (process-get connection 'input) "") output))
+        (done nil))
+    (while (not done)
+      (setq done t)
+      (when-let* ((end (string-search "\r\n\r\n" input)))
+        (let* ((lines (split-string (substring input 0 end) "\r\n"))
+               (start (split-string (car lines) " "))
+               (headers (mapcar (lambda (line)
+                                  (when (string-match "\\`\\([^:]+\\): *\\(.*\\)\\'" line)
+                                    (cons (downcase (match-string 1 line)) (match-string 2 line))))
+                                (cdr lines)))
+               (length (string-to-number (or (cdr (assoc "content-length" headers)) "0")))
+               (body-start (+ end 4)))
+          (when (>= (- (length input) body-start) length)
+            (let ((body (substring input body-start (+ body-start length))))
+              (setq input (substring input (+ body-start length))
+                    done nil)
+              (process-put connection 'input input)
+              (opencode-test--handle service connection
+                                     (list :method (car start) :path (cadr start) :headers headers
+                                           :body (decode-coding-string body 'utf-8)
+                                           :connection connection)))))))
+    (process-put connection 'input input)))
+
+(defun opencode-test--stream-write (stream text)
+  "Write TEXT on STREAM, in a chunk of its own when the stream is chunked."
+  (when (process-live-p stream)
+    (let ((bytes (encode-coding-string text 'utf-8)))
+      (opencode-test--write stream (if (process-get stream 'chunked)
+                                       (opencode-test--chunk bytes)
+                                     bytes)))))
 
 (defun opencode-test-send-event (event &optional connection)
   "Send EVENT as one SSE frame on CONNECTION, else on every open stream."
   (let ((frame (concat "data: " (json-serialize event) "\n\n")))
     (dolist (stream (if connection (list connection)
                       (opencode-test-service-streams opencode-test-service)))
-      (when (process-live-p stream)
-        (process-send-string stream (encode-coding-string frame 'utf-8))))))
+      (opencode-test--stream-write stream frame))))
 
 (defun opencode-test-send-raw (text)
   "Send TEXT unchanged on every open stream."
   (dolist (stream (opencode-test-service-streams opencode-test-service))
-    (when (process-live-p stream)
-      (process-send-string stream (encode-coding-string text 'utf-8)))))
+    (opencode-test--stream-write stream text)))
 
 (defun opencode-test-close-streams ()
   "Close every open event stream, as a restarting service would."
@@ -134,7 +207,7 @@
   "Close every open event stream without Emacs noticing.
 That leaves the stream wanted, closed and with no reconnection pending,
 which nothing should cause but which an unnoticed death of its curl
-process did."
+process once did."
   (cl-letf (((symbol-function 'opencode-events--closed) #'ignore))
     (opencode-test-close-streams)
     (opencode-test-wait-for (lambda () (not (opencode-events-connected-p))))
@@ -144,9 +217,36 @@ process did."
   (should-not (timerp opencode-events--reconnect-timer)))
 
 (defun opencode-test-request-buffers ()
-  "Return the live buffers of curl processes `plz' started, and of their error output."
-  (seq-filter (lambda (buffer) (string-prefix-p " *plz-request-curl" (buffer-name buffer)))
+  "Return the live buffers of requests and streams.
+Those of connections kept idle for later requests are left out: there
+are a few at most."
+  (seq-filter (lambda (buffer)
+                (or (string-prefix-p " *opencode-events*" (buffer-name buffer))
+                    (and (string-prefix-p " *opencode-transport*" (buffer-name buffer))
+                         (not (when-let* ((connection (get-buffer-process buffer)))
+                                (and (process-live-p connection)
+                                     (null (process-get connection 'opencode-transport-exchange))))))))
               (buffer-list)))
+
+(defun opencode-test-session-stand-in (id)
+  "Return a new buffer standing for the buffer of session ID."
+  (let ((buffer (generate-new-buffer " *opencode-test-session*")))
+    (with-current-buffer buffer
+      (setq-local opencode-session-id id))
+    buffer))
+
+(defun opencode-test-requests-on (path)
+  "Return the requests the fake service received on PATH, oldest first."
+  (reverse (seq-filter (lambda (request) (equal (car (split-string (plist-get request :path) "?")) path))
+                       (opencode-test-service-requests opencode-test-service))))
+
+(defun opencode-test-requests-in-flight-p ()
+  "Return non-nil while a connection carries a request, the event stream's aside."
+  (seq-some (lambda (connection)
+              (when-let* ((exchange (process-get connection 'opencode-transport-exchange)))
+                (and (process-live-p connection)
+                     (not (eq exchange opencode-events--stream)))))
+            (process-list)))
 
 (defun opencode-test-restart-service (password)
   "Make the fake service a new process, registered with PASSWORD."
@@ -216,7 +316,8 @@ accepting after a few connections, so one server serves the whole run.")
           (opencode-service--import-checked nil)
           (opencode-command "opencode-test-missing-cli")
           (opencode-events--handlers (copy-hash-table opencode-events--handlers))
-          (opencode-events--process nil)
+          (opencode-events--stream nil)
+          (opencode-transport--idle (make-hash-table :test #'equal))
           (opencode-events--wanted nil)
           (opencode-events--closed-for-stop nil)
           (opencode-events--opening nil)
@@ -238,12 +339,9 @@ accepting after a few connections, so one server serves the whole run.")
        ;; Requests still in flight, such as those a reconnection sends,
        ;; would otherwise report their outcome during a later test.
        (let ((deadline (+ (float-time) 5)))
-         (while (and (< (float-time) deadline)
-                     (seq-some (lambda (process)
-                                 (and (process-live-p process)
-                                      (string-prefix-p "plz-request-curl" (process-name process))))
-                               (process-list)))
+         (while (and (< (float-time) deadline) (opencode-test-requests-in-flight-p))
            (accept-process-output nil 0.05)))
+       (opencode-transport-close-idle)
        (delete-directory directory t))))
 
 (provide 'opencode-test-server)

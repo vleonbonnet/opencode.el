@@ -11,12 +11,15 @@
 
 ;; Usage: emacs -Q --batch -L . -L test -L DEPS... -l dev/contract/record-requests.el OUT
 ;;
-;; Runs the ERT suite with the fake service's entry point advised to log
-;; each request to OUT as a JSON line: method, path, the query as
-;; `opencode-request' puts it in the URL (nil values dropped, values
-;; formatted with %s), the body as `opencode-request' encodes it, and the
-;; test making it.  validate.ts then checks them against the service's
-;; API document, which the fake service does not know.
+;; Runs the ERT suite with the fake service's entry points advised to
+;; log each request to OUT as a JSON line: method, path, query, body and
+;; the test making it.  Session tests answer `opencode-request' without
+;; a connection: their query is as `opencode-request' puts it in the URL
+;; (nil values dropped, values formatted with %s), their body as it
+;; encodes it.  Requests that reach the fake HTTP service are logged as
+;; they arrive, decoded from the wire, so that what the HTTP client
+;; sends is checked too.  validate.ts then checks them against the
+;; service's API document, which the fake service does not know.
 
 ;;; Code:
 
@@ -53,10 +56,32 @@
                (encoded `((encodeError . ,(plist-get encoded :encode-error)))))
        (test . ,(format "%s" (and (ert-running-test) (ert-test-name (ert-running-test)))))))))
 
+(defun record-requests--wire-entry (request)
+  "Return the JSON line for REQUEST as the fake HTTP service received it."
+  (pcase-let* ((`(,path ,query) (split-string (plist-get request :path) "?"))
+               (body (plist-get request :body)))
+    (json-serialize
+     `((method . ,(plist-get request :method))
+       (path . ,(url-unhex-string path))
+       (query . ,(if query
+                     (mapcar (lambda (pair)
+                               (cons (intern (car pair))
+                                     (decode-coding-string (url-unhex-string (or (cadr pair) "")) 'utf-8)))
+                             (url-parse-query-string query))
+                   (make-hash-table)))
+       ,@(unless (string-empty-p body) `((body . ,body)))
+       (wire . t)
+       (test . ,(format "%s" (and (ert-running-test) (ert-test-name (ert-running-test)))))))))
+
 (write-region "" nil record-requests-file nil 'silent)
 (advice-add 'opencode-test--request :before
             (lambda (method path &rest arguments)
               (write-region (concat (record-requests--entry method path arguments) "\n")
+                            nil record-requests-file t 'silent)))
+
+(advice-add 'opencode-test--handle :before
+            (lambda (_service _connection request)
+              (write-region (concat (record-requests--wire-entry request) "\n")
                             nil record-requests-file t 'silent)))
 
 (ert-run-tests-batch-and-exit)

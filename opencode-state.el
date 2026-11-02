@@ -309,7 +309,7 @@ It then holds the newest sessions and the running ones, and follows
 events; the older sessions may still be listed (see
 `opencode-state-loaded-p')."
   (and opencode-state--ready
-       (eq opencode-state--stream opencode-events--process)
+       (eq opencode-state--stream opencode-events--stream)
        (opencode-events-connected-p)))
 
 (defun opencode-state-loaded-p ()
@@ -896,7 +896,7 @@ REPLAY is passed to `opencode-state--apply'."
 Events received while bootstrapping wait for the bootstrap; before the
 registry was ever bootstrapped on this stream there is nothing to apply
 them to, and the next bootstrap covers them."
-  (when (eq opencode-state--stream opencode-events--process)
+  (when (eq opencode-state--stream opencode-events--stream)
     (when-let* ((id (opencode-state--event-session event))
                 ;; Forms of no session belong to no entry.
                 ((not (equal id "global"))))
@@ -958,7 +958,7 @@ Then list the other sessions from LISTING, a plist (:next :previous
                    (when (eq opencode-state--retry-timer timer)
                      (setq opencode-state--retry-timer nil)
                      (when (and (eq stream opencode-state--stream)
-                                (eq stream opencode-events--process)
+                                (eq stream opencode-events--stream)
                                 (opencode-events-connected-p)
                                 (not opencode-state--bootstrapping)
                                 (not opencode-state--ready))
@@ -1197,7 +1197,7 @@ Until the listing that follows a bootstrap ends, its end does.  For
   "Bootstrap the registry and list the expiries on the stream that just (re)connected.
 A service restarted meanwhile, maybe another build, may list expiries
 the previous one could not."
-  (setq opencode-state--stream opencode-events--process
+  (setq opencode-state--stream opencode-events--stream
         opencode-state--cache-unsupported nil
         opencode-state--cache-held nil)
   (opencode-state--bootstrap)
@@ -1217,11 +1217,11 @@ registry missed, having been loaded after it."
     (when callback (push callback opencode-state--waiters))
     (when (opencode-events-connected-p)
       (cond
-       ((eq opencode-state--stream opencode-events--process)
+       ((eq opencode-state--stream opencode-events--stream)
         (unless opencode-state--bootstrapping
           (opencode-state--bootstrap)))
-       ((and opencode-events--process
-             (eq opencode-events--greeted opencode-events--process))
+       ((and opencode-events--stream
+             (eq opencode-events--greeted opencode-events--stream))
         (opencode-state--connected nil))))))
 
 (opencode-events-register "server.connected" #'opencode-state--connected)
@@ -1532,7 +1532,7 @@ No timer runs while none is known."
   "Return non-nil when the service can be asked for the expiries now.
 While the stream is down, its reconnection lists them."
   (and (not opencode-state--cache-unsupported)
-       (eq opencode-state--stream opencode-events--process)
+       (eq opencode-state--stream opencode-events--stream)
        (opencode-events-connected-p)))
 
 (defun opencode-state--cache-expired ()
@@ -1593,7 +1593,7 @@ failure keeps the known expiries, and the next one to pass lists again."
 (defun opencode-state--cache-event (event)
   "Apply `session.cache.updated' EVENT when it follows the registry's stream.
 While a listing is in flight, the event waits for its answer."
-  (when (eq opencode-state--stream opencode-events--process)
+  (when (eq opencode-state--stream opencode-events--stream)
     (if opencode-state--cache-listing
         (push event opencode-state--cache-held)
       (opencode-state--cache-apply event)

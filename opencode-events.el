@@ -26,8 +26,10 @@
 ;; reconnect, so `server.connected' is the cue for every module to
 ;; resynchronize from REST.
 ;;
-;; The server fails a subscriber that falls 4096 frames behind, so the
-;; process filter only splits frames and queues them; a zero-delay timer
+;; The stream is a request of `opencode-transport-request' whose body
+;; never ends.  The server fails a subscriber that falls 4096 frames
+;; behind, so the stream's filter only splits frames and queues them,
+;; in a buffer of the stream's own; a zero-delay timer
 ;; dispatches them in time-bounded batches.  The scan resumes where the
 ;; previous chunk ended, so a multi-megabyte frame costs linear time.
 ;;
@@ -48,7 +50,7 @@
 (require 'opencode-common)
 (require 'opencode-http)
 (require 'opencode-service)
-(require 'plz)
+(require 'opencode-transport)
 
 (defcustom opencode-events-dispatch-budget 0.05
   "Seconds spent dispatching queued events before yielding to redisplay."
@@ -66,8 +68,9 @@
 (defvar opencode-events--handlers (make-hash-table :test #'equal)
   "Event types mapped to the list of their handler functions.")
 
-(defvar opencode-events--process nil
-  "Curl process of the event stream.")
+(defvar opencode-events--stream nil
+  "Exchange of the open event stream, an `opencode-transport-exchange', or nil.
+It also names the stream: a stream reopened is another exchange.")
 
 (defvar opencode-events--wanted nil
   "Non-nil while Emacs wants the stream open; nil after a disconnect.")
@@ -119,12 +122,9 @@ Silence before it is no evidence that the stream died.")
   "Hook run, after a stream (re)opens, on its `server.connected' event.")
 
 (defvar opencode-events--greeted nil
-  "Stream process whose `server.connected' event was handled, or nil.")
+  "Stream whose `server.connected' event was handled, or nil.")
 
-(defvar-local opencode-events--body-start nil
-  "Position after the HTTP headers in the stream buffer.")
-
-(defvar-local opencode-events--scanned nil
+(defvar-local opencode-events--scanned 1
   "Position up to which the stream buffer holds no frame terminator.")
 
 (defun opencode-events-register (type function)
@@ -142,7 +142,7 @@ FUNCTION receives the event alist with members `type', `data', `id',
 
 (defun opencode-events-connected-p ()
   "Return non-nil while the event stream is open."
-  (process-live-p opencode-events--process))
+  (opencode-transport-live-p opencode-events--stream))
 
 (defun opencode-event-directory (event)
   "Return the directory EVENT belongs to, normalized, or nil."
@@ -180,30 +180,23 @@ FUNCTION receives the event alist with members `type', `data', `id',
                               :null-object nil :false-object nil))
         (error (message "OpenCode: undecodable event: %s" (error-message-string err)))))))
 
-(defun opencode-events--filter (process output)
-  "Append OUTPUT of stream PROCESS and queue every complete frame."
+(defun opencode-events--filter (buffer output)
+  "Append OUTPUT, bytes of the stream's body, to BUFFER and queue every complete frame."
   (setq opencode-events--last-output (float-time))
-  (when (buffer-live-p (process-buffer process))
-    (with-current-buffer (process-buffer process)
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
       (save-excursion
         (goto-char (point-max))
         (insert output)
-        (unless opencode-events--body-start
-          (goto-char (point-min))
-          ;; curl prints every response's headers; the stream follows the last block.
-          (when (re-search-forward "\r?\n\r?\n" nil t)
-            (setq opencode-events--body-start (point)
-                  opencode-events--scanned (point))))
-        (when opencode-events--body-start
-          (let ((start opencode-events--body-start)
-                (consumed nil))
-            (goto-char (max start (- opencode-events--scanned 3)))
-            (while (re-search-forward "\r?\n\r?\n" nil t)
-              (opencode-events--frame start (match-beginning 0))
-              (setq start (point) consumed t))
-            (when consumed
-              (delete-region opencode-events--body-start start))
-            (setq opencode-events--scanned (point-max))))))))
+        (let ((start (point-min))
+              (consumed nil))
+          (goto-char (max start (- opencode-events--scanned 3)))
+          (while (re-search-forward "\r?\n\r?\n" nil t)
+            (opencode-events--frame start (match-beginning 0))
+            (setq start (point) consumed t))
+          (when consumed
+            (delete-region (point-min) start))
+          (setq opencode-events--scanned (point-max)))))))
 
 ;;;; Dispatch
 
@@ -217,7 +210,7 @@ FUNCTION receives the event alist with members `type', `data', `id',
           (insert (format-time-string "%T ") (or type "?") "\n"))))
     (when (equal type "server.connected")
       (setq opencode-events--backoff 1
-            opencode-events--greeted opencode-events--process))
+            opencode-events--greeted opencode-events--stream))
     (dolist (handler (append (gethash type opencode-events--handlers)
                              (gethash t opencode-events--handlers)))
       (condition-case err
@@ -264,18 +257,17 @@ That is a client of `opencode-events-wanted-functions'."
                          (opencode-events--open))))
     (setq opencode-events--backoff (min 30 (* 2 opencode-events--backoff)))))
 
-(defun opencode-events--closed (process)
-  "Handle the end of stream PROCESS."
-  (when (eq process opencode-events--process)
-    (setq opencode-events--process nil)
+(defun opencode-events--closed (stream)
+  "Handle the end of STREAM."
+  (when (eq stream opencode-events--stream)
+    (setq opencode-events--stream nil)
     (opencode-events--schedule-reconnect)))
 
 (defun opencode-events--drop ()
   "Close the stream, without reopening it."
-  (when-let* ((process opencode-events--process))
-    (setq opencode-events--process nil)
-    (when (process-live-p process)
-      (delete-process process))))
+  (when-let* ((stream opencode-events--stream))
+    (setq opencode-events--stream nil)
+    (opencode-transport-cancel stream)))
 
 (defun opencode-events--note-resumption (now)
   "Note when the watchdog, checking at NOW, could not run for a while.
@@ -318,27 +310,31 @@ session buffers stale."
       (cancel-timer opencode-events--reconnect-timer)
       (setq opencode-events--reconnect-timer nil))
     (setq opencode-events--last-output (float-time))
-    (condition-case err
-        (let (process
-              ;; curl buffers piped output, and decompression holds frames back.
-              (plz-curl-default-args '("--silent" "--no-buffer" "--location")))
-          (setq process
-                (opencode-plz 'get (concat (plist-get connection :url) "/api/event")
-                  :headers `(("Authorization" . ,(opencode-service-authorization connection))
-                             ("Accept" . "text/event-stream"))
-                  :as 'string :noquery t
-                  :filter #'opencode-events--filter
-                  :then (lambda (_) (opencode-events--closed process))
-                  :else (lambda (error)
-                          (when (and (plz-error-response error)
-                                     (eql 401 (plz-response-status (plz-error-response error))))
-                            (setq opencode-service-connection nil))
-                          (opencode-events--closed process))))
-          (setq opencode-events--process process
-                opencode-events--connection connection))
-      (error
-       (message "OpenCode: cannot open the event stream: %s" (error-message-string err))
-       (opencode-events--schedule-reconnect)))))
+    (let ((buffer (generate-new-buffer " *opencode-events*" t))
+          stream)
+      (with-current-buffer buffer
+        (set-buffer-multibyte nil))
+      (cl-flet ((closed ()
+                  (when (buffer-live-p buffer) (kill-buffer buffer))
+                  (opencode-events--closed stream)))
+        (condition-case err
+            (setq stream
+                  (opencode-transport-request
+                   'get (concat (plist-get connection :url) "/api/event")
+                   :headers `(("Authorization" . ,(opencode-service-authorization connection))
+                              ("Accept" . "text/event-stream"))
+                   :filter (lambda (_stream output) (opencode-events--filter buffer output))
+                   :then (lambda (_) (closed))
+                   :else (lambda (failure)
+                           (when (eql 401 (opencode-transport-failure-status failure))
+                             (setq opencode-service-connection nil))
+                           (closed)))
+                  opencode-events--stream stream
+                  opencode-events--connection connection)
+          (error
+           (kill-buffer buffer)
+           (message "OpenCode: cannot open the event stream: %s" (error-message-string err))
+           (opencode-events--schedule-reconnect)))))))
 
 (defun opencode-events--open ()
   "Open the event stream on a ready service, starting one if needed."

@@ -8,7 +8,7 @@
 ;; Maintainer: Valentin Leon <valentin@leon.click>
 ;; Keywords: tools, llm, opencode
 ;; Version: 2.1.0
-;; Package-Requires: ((emacs "31.1") (plz "0.9") (transient "0.7"))
+;; Package-Requires: ((emacs "31.1") (transient "0.7"))
 ;; URL: https://github.com/vleonbonnet/opencode.el
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -39,6 +39,7 @@
 
 (require 'opencode-common)
 (require 'opencode-look)
+(require 'opencode-transport)
 (require 'opencode-service)
 (require 'opencode-http)
 (require 'opencode-events)

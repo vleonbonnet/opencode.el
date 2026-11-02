@@ -831,7 +831,7 @@ in `opencode-test-answered' instead."
     (let* ((parent (opencode-test-scenario "text"))
            (buffer (opencode-test-open-empty parent))
            (opencode-state--ready t)
-           (opencode-state--stream opencode-events--process))
+           (opencode-state--stream opencode-events--stream))
       (puthash parent (list :id parent :running t) opencode-state--sessions)
       (puthash "ses_test_child" (list :id "ses_test_child" :parent-id parent :running t
                                       :requests '((:kind question :id "frm_child" :time 1.0)))
