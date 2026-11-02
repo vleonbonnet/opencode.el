@@ -113,7 +113,7 @@ Each is a plist (:method :path :query :body).")
 (defvar opencode-test-routes nil
   "Route handlers of `opencode-test-with-server'.
 Each is (METHOD REGEXP FUNCTION); FUNCTION receives the request plist
-and returns the decoded response, or (:error STATUS MESSAGE).")
+and returns the decoded response, or (:error STATUS MESSAGE [TAG]).")
 
 (defun opencode-test-requests-to (method suffix)
   "Return the bodies of the METHOD requests whose path ends in SUFFIX, oldest first."
@@ -192,6 +192,7 @@ returns the answer once `opencode-test-release' releases it.")
                     (answer (response)
                       (if (eq (car-safe response) :error)
                           (let ((error (opencode-error--make :status (nth 1 response) :message (nth 2 response)
+                                                             :tag (nth 3 response)
                                                              :method method :path path)))
                             (if else (deliver else error) (error "%s" (opencode-error-describe error))))
                         (deliver then response))))
@@ -289,6 +290,8 @@ They are real timer objects, which `timerp' recognizes, never scheduled."
          (opencode--catalog-refetch (make-hash-table :test #'equal))
          (opencode--catalog-epoch 0)
          (opencode--catalog-generations (make-hash-table :test #'equal))
+         (opencode--missing-locations (make-hash-table :test #'equal))
+         (opencode--missing-reported (make-hash-table :test #'equal))
          (opencode--mode-line-directories nil)
          (opencode--mode-line-timer nil))
      (unwind-protect (progn ,@body)

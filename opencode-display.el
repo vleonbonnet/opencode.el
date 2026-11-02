@@ -148,13 +148,16 @@ ESTIMATED non-nil means TOKENS is an estimate, as after a compaction."
 
 (defun opencode--catalogs-cached-p (directory &rest kinds)
   "Return non-nil when DIRECTORY's catalogs of KINDS are all cached.
-Those that are not are fetched in the background."
+Those that are not are fetched in the background.  A location the
+service said does not exist counts as cached, with empty catalogs, so
+that displays show identifiers rather than nothing."
   (let ((cached t))
-    (dolist (kind kinds cached)
+    (dolist (kind kinds)
       ;; Every missing catalog starts at once, not one per redisplay.
       (opencode-catalog-ensure kind directory)
       (unless (opencode-catalog-cached-p kind directory)
-        (setq cached nil)))))
+        (setq cached nil)))
+    (or cached (opencode-location-missing-p directory))))
 
 (defun opencode--model-short-name (name)
   "Return model NAME without the family prefix every model of it shares."

@@ -242,6 +242,32 @@ the stream reopens or an event says the catalog changed.")
   "Keys an event said changed while their fetch ran, mapped to t.
 That fetch may answer from before the change, so another follows it.")
 
+(defvar opencode--missing-locations (make-hash-table :test #'equal)
+  "Normalized directories the service said do not exist.
+Each maps to t, or to `recheck' once the stream reopened, when displays
+ask for its catalogs once more.  Their catalogs are not asked for again
+until then, or until an event of theirs says a catalog changed; displays
+show identifiers meanwhile.")
+
+(defvar opencode--missing-reported (make-hash-table :test #'equal)
+  "Normalized directories whose absence was logged, mapped to t, so it is once.")
+
+(defun opencode-location-missing-p (&optional directory)
+  "Return non-nil when the service said DIRECTORY does not exist.
+DIRECTORY defaults to `default-directory'.  Displays reading its
+catalogs show identifiers instead; see `opencode-catalog-ensure'."
+  (gethash (opencode-normalize-directory (or directory default-directory))
+           opencode--missing-locations))
+
+(defun opencode-location-not-found-p (error)
+  "Return non-nil when request ERROR says its location does not exist.
+The service answers so a request scoped to a directory that is gone,
+such as a session's worktree deleted since."
+  (and (opencode-error-p error)
+       (or (equal (opencode-error-tag error) "LocationNotFoundError")
+           (and (eql (opencode-error-status error) 404)
+                (string-prefix-p "Location not found" (or (opencode-error-message error) ""))))))
+
 (defvar opencode--catalog-epoch 0
   "Count of stream openings.
 A catalog fetched by a request begun before the latest one stays stale.")
@@ -300,11 +326,12 @@ be computed again when another location's change."
 (defun opencode--catalog-wanted-p (key)
   "Return non-nil when catalog KEY should be fetched for displays.
 It should when it is missing or stale, and neither fetched, queued, nor
-failed on this stream."
+failed on this stream, and its location exists."
   (and (or (opencode--catalog-missing-p key) (gethash key opencode--catalog-stale))
        (not (gethash key opencode--catalog-failed))
        (not (gethash key opencode--catalog-waiters))
-       (not (gethash key opencode--catalog-scheduled))))
+       (not (gethash key opencode--catalog-scheduled))
+       (not (eq (gethash (car key) opencode--missing-locations) t))))
 
 (defvar opencode--mode-line-directories nil
   "Directories of the session buffers whose mode lines wait to be updated, or t for all.")
@@ -354,10 +381,40 @@ began, as the service may have changed meanwhile."
       (opencode--update-mode-lines (car key)))
     changed))
 
+(defun opencode--location-missing (directory error)
+  "Remember that DIRECTORY, normalized, does not exist, as ERROR said.
+Return non-nil when it was not known.  Its absence is logged once,
+without showing in the echo area, and the displays of its catalogs,
+which show identifiers now, are redrawn."
+  (let ((newly (null (gethash directory opencode--missing-locations))))
+    (puthash directory t opencode--missing-locations)
+    (when newly
+      (unless (gethash directory opencode--missing-reported)
+        (puthash directory t opencode--missing-reported)
+        (let ((inhibit-message t))
+          (message "OpenCode: %s does not exist; its sessions show identifiers (%s)"
+                   directory (opencode-error-describe error))))
+      (cl-incf opencode-catalog-generation)
+      (cl-incf (gethash directory opencode--catalog-generations 0))
+      (opencode--update-mode-lines directory))
+    newly))
+
+(defun opencode--location-back (directory)
+  "Forget that DIRECTORY, normalized, does not exist, as it answered.
+The displays of its catalogs, which showed identifiers, are redrawn."
+  (when (gethash directory opencode--missing-locations)
+    (remhash directory opencode--missing-locations)
+    (cl-incf opencode-catalog-generation)
+    (cl-incf (gethash directory opencode--catalog-generations 0))
+    (opencode--update-mode-lines directory)))
+
 (defun opencode--catalog-start (key)
   "Fetch catalog KEY, then settle the callbacks waiting for it.
 A location's catalogs fill in shortly after its first request, so an
-empty answer is asked again before being cached."
+empty answer is asked again before being cached.  A location the
+service says does not exist is remembered (see
+`opencode-location-missing-p'): displays waiting are not told, and no
+display asks for its catalogs again until the stream reopens."
   (let ((epoch opencode--catalog-epoch)
         (directory (car key))
         (kind (cdr key)))
@@ -375,6 +432,7 @@ empty answer is asked again before being cached."
                            (let ((data (opencode-request-data response)))
                              (if (and (null data) (> retries 0))
                                  (run-at-time 0.5 nil #'fetch (1- retries))
+                               (opencode--location-back directory)
                                (let ((changed (opencode--catalog-store key data epoch)))
                                  (when (gethash key opencode--catalog-refetch)
                                    (remhash key opencode--catalog-refetch)
@@ -387,13 +445,22 @@ empty answer is asked again before being cached."
                                    (opencode-state--run-hook 'opencode-catalog-changed-functions
                                                              kind directory))))))
                    :else (lambda (error)
-                           (remhash key opencode--catalog-refetch)
-                           (puthash key t opencode--catalog-failed)
-                           (settle (lambda (waiters)
-                                     (when (seq-some (lambda (waiter) (null (cdr waiter))) waiters)
-                                       (opencode-report-error (opencode-error-describe error)))
-                                     (dolist (waiter waiters)
-                                       (when (cdr waiter) (funcall (cdr waiter) error)))))))))
+                           (let* ((gone (opencode-location-not-found-p error))
+                                  (newly (and gone (opencode--location-missing directory error))))
+                             (remhash key opencode--catalog-refetch)
+                             (puthash key t opencode--catalog-failed)
+                             (settle (lambda (waiters)
+                                       ;; Displays (`ignore') show identifiers for a location gone.
+                                       (when (seq-some (lambda (waiter)
+                                                         (and (null (cdr waiter))
+                                                              (not (and gone (eq (car waiter) #'ignore)))))
+                                                       waiters)
+                                         (opencode-report-error (opencode-error-describe error)))
+                                       (dolist (waiter waiters)
+                                         (when (cdr waiter) (funcall (cdr waiter) error)))))
+                             (when newly
+                               (opencode-state--run-hook 'opencode-catalog-changed-functions
+                                                         kind directory)))))))
       (fetch 2))))
 
 (defun opencode--catalog-join (key callback else)
@@ -479,6 +546,7 @@ running may answer from before the change, so another follows it."
     (dolist (kind kinds)
       (let ((key (cons directory kind)))
         (remhash key opencode--catalog-failed)
+        (opencode--location-back directory)
         (when (gethash key opencode--catalog-waiters)
           (puthash key t opencode--catalog-refetch))
         (unless (opencode--catalog-missing-p key)
@@ -490,9 +558,12 @@ running may answer from before the change, so another follows it."
   "Mark every cached catalog stale when a stream opens: the service may have changed.
 Displays keep showing them, and the first asking for one again fetches
 it, so that a reconnection costs only the requests of the catalogs in
-use, and redraws only for those that changed."
+use, and redraws only for those that changed.  A location said not to
+exist is asked once again, its absence no longer logged."
   (cl-incf opencode--catalog-epoch)
   (clrhash opencode--catalog-failed)
+  (maphash (lambda (directory _) (puthash directory 'recheck opencode--missing-locations))
+           opencode--missing-locations)
   (maphash (lambda (key _) (puthash key t opencode--catalog-stale)) opencode--catalogs))
 
 (dolist (type '("agent.updated" "model.updated" "provider.updated" "integration.updated"

@@ -568,5 +568,72 @@ The next stream asks again, and so does an event saying it changed."
           (opencode-test-run-timers)
           (should (= (length (opencode-test-catalog-paths)) 3)))))))
 
+(defun opencode-test-gone-routes (gone)
+  "Return the display routes, answering for location GONE that it does not exist."
+  (cons (list 'get "\\`/api/\\(?:agent\\|model\\|provider\\)\\'"
+              (lambda (request)
+                (if (equal (opencode-normalize-directory (plist-get request :directory)) gone)
+                    `(:error 404 ,(format "Location not found: %s" gone) "LocationNotFoundError")
+                  (funcall (nth 2 (seq-find (lambda (route) (string-match-p (nth 1 route) (plist-get request :path)))
+                                            (opencode-test-display-routes)))
+                           request))))
+        (opencode-test-display-routes)))
+
+(ert-deftest opencode-test-missing-location-shows-identifiers ()
+  "A location the service says is gone fails once, quietly, and its displays show identifiers.
+No display asks for its catalogs again until the stream reopens, which
+asks once more, showing identifiers meanwhile and logging nothing new."
+  (opencode-test-with-server
+    (let* ((gone (opencode-test-other-location))
+           (opencode-test-routes (opencode-test-gone-routes gone))
+           (logged nil)
+           (reported nil)
+           (changed nil)
+           (opencode-catalog-changed-functions (list (lambda (kind directory) (push (cons kind directory) changed)))))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format &rest arguments) (push (apply #'format-message format arguments) logged)))
+                ((symbol-function 'opencode-report-error) (lambda (text) (push text reported))))
+        (opencode-test-with-held-timers
+          (should-not (opencode-agent-display "build" gone))
+          (opencode-test-run-timers)
+          (should (opencode-location-missing-p gone))
+          (should (equal changed (list (cons 'agent gone))))
+          (should (equal (substring-no-properties (opencode-agent-display "build" gone)) "build"))
+          (should (equal (opencode-model-display opencode-test-sol gone) "gpt-6-sol"))
+          (should (string-match-p "openai" (get-text-property 0 'help-echo (opencode-provider-display "openai" gone))))
+          (should (equal (opencode-model-label opencode-test-sol gone) "gpt-6-sol low"))
+          (should (zerop (opencode-test-run-timers)))
+          (should (equal (opencode-test-catalog-paths) (list (list "/api/agent" gone))))
+          (should (= 1 (seq-count (lambda (line) (string-match-p "does not exist" line)) logged)))
+          (should-not reported)
+          ;; Asked once more after a reconnection, it stays quiet and shown.
+          (opencode-test-dispatch '(((type . "server.connected") (data))))
+          (should (equal (opencode-model-display opencode-test-sol gone) "gpt-6-sol"))
+          (opencode-test-run-timers)
+          (should (= 2 (length (opencode-test-catalog-paths))))
+          (should (equal (opencode-model-display opencode-test-sol gone) "gpt-6-sol"))
+          (should (zerop (opencode-test-run-timers)))
+          (should (= 1 (seq-count (lambda (line) (string-match-p "does not exist" line)) logged)))
+          (should-not reported)
+          ;; Back after the next one, it shows its catalogs.
+          (setq opencode-test-routes (opencode-test-display-routes))
+          (opencode-test-dispatch '(((type . "server.connected") (data))))
+          (opencode-model-display opencode-test-sol gone)
+          (opencode-test-run-timers)
+          (should-not (opencode-location-missing-p gone))
+          (should (equal (opencode-model-display opencode-test-sol gone) "GPT-6 Sol")))))))
+
+(ert-deftest opencode-test-missing-location-reported-to-commands ()
+  "A command fetching a catalog of a location gone hears of it, as of any failure."
+  (opencode-test-with-server
+    (let* ((gone (opencode-test-other-location))
+           (opencode-test-routes (opencode-test-gone-routes gone))
+           (failure nil))
+      (cl-letf (((symbol-function 'message) #'ignore))
+        (opencode-catalog-fetch 'agent #'ignore gone (lambda (error) (setq failure error)))
+        (should (opencode-location-not-found-p failure))
+        (should (opencode-location-missing-p gone))
+        (should-error (opencode-catalog-wait 'model gone) :type 'user-error)))))
+
 (provide 'opencode-display-test)
 ;;; opencode-display-test.el ends here
