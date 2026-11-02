@@ -632,6 +632,9 @@ first selectable entry of the cached catalog."
   "M-n" #'opencode-next-input-or-button
   "TAB" #'opencode-tab-dwim
   "<backtab>" #'backward-button
+  ;; Any key sending input goes through the checks, the archive and the
+  ;; attachments, as RET does.
+  "<remap> <comint-send-input>" #'opencode-send-input
   ;; C-c C-o opens links, as in Org, instead of deleting the last output.
   "C-c C-o" #'opencode-open-link-at-point
   "/" #'opencode-electric-slash
@@ -1234,19 +1237,22 @@ The session's events are withheld meanwhile, then applied."
 
 (defun opencode--render-again (&optional then)
   "Render this session's transcript again from the server, then call THEN.
-The input and the viewport are kept as `opencode-session-reload' says."
-  (let ((input (and (get-buffer-process (current-buffer))
-                    (buffer-substring-no-properties (opencode-pmark) (point-max))))
-        (viewport (opencode-save-viewport)))
+The input and the viewport are kept as `opencode-session-reload' says;
+the input keeps its attachments, and comes back too when the transcript
+cannot be loaded, the failure being reported."
+  (let* ((viewport (opencode-save-viewport))
+         (input (opencode--take-input)))
     (opencode--erase-transcript)
     (opencode-session-load
      (lambda ()
-       (goto-char (point-max))
-       (when (and input (not (string-empty-p input)))
-         (let ((buffer-undo-list t))
-           (insert input)))
+       (let ((buffer-undo-list t))
+         (opencode--put-back-input input))
        (opencode-restore-viewport viewport)
-       (when then (funcall then))))))
+       (when then (funcall then)))
+     (lambda (error)
+       (let ((buffer-undo-list t))
+         (opencode--put-back-input input))
+       (opencode-report-error (opencode-error-describe error))))))
 
 (defun opencode-session-reload ()
   "Render this session's transcript again from the server.
@@ -1288,9 +1294,8 @@ reloads."
 Input still being typed is lifted out and put back afterwards."
   (opencode-without-undo
     (let* ((process (get-buffer-process (current-buffer)))
-           (pending (buffer-substring (opencode-pmark) (point-max)))
-           (inhibit-read-only t))
-      (delete-region (opencode-pmark) (point-max))
+           (inhibit-read-only t)
+           (pending (opencode--take-input)))
       (unless (opencode-prompt-shown-p)
         (opencode-open-block 'user)
         (opencode-show-prompt))
@@ -1307,9 +1312,7 @@ Input still being typed is lifted out and put back afterwards."
         (opencode-output (opencode-fontify-as (propertize (concat note "\n") 'font-lock-face 'opencode-notice)
                                               'verbatim)))
       (setq opencode--last-block-kind 'user)
-      (goto-char (point-max))
-      (insert pending)
-      (set-marker (process-mark process) (- (point-max) (length pending))))))
+      (set-marker (process-mark process) (opencode--put-back-input pending)))))
 
 (defun opencode--user-message-text (message)
   "Return the prompt text of user MESSAGE with its attachments named."
@@ -2021,6 +2024,10 @@ compaction the transcript fetched meanwhile shows finished already."
          (setf (alist-get 'title opencode-session-info) (alist-get 'title data))
          (rename-buffer (opencode-session-buffer-name opencode-session-info) t)
          (force-mode-line-update)))
+      ("session.archived"
+       (opencode--note-archived id (or (alist-get 'created event) (truncate (* 1000 (float-time))))))
+      ("session.unarchived"
+       (opencode--note-archived id nil))
       (type
        (opencode-with-session-buffer id
          (opencode--when-live
@@ -2096,6 +2103,8 @@ compaction the transcript fetched meanwhile shows finished already."
                    ("session.compaction.failed" . opencode--event-compaction)
                    ("session.deleted" . opencode--event-session)
                    ("session.renamed" . opencode--event-session)
+                   ("session.archived" . opencode--event-session)
+                   ("session.unarchived" . opencode--event-session)
                    ("session.agent.selected" . opencode--event-session)
                    ("session.model.selected" . opencode--event-session)
                    ("session.usage.updated" . opencode--event-session)
@@ -2522,6 +2531,72 @@ those blocks with their text.  Services without my fork ignore the key."
       metadata
     (cons `(thinkingLoss . ,(if accept "accept" "ask")) metadata)))
 
+;; Input sent to an archived session restores it from the archive first.
+;; Whether it is archived is known locally, so other sessions send as
+;; before, without a request more.
+
+(defvar opencode--restores (make-hash-table :test #'equal)
+  "Sessions being restored from the archive for input sent to them.
+Each ID maps to the sends waiting for the restore, newest first, as
+\(BUFFER THEN ELSE); see `opencode--after-restore'.")
+
+(defvar-local opencode--input-awaits-restore nil
+  "Non-nil while the input at the prompt waits for its session to leave the archive.")
+
+(defun opencode-session-archived-p (&optional id)
+  "Return non-nil when session ID is archived, as Emacs knows it without asking.
+ID defaults to this buffer's session.  The registry tells when it holds
+the session; otherwise the info of the session's buffer does, as for a
+buffer opened on an archived session the registry has not fetched yet."
+  (let ((id (or id opencode-session-id)))
+    (if-let* ((entry (opencode-state-get id)))
+        (and (plist-get entry :archived) t)
+      (when-let* ((buffer (seq-find (lambda (buffer)
+                                      (and (buffer-live-p buffer)
+                                           (equal (buffer-local-value 'opencode-session-id buffer) id)))
+                                    (list (gethash id opencode-session-buffers) (current-buffer)))))
+        (and (alist-get 'archived (alist-get 'time (buffer-local-value 'opencode-session-info buffer)))
+             t)))))
+
+(defun opencode--after-restore (then else)
+  "Call THEN once this buffer's session is out of the archive, or ELSE.
+A session that is not archived calls THEN at once.  Otherwise the
+service is asked to restore it, once however many sends wait for that,
+and once it did, the waiting sends call their THEN in the order they
+were made, each in its buffer; were it refused, they call ELSE with the
+`opencode-error' of the refusal.  A send whose buffer was killed
+meanwhile is dropped."
+  (let ((id opencode-session-id)
+        (waiter (list (current-buffer) then else)))
+    (cond
+     ((gethash id opencode--restores)
+      (push waiter (gethash id opencode--restores)))
+     ((not (opencode-session-archived-p id))
+      (funcall then))
+     (t
+      (puthash id (list waiter) opencode--restores)
+      (cl-flet ((settle (restored &rest arguments)
+                  (let ((waiters (reverse (gethash id opencode--restores))))
+                    (remhash id opencode--restores)
+                    (pcase-dolist (`(,buffer ,then ,else) waiters)
+                      (when (buffer-live-p buffer)
+                        (with-current-buffer buffer
+                          (with-demoted-errors "OpenCode send: %S"
+                            (apply (if restored then else) arguments))))))))
+        (condition-case error
+            (opencode-session-archive id t
+                                      (lambda (_info) (settle t))
+                                      (lambda (error) (settle nil error)))
+          (error (remhash id opencode--restores)
+                 (signal (car error) (cdr error)))))))))
+
+(defun opencode--restore-failure (error)
+  "Return the one-line notice that input was not sent, as restoring failed with ERROR."
+  (truncate-string-to-width
+   (concat "Not sent: restoring the session from the archive failed: "
+           (opencode-state--one-line (opencode-error-describe error)))
+   300 nil nil "…"))
+
 (cl-defun opencode-session-send (text &key files agents delivery metadata accept-thinking-loss
                                       show region then else)
   "Send TEXT as a prompt of this session.
@@ -2536,6 +2611,12 @@ it, gets the prompt's message ID as its `opencode-message' property once
 the server delivers it, the message existing only then.  THEN runs with
 the admitted inbox item, ELSE with the error; a prompt that fails keeps
 no ID.
+
+An archived session (see `opencode-session-archived-p') is restored from
+the archive first, and the prompt sent once the service restored it;
+prompts sent meanwhile wait for that same restore, and go in the order
+they were sent.  Were it refused, nothing is sent, and ELSE receives
+the error of the restore's request, a PATCH of the session.
 
 No send check runs here (see `opencode-check-send'): a prompt sent while
 the session waits on a permission request or a question reaches the
@@ -2552,19 +2633,24 @@ it."
       (setq opencode-last-model opencode-session-model))
     ;; The turn shows only through the stream.
     (opencode-events-reopen)
-    (opencode-request
-     'post (format "/api/session/%s/prompt" opencode-session-id)
-     :body `((id . ,id) (text . ,text)
-             ,@(when (and files (> (length files) 0)) `((files . ,files)))
-             ,@(when (and agents (> (length agents) 0)) `((agents . ,agents)))
-             ,@(when metadata `((metadata . ,metadata)))
-             (delivery . ,(symbol-name (or delivery opencode-prompt-delivery))))
-     :then (lambda (response) (when then (funcall then (opencode-request-data response))))
-     :else (lambda (error)
-             (remhash id opencode--own-inputs)
-             (opencode--release-sent-input id)
-             (if else (funcall else error)
-               (opencode-output-notice (opencode-error-describe error) 'error))))
+    (let ((path (format "/api/session/%s/prompt" opencode-session-id))
+          (body `((id . ,id) (text . ,text)
+                  ,@(when (and files (> (length files) 0)) `((files . ,files)))
+                  ,@(when (and agents (> (length agents) 0)) `((agents . ,agents)))
+                  ,@(when metadata `((metadata . ,metadata)))
+                  (delivery . ,(symbol-name (or delivery opencode-prompt-delivery))))))
+      (cl-flet ((fail (error describe)
+                  (remhash id opencode--own-inputs)
+                  (opencode--release-sent-input id)
+                  (if else (funcall else error)
+                    (opencode-output-notice (funcall describe error) 'error))))
+        (opencode--after-restore
+         (lambda ()
+           (opencode-request
+            'post path :body body
+            :then (lambda (response) (when then (funcall then (opencode-request-data response))))
+            :else (lambda (error) (fail error #'opencode-error-describe))))
+         (lambda (error) (fail error #'opencode--restore-failure)))))
     id))
 
 (cl-defun opencode-session-command (name arguments &key metadata accept-thinking-loss region then else)
@@ -2575,7 +2661,8 @@ the prompt a command makes an ID of its own and expands its text, so
 it is rendered once delivered, like a prompt of another client; REGION,
 a cons (START . END) of the text showing the command, gets that ID too.
 The command's prompt is recognized by a correlation key Emacs adds to
-METADATA, which the service passes on to it."
+METADATA, which the service passes on to it.  An archived session is
+restored from the archive first, as for `opencode-session-send'."
   (let* ((key (and region (opencode-generate-id "cmd_")))
          (metadata (opencode-thinking-metadata
                     (if key (append metadata `((,opencode--command-key . ,key))) metadata)
@@ -2584,19 +2671,32 @@ METADATA, which the service passes on to it."
     (when key
       (opencode--track-sent-input key region t))
     (opencode-events-reopen)
-    (opencode-request
-     'post (format "/api/session/%s/command" opencode-session-id)
-     :body `((name . ,name) (text . ,arguments)
-             (metadata . ,metadata)
-             (delivery . ,(symbol-name opencode-prompt-delivery)))
-     :then (lambda (_)
-             (when-let* ((entry (and key (gethash key (opencode--sent-input-table)))))
-               (plist-put entry :answered (float-time)))
-             (when then (funcall then nil)))
-     :else (lambda (error)
-             (when key (opencode--release-sent-input key))
-             (if else (funcall else error)
-               (opencode-output-notice (opencode-error-describe error) 'error))))))
+    (let ((path (format "/api/session/%s/command" opencode-session-id))
+          (body `((name . ,name) (text . ,arguments)
+                  (metadata . ,metadata)
+                  (delivery . ,(symbol-name opencode-prompt-delivery)))))
+      (cl-flet ((fail (error describe)
+                  (when key (opencode--release-sent-input key))
+                  (if else (funcall else error)
+                    (opencode-output-notice (funcall describe error) 'error))))
+        (opencode--after-restore
+         (lambda ()
+           (opencode-request
+            'post path :body body
+            :then (lambda (_)
+                    (when-let* ((entry (and key (gethash key (opencode--sent-input-table)))))
+                      (plist-put entry :answered (float-time)))
+                    (when then (funcall then nil)))
+            :else (lambda (error) (fail error #'opencode-error-describe))))
+         (lambda (error) (fail error #'opencode--restore-failure)))))))
+
+(defun opencode--session-shell (command)
+  "Run shell COMMAND in this session, restoring it from the archive first."
+  (opencode-events-reopen)
+  (let ((path (format "/api/session/%s/shell" opencode-session-id)))
+    (opencode--after-restore
+     (lambda () (opencode-request 'post path :body `((command . ,command))))
+     (lambda (error) (opencode-output-notice (opencode--restore-failure error) 'error)))))
 
 (defvar opencode-send-checks nil
   "Functions checking input before it is sent, in order.
@@ -2606,6 +2706,54 @@ an alist of metadata to attach to it.")
 
 (defvar opencode--send-decision nil
   "Outcome of the checks of the input being sent: t, or metadata to attach.")
+
+(defvar opencode--sending-input nil
+  "The session buffer whose input Comint is taking to send it, or nil.
+Comint deletes the input and inserts it again as sent text, which must
+not drop the attachments whose labels it holds: they go with the prompt.
+Bound by `opencode--comint-send', whatever command runs, rather than
+read from `this-command', which names RET's command, not Comint's; it
+ends once Comint hands the input over to `opencode--send-input'.")
+
+(defun opencode--comint-send ()
+  "Have Comint send the input at point, keeping its attachments for the prompt."
+  (let ((opencode--sending-input (current-buffer)))
+    (comint-send-input)))
+
+(defvar opencode--input-sent nil
+  "The input Comint is taking to send, as `opencode--copy-input' returns it.
+A send check that keeps input Comint took already puts it back from
+this, with its attachment labels.  Nil when Comint sends an earlier
+input rather than the one at the prompt.")
+
+(defvar opencode--routing-input nil
+  "Non-nil while `comint-send-input' called in a session buffer runs as RET.")
+
+(defun opencode--comint-send-input (send &rest arguments)
+  "Run Comint's SEND, `comint-send-input', with ARGUMENTS as session buffers send.
+In a session buffer, input sent otherwise than by `opencode--comint-send',
+such as with `execute-extended-command', goes through
+`opencode-send-input' as RET's does: its checks, the archive, its
+attachments.  Input Comint then takes keeps the attachments its labels
+stand for.  Elsewhere, and for text a session buffer writes through
+Comint with another sender, SEND runs as it is."
+  (cond
+   ((not (and (derived-mode-p 'opencode-session-mode)
+              (eq comint-input-sender #'opencode--send-input)))
+    (apply send arguments))
+   ((and (not (seq-some #'identity arguments))
+         (not (eq opencode--sending-input (current-buffer)))
+         (not opencode--routing-input))
+    (let ((opencode--routing-input t))
+      (opencode-send-input)))
+   (t
+    (let ((opencode--sending-input (current-buffer))
+          (opencode--input-sent (and (get-buffer-process (current-buffer))
+                                     (>= (point) (opencode-pmark))
+                                     (opencode--copy-input))))
+      (apply send arguments)))))
+
+(advice-add 'comint-send-input :around #'opencode--comint-send-input)
 
 (defun opencode-input-request (string)
   "Return what sending input STRING requests, as a plist.
@@ -2644,23 +2792,59 @@ any asynchronous step.  `opencode-before-send-functions' run first."
 
 (defun opencode-send-input ()
   "Send the input at the prompt, unless a check keeps it there.
-Checks run before Comint takes the input, so declining leaves it as typed."
+Checks run before Comint takes the input, so declining leaves it as typed.
+An archived session is restored from the archive once the checks passed,
+and the input sent once the service restored it; were the restore
+refused, the input stays at the prompt."
   (interactive)
   (if (not (and opencode-session-id (get-buffer-process (current-buffer))))
-      (comint-send-input)
+      (opencode--comint-send)
     (let ((input (if (>= (point) (opencode-pmark))
                      (buffer-substring-no-properties (opencode-pmark) (point-max))
                    (funcall comint-get-old-input))))
-      ;; An empty prompt would start a turn about nothing.
-      (if (string-blank-p input)
-          (message "Nothing to send")
+      (cond
+       (opencode--input-awaits-restore
+        (message "The session is being restored from the archive; the input is sent then"))
+       ;; An empty prompt would start a turn about nothing.
+       ((string-blank-p input)
+        (message "Nothing to send"))
+       (t
         (let* ((opencode--send-cancel-quietly nil)
                (decision (opencode-check-send (opencode-input-request input))))
           (if (eq decision 'cancel)
               (unless opencode--send-cancel-quietly
                 (message "Not sent"))
-            (let ((opencode--send-decision (or decision t)))
-              (comint-send-input))))))))
+            (opencode--send-checked-input (or decision t)))))))))
+
+(defun opencode--send-checked-input (decision)
+  "Have Comint send the input at point, checked with DECISION.
+DECISION is t, or the metadata the checks attach.  An archived session
+is restored first: the input waits at the prompt, where it can still
+be edited, and is sent as if RET were pressed again where it was, at
+the prompt or on an earlier input; were the restore refused, it stays."
+  (let ((old (unless (>= (point) (opencode-pmark)) (point-marker)))
+        (delivery opencode-prompt-delivery)
+        (settled nil))
+    (opencode--after-restore
+     (lambda ()
+       (setq settled t
+             opencode--input-awaits-restore nil)
+       (goto-char (or old (max (point) (opencode-pmark))))
+       (when old (set-marker old nil))
+       (if (and (not old) (string-blank-p (buffer-substring-no-properties (opencode-pmark) (point-max))))
+           (message "Nothing to send")
+         (let ((opencode--send-decision decision)
+               (opencode-prompt-delivery delivery))
+           (opencode--comint-send))))
+     (lambda (error)
+       (setq settled t
+             opencode--input-awaits-restore nil)
+       (when old (set-marker old nil))
+       (opencode-output-notice
+        (concat (opencode--restore-failure error) "; the input is still at the prompt")
+        'error)))
+    (unless settled
+      (setq opencode--input-awaits-restore t))))
 
 (defun opencode-queue-input ()
   "Send the input at the prompt to start after the running turn, not steer it."
@@ -2683,9 +2867,14 @@ Checks run before Comint takes the input, so declining leaves it as typed."
     (forward-button count)))
 
 (defun opencode--restore-input (text)
-  "Put TEXT back at the prompt after a send was cancelled."
-  (goto-char (point-max))
-  (insert text))
+  "Put TEXT back at the prompt after a send was cancelled.
+The input Comint took is put back whole, with its attachment labels,
+when known (see `opencode--input-sent'); else TEXT, an earlier input
+Comint sent."
+  (if opencode--input-sent
+      (opencode--put-back-input opencode--input-sent)
+    (goto-char (point-max))
+    (insert text)))
 
 (defun opencode--send-input (_process string)
   "Send STRING typed at the prompt: a prompt, a /command or a !shell command.
@@ -2693,10 +2882,14 @@ Input that did not go through `opencode-send-input' is checked here.  The
 input of a prompt or a command gets the ID of the message it makes once
 the service delivers it, which reverting and forking at point need; a
 shell command makes no prompt, only a shell message and its result,
-which like other messages between prompts never start a cut."
+which like other messages between prompts never start a cut.  The
+prompt's attachments are those whose labels the input held; Comint
+leaves their overlays emptied, which go."
   (opencode-highlight-input)
   (opencode-output "\n")
-  (let* ((request (opencode-input-request string))
+  (opencode--forget-attachment-labels comint-last-input-start comint-last-input-end)
+  (let* ((opencode--sending-input nil)
+         (request (opencode-input-request string))
          (string (plist-get request :text))
          (decision (or opencode--send-decision (opencode-check-send request)))
          (metadata (and (consp decision) decision))
@@ -2714,9 +2907,7 @@ which like other messages between prompts never start a cut."
                                    :metadata metadata :region region
                                    :then (lambda (_) (mapc #'delete-file temp-files))))
         ('shell
-         (opencode-events-reopen)
-         (opencode-request 'post (format "/api/session/%s/shell" opencode-session-id)
-                           :body `((command . ,(substring string 1)))))
+         (opencode--session-shell (substring string 1)))
         ('prompt
          (opencode-session-send string :files files :agents agents :metadata metadata :region region
                                 :then (lambda (_) (mapc (lambda (file) (ignore-errors (delete-file file)))
@@ -2724,14 +2915,23 @@ which like other messages between prompts never start a cut."
 
 ;;;; Attachments
 
+(defun opencode--forget-attachment-labels (start end)
+  "Delete the overlays of the attachment labels between START and END.
+Comint taking the input to send it leaves them there, emptied."
+  (dolist (overlay (overlays-in start end))
+    (when (overlay-get overlay 'opencode-attachment)
+      (delete-overlay overlay))))
+
 (defun opencode--in-attachment-p ()
   "Return non-nil when point is inside an attachment label."
   (cl-loop for overlay in (overlays-at (point))
            thereis (overlay-get overlay 'opencode-attachment)))
 
 (defun opencode--remove-attachment (overlay after _beg _end &optional _length)
-  "Drop OVERLAY's attachment once its label is deleted, AFTER the change."
-  (when (and after (not (eq this-command 'comint-send-input)))
+  "Drop OVERLAY's attachment once its label is deleted, AFTER the change.
+Comint taking the input to send it deletes the labels too, which drops
+nothing (see `opencode--sending-input')."
+  (when (and after (not (eq opencode--sending-input (current-buffer))))
     (let ((attachment (overlay-get overlay 'opencode-attachment))
           (start (overlay-start overlay))
           (end (overlay-end overlay)))
@@ -2745,15 +2945,75 @@ which like other messages between prompts never start a cut."
 (defun opencode--insert-attachment (label attachment)
   "Insert an intangible LABEL standing for ATTACHMENT at point."
   (push attachment opencode--attachments)
-  (let* ((start (point))
-         (end (progn (insert "`" (propertize label 'cursor-intangible t)
-                             (propertize "`" 'rear-nonsticky t))
-                     (point)))
-         (overlay (make-overlay start end)))
+  (let ((start (point)))
+    (insert "`" (propertize label 'cursor-intangible t)
+            (propertize "`" 'rear-nonsticky t))
+    (opencode--label-attachment start (point) attachment (propertize label 'face 'markdown-ts-code))))
+
+(defun opencode--label-attachment (start end attachment display)
+  "Make the text from START to END the label of ATTACHMENT, shown as DISPLAY.
+Deleting any of it drops the attachment.  Return the label's overlay."
+  (let ((overlay (make-overlay start end)))
     (overlay-put overlay 'opencode-attachment attachment)
-    (overlay-put overlay 'display (propertize label 'face 'markdown-ts-code))
+    (overlay-put overlay 'display display)
     (overlay-put overlay 'modification-hooks '(opencode--remove-attachment))
     overlay))
+
+;; Rendering lifts the input out and puts it back: another client's
+;; prompt goes before it, and a transcript rendered again erases it.  Its
+;; text alone would lose the attachments its labels stand for, so every
+;; path lifting it goes through this pair.
+
+(defun opencode--copy-input (&optional take)
+  "Return the input typed at the prompt, its attachment labels included.
+The value, for `opencode--put-back-input', is a plist: :text, the input
+with its text properties; :labels, its attachment labels, as (START END
+ATTACHMENT DISPLAY) with START and END offsets in :text; :attachments,
+the attachments it takes along.  With TAKE, the input is removed, and
+the next prompt's attachments go with it, out of `opencode--attachments'
+until put back: the labels' overlays go first, so that removing their
+text drops nothing.  Without TAKE, the input and the attachments stay,
+and :attachments is nil.  Return nil without a prompt."
+  (when (get-buffer-process (current-buffer))
+    (let* ((start (opencode-pmark))
+           (end (point-max))
+           (overlays (seq-filter (lambda (overlay) (overlay-get overlay 'opencode-attachment))
+                                 (overlays-in start end)))
+           (input (list :text (buffer-substring start end)
+                        :labels (mapcar (lambda (overlay)
+                                          (list (- (overlay-start overlay) start)
+                                                (- (overlay-end overlay) start)
+                                                (overlay-get overlay 'opencode-attachment)
+                                                (overlay-get overlay 'display)))
+                                        (seq-filter (lambda (overlay)
+                                                      (< (overlay-start overlay) (overlay-end overlay)))
+                                                    overlays))
+                        :attachments (and take opencode--attachments))))
+      (when take
+        (mapc #'delete-overlay overlays)
+        (setq opencode--attachments nil)
+        (let ((inhibit-read-only t))
+          (delete-region start end)))
+      input)))
+
+(defun opencode--take-input ()
+  "Remove the input typed at the prompt; return it for `opencode--put-back-input'.
+See `opencode--copy-input'."
+  (opencode--copy-input t))
+
+(defun opencode--put-back-input (input)
+  "Insert INPUT, which `opencode--copy-input' returned, at the end of the buffer.
+Its labels stand for their attachments again, deleting one dropping
+it, and the attachments it took along are the next prompt's again.
+Point ends after it.  Return where it starts."
+  (goto-char (point-max))
+  (let ((start (point)))
+    (when input
+      (insert (plist-get input :text))
+      (pcase-dolist (`(,from ,to ,attachment ,display) (plist-get input :labels))
+        (opencode--label-attachment (+ start from) (+ start to) attachment display))
+      (setq opencode--attachments (append opencode--attachments (plist-get input :attachments))))
+    start))
 
 (defun opencode--prompt-buffer ()
   "Return the session buffer whose input prompt commands edit.
@@ -3171,12 +3431,32 @@ the service returns it once the service archived or restored it; ELSE
 with the `opencode-error' of a refusal, which is otherwise reported.
 Either is called once, in whatever buffer is current then, so that a
 caller can act on the outcome, such as close the session's buffer only
-once the archive took."
+once the archive took.  The registry and the session's buffer know of
+the outcome before THEN runs, without waiting for its event."
   (opencode-request 'patch (concat "/api/session/" id)
                     :directory (opencode-state--directory id) :buffer nil
                     :body `((archived . ,(if restore :false t)))
-                    :then (or then #'ignore)
+                    :then (lambda (response)
+                            (let* ((info (opencode-request-data response))
+                                   (archived (unless restore
+                                               (or (alist-get 'archived (alist-get 'time info))
+                                                   (truncate (* 1000 (float-time)))))))
+                              (opencode-state--note-archived id (opencode-time-seconds archived))
+                              (opencode--note-archived id archived)
+                              (when then (funcall then info))))
                     :else else))
+
+(defun opencode--note-archived (id archived)
+  "Record in session ID's buffer that it was archived at ARCHIVED, or restored.
+ARCHIVED is in epoch milliseconds, as the service reports times, or nil
+for a session restored from the archive.  The buffer's session info
+then tells it, for sessions the registry does not hold."
+  (opencode-with-session-buffer id
+    (unless (equal archived (alist-get 'archived (alist-get 'time opencode-session-info)))
+      (let ((time (copy-alist (alist-get 'time opencode-session-info))))
+        (setf (alist-get 'archived time nil t) archived)
+        (setf (alist-get 'time opencode-session-info) time))
+      (force-mode-line-update))))
 
 (defun opencode--reply-text (message)
   "Return the text of assistant MESSAGE, or nil when it has none."

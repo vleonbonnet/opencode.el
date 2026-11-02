@@ -340,6 +340,7 @@ session registry starts empty and follows events once a test dispatches
              (opencode-test-deferred nil)
              (opencode-test-routes (opencode-test-default-routes))
              (opencode-session-buffers (make-hash-table :test #'equal))
+             (opencode--restores (make-hash-table :test #'equal))
              ;; Answers come synchronously, and so does the transcript.
              (opencode-replay-slice nil)
              (opencode--resync-epoch 0)
@@ -435,6 +436,42 @@ session registry starts empty and follows events once a test dispatches
     (goto-char (point-min))
     (search-forward text)
     (match-beginning 0)))
+
+;;;; Keys
+
+(defun opencode-test-press (buffer keys)
+  "Press KEYS in BUFFER, shown in the selected window.
+Return the error they signaled, or nil.  Running them through the
+command loop applies key remapping as typing them would."
+  (save-window-excursion
+    (set-window-buffer (selected-window) buffer)
+    (with-current-buffer buffer
+      (condition-case err
+          (progn (execute-kbd-macro (key-parse keys)) nil)
+        (error err)))))
+
+;;;; Attachments
+
+(defun opencode-test-type-attachments ()
+  "Type a prompt attaching the workspace's README.md and mentioning a subagent.
+Return the URI of the file."
+  (let ((file (expand-file-name "README.md" opencode-test-workspace)))
+    (goto-char (point-max))
+    (insert "look at ")
+    (opencode--attach-file file)
+    (opencode--insert-mention "explore")
+    (opencode--file-uri file)))
+
+(defun opencode-test-sent-prompt ()
+  "Return the body of the latest prompt requested."
+  (plist-get (seq-find (lambda (request) (string-suffix-p "/prompt" (plist-get request :path)))
+                       opencode-test-requests)
+             :body))
+
+(defun opencode-test-attachment-overlays ()
+  "Return the overlays of attachment labels left in the current buffer."
+  (seq-filter (lambda (overlay) (overlay-get overlay 'opencode-attachment))
+              (overlays-in (point-min) (point-max))))
 
 ;;;; Transcripts
 
