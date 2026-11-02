@@ -449,7 +449,7 @@ sorted by its display sort function, then affixed."
         (setq default-directory opencode-test-workspace)
         (cl-letf (((symbol-function 'y-or-n-p) (lambda (prompt) (push prompt questions) t))
                   ((symbol-function 'yes-or-no-p) (lambda (prompt) (push prompt questions) t))
-                  ((symbol-function 'read-string) (lambda (_prompt initial) (push initial questions) "Typed")))
+                  ((symbol-function 'read-string) (lambda (_prompt initial &rest _) (push initial questions) "Typed")))
           (opencode-test-picking (opencode-test-choose "reasoning")
             (opencode-rename-session nil "Renamed")
             (opencode-archive-session)
