@@ -277,6 +277,7 @@ reasoning included."
 
 (defun opencode-format-time-ago (seconds)
   "Format SECONDS as a human readable duration, or \"-\" when nil."
+  (declare (obsolete opencode-format-duration "2.1.0"))
   (if seconds (seconds-to-string seconds) "-"))
 
 (defun opencode-annotated-completion (prompt candidates)
