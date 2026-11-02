@@ -238,34 +238,65 @@ BINDINGS is a list (SESSION) of the variable bound to the session's ID."
     ("the doc" . "https://example.com/doc"))
   "The links of `opencode-test-prompt-with-links', as `opencode-test-links' lists them.")
 
+(defconst opencode-test-answer-with-link "On it: see https://example.com/answer."
+  "An answer with a URL written out, following the prompt.")
+
+(defconst opencode-test-exchange-links
+  (append opencode-test-prompt-links
+          '(("https://example.com/answer" . "https://example.com/answer")))
+  "The links of a prompt `opencode-test-prompt-with-links' answered with
+`opencode-test-answer-with-link', as `opencode-test-links' lists them.")
+
+(defun opencode-test-answer-turn (session)
+  "Answer the prompt of SESSION with `opencode-test-answer-with-link', ending the turn."
+  (opencode-test-turn session "started")
+  (opencode-test-answer session "msg_answer" opencode-test-answer-with-link)
+  (opencode-test-turn session "succeeded"))
+
+(defun opencode-test-check-link-keys (buffer)
+  "Check that M-n and M-p go through the links of BUFFER's exchange.
+From the start of the transcript, M-n reaches the prompt's URL, then
+each link after it, and stops at the last; M-p goes back to the first."
+  (with-current-buffer buffer
+    (let ((links (list (opencode-test-find "https://mongodb.slack.com")
+                       (opencode-test-find "the doc")
+                       (opencode-test-find "https://example.com/answer"))))
+      (goto-char (point-min))
+      (should (eq (key-binding (kbd "M-n")) 'opencode-next-input-or-button))
+      (should (eq (key-binding (kbd "M-p")) 'opencode-previous-input-or-button))
+      (dolist (link links)
+        (should-not (opencode-test-press buffer "M-n"))
+        (should (= (point) link)))
+      (should (equal (opencode-test-press buffer "M-n") '(user-error "No more buttons")))
+      (should (= (point) (car (last links))))
+      (dolist (link (cdr (reverse links)))
+        (should-not (opencode-test-press buffer "M-p"))
+        (should (= (point) link)))
+      (should (equal (opencode-test-press buffer "M-p") '(user-error "No more buttons")))
+      (should (= (point) (car links))))))
+
 (defun opencode-test-check-prompt-links (buffer)
   "Check that the sent prompt of BUFFER has its links, which the keys reach and follow.
-Return the URLs followed."
+The prompt is `opencode-test-prompt-with-links', answered with
+`opencode-test-answer-with-link'."
   (with-current-buffer buffer
     (font-lock-ensure)
     (let ((url (opencode-test-find "https://mongodb.slack.com"))
           (doc (opencode-test-find "the doc"))
           (browsed nil)
           (prompts (length (opencode-test-requests-to 'post "/prompt"))))
-      (should (equal (opencode-test-links (point-min) (opencode-pmark)) opencode-test-prompt-links))
+      (should (equal (opencode-test-links (point-min) (opencode-pmark)) opencode-test-exchange-links))
       (should (get-text-property url 'opencode-prompt))
       (should (memq 'link (ensure-list (get-text-property url 'face))))
       (should (equal (get-text-property url 'help-echo)
                      "Open https://mongodb.slack.com/archives/C0C8DPY6L78/p179209784790270"))
       (should (mouse-on-link-p (1+ url)))
+      (opencode-test-check-link-keys buffer)
       (cl-letf (((symbol-function 'browse-url) (lambda (target &rest _) (push target browsed)))
                 ((symbol-function 'completing-read)
                  (lambda (_prompt collection &rest _)
-                   (should (equal (mapcar #'car collection) (mapcar #'car opencode-test-prompt-links)))
+                   (should (equal (mapcar #'car collection) (mapcar #'car opencode-test-exchange-links)))
                    "the doc")))
-        ;; M-n and M-p go from link to link in the transcript.
-        (goto-char (point-min))
-        (should-not (opencode-test-press buffer "M-n"))
-        (should (= (point) url))
-        (should-not (opencode-test-press buffer "M-n"))
-        (should (= (point) doc))
-        (should-not (opencode-test-press buffer "M-p"))
-        (should (= (point) url))
         ;; RET and C-c C-o follow the link at point, and send nothing.
         (goto-char (+ url 10))
         (should (eq (key-binding (kbd "RET")) 'push-button))
@@ -283,13 +314,15 @@ Return the URLs followed."
 (ert-deftest opencode-test-sent-prompt-links ()
   "The links of a prompt sent from the input are links, and the input's never are."
   (opencode-test-with-server
-    (let ((buffer (opencode-test-open-empty (opencode-test-scenario "text"))))
+    (let* ((session (opencode-test-scenario "text"))
+           (buffer (opencode-test-open-empty session)))
       (with-current-buffer buffer
         (goto-char (point-max))
         (insert opencode-test-prompt-with-links)
         (should-not (opencode-test-press buffer "RET"))
         (should (equal (alist-get 'text (car (opencode-test-requests-to 'post "/prompt")))
                        opencode-test-prompt-with-links))
+        (opencode-test-answer-turn session)
         (opencode-test-check-prompt-links buffer)
         ;; In the input, RET still sends.
         (goto-char (point-max))
@@ -302,15 +335,18 @@ Return the URLs followed."
         (should (equal (alist-get 'text (car (last (opencode-test-requests-to 'post "/prompt"))))
                        "again https://example.com/x"))
         (should (equal (opencode-test-links (point-min) (opencode-pmark))
-                       (append opencode-test-prompt-links
+                       (append opencode-test-exchange-links
                                '(("https://example.com/x" . "https://example.com/x")))))))))
+
+(defun opencode-test-exchange-transcript ()
+  "Return a transcript of `opencode-test-prompt-with-links' and its answer."
+  (list (opencode-test-prompt "msg_ask" opencode-test-prompt-with-links)
+        (opencode-test-step "msg_reply" `((type . "text") (text . ,opencode-test-answer-with-link)))
+        (opencode-test-idle "msg_done")))
 
 (ert-deftest opencode-test-replayed-prompt-links ()
   "A prompt replayed from the transcript has its links, after a reload too."
-  (opencode-test-with-transcript
-      (list (opencode-test-prompt "msg_ask" opencode-test-prompt-with-links)
-            (opencode-test-step "msg_reply" '((type . "text") (text . "On it.")))
-            (opencode-test-idle "msg_done"))
+  (opencode-test-with-transcript (opencode-test-exchange-transcript)
     (let ((buffer (opencode-test-open (opencode-test-session))))
       (opencode-test-check-prompt-links buffer)
       (with-current-buffer buffer (revert-buffer))
@@ -325,9 +361,53 @@ Return the URLs followed."
         (goto-char (point-max))
         (insert "draft https://example.com/draft")
         (opencode-test-dispatch (opencode-test-inbox-events session "msg_tui" opencode-test-prompt-with-links))
+        (opencode-test-answer-turn session)
         (should (equal (buffer-substring-no-properties (opencode-pmark) (point-max))
                        "draft https://example.com/draft"))
         (should-not (opencode-test-links (opencode-pmark)))
+        (delete-region (opencode-pmark) (point-max)))
+      (opencode-test-check-prompt-links buffer))))
+
+(defun opencode-test-highlight-input-unlinked (&optional _process _string)
+  "Mark the input just sent as prompt text, as versions making no links of it did."
+  (opencode-add-margin comint-last-input-start comint-last-input-end
+                       'opencode-request-margin-highlight)
+  (with-silent-modifications
+    (put-text-property comint-last-input-start comint-last-input-end 'opencode-prompt t)))
+
+(ert-deftest opencode-test-earlier-version-prompt-links ()
+  "Loaded over a version that made no links of prompts, the package links those it rendered.
+The input typed meanwhile is left as it is, and buffers of other modes too."
+  (opencode-test-with-transcript (opencode-test-exchange-transcript)
+    (let ((buffer (cl-letf (((symbol-function 'opencode-highlight-input)
+                             #'opencode-test-highlight-input-unlinked))
+                    (opencode-test-open (opencode-test-session))))
+          modified undo)
+      (with-temp-buffer
+        (insert "https://example.com/elsewhere")
+        (put-text-property (point-min) (point-max) 'opencode-prompt t)
+        (let ((other (current-buffer)))
+          (with-current-buffer buffer
+            (font-lock-ensure)
+            (goto-char (point-max))
+            (insert "draft https://example.com/draft")
+            ;; The prompt's URL is no link: M-n from the start skips it.
+            (should-not (get-char-property (opencode-test-find "https://mongodb.slack.com") 'button))
+            (goto-char (point-min))
+            (should-not (opencode-test-press buffer "M-n"))
+            (should (> (point) (opencode-test-find "https://mongodb.slack.com")))
+            (setq modified (buffer-modified-p)
+                  undo buffer-undo-list))
+          (load "opencode-links" nil t)
+          (with-current-buffer other
+            (should-not (next-button (point-min))))))
+      (with-current-buffer buffer
+        (should (equal (buffer-substring-no-properties (opencode-pmark) (point-max))
+                       "draft https://example.com/draft"))
+        (should-not (opencode-test-links (opencode-pmark)))
+        ;; Linking is no edit.
+        (should (eq (buffer-modified-p) modified))
+        (should (eq buffer-undo-list undo))
         (delete-region (opencode-pmark) (point-max)))
       (opencode-test-check-prompt-links buffer))))
 
