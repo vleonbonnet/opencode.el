@@ -198,26 +198,70 @@ Each is a plist (:file URI-ALIST) or (:agent NAME).")
 
 ;;;; Catalogs
 
+;; Displays read a location's catalogs at redisplay and never wait, so
+;; fetching them is left to timers, a few at a time.  A reconnection
+;; most likely changed no catalog, yet the service may have restarted
+;; with another configuration: every cached catalog is then marked
+;; stale rather than forgotten, displays keep showing it, and the first
+;; display asking for one again fetches it anew.  Only a catalog that
+;; arrives different counts as changed, and only the mode lines of its
+;; location's session buffers are updated then, once per tick.
+
+(defcustom opencode-catalog-requests 4
+  "Number of catalogs fetched at once for displays, at most.
+See `opencode-catalog-ensure'."
+  :type 'natnum
+  :group 'opencode)
+
 (defvar opencode--catalogs (make-hash-table :test #'equal)
-  "Location catalogs, keyed by (DIRECTORY . KIND).")
+  "Location catalogs, keyed by (DIRECTORY . KIND).
+Stale ones, which `opencode--catalog-stale' holds, are included.")
+
+(defvar opencode--catalog-stale (make-hash-table :test #'equal)
+  "Keys of the cached catalogs to fetch again before trusting them, mapped to t.")
 
 (defvar opencode--catalog-waiters (make-hash-table :test #'equal)
-  "Callbacks waiting for a catalog fetch in flight, keyed like `opencode--catalogs'.")
+  "Callbacks waiting for a catalog fetch in flight, keyed like `opencode--catalogs'.
+Each is (CALLBACK . ELSE); a key is present exactly while its fetch runs.")
 
 (defvar opencode--catalog-scheduled (make-hash-table :test #'equal)
-  "Keys, like those of `opencode--catalogs', of the fetches a timer is about to start.")
+  "Keys, like those of `opencode--catalogs', queued in `opencode--catalog-queue'.")
+
+(defvar opencode--catalog-queue nil
+  "Keys of the catalogs displays asked for that wait to be fetched, oldest first.")
+
+(defvar opencode--catalog-timer nil
+  "Timer starting the queued catalog fetches.")
+
+(defvar opencode--catalog-failed (make-hash-table :test #'equal)
+  "Keys whose fetch failed since the stream opened, mapped to t.
+Displays ask at every redisplay, so they do not fetch these again until
+the stream reopens or an event says the catalog changed.")
+
+(defvar opencode--catalog-refetch (make-hash-table :test #'equal)
+  "Keys an event said changed while their fetch ran, mapped to t.
+That fetch may answer from before the change, so another follows it.")
+
+(defvar opencode--catalog-epoch 0
+  "Count of stream openings.
+A catalog fetched by a request begun before the latest one stays stale.")
+
+(defvar opencode--catalog-generations (make-hash-table :test #'equal)
+  "Normalized directories mapped to the count of their catalogs' changes.")
 
 (defvar opencode-catalog-generation 0
-  "Count of catalog changes, for caches of values derived from catalogs.")
+  "Count of catalog changes, for caches of values derived from catalogs.
+`opencode-catalog-location-generation' counts those of one location.")
 
 (defcustom opencode-catalog-changed-functions nil
-  "Abnormal hook run when a location's catalog is fetched or forgotten.
+  "Abnormal hook run when a location's catalog changed.
 Each function receives the catalog's kind, `agent', `model', `provider'
-or `command', and the location's normalized directory; both are nil
-when every catalog was forgotten, as when the event stream (re)connects.
-What was computed from a catalog, such as `opencode-model-display', may
-differ afterwards; a forgotten catalog is fetched again when next asked
-for, and this runs once it arrives."
+or `command', and the location's normalized directory.  It runs when a
+catalog arrives for the first time, and when one fetched again, after
+an event said it changed or the event stream reopened, arrives
+different; a catalog fetched again unchanged runs nothing.  What was
+computed from the catalog, such as `opencode-model-display', may differ
+afterwards."
   :type 'hook
   :group 'opencode)
 
@@ -226,109 +270,235 @@ for, and this runs once it arrives."
     (command . "/api/command"))
   "Catalog kinds and their routes.")
 
+(defun opencode--catalog-key (kind directory)
+  "Return the key of the KIND catalog of DIRECTORY, by default `default-directory'."
+  (cons (opencode-normalize-directory (or directory default-directory)) kind))
+
 (defun opencode-catalog (kind &optional directory)
-  "Return the cached KIND catalog of DIRECTORY, or nil when not fetched."
-  (gethash (cons (opencode-normalize-directory (or directory default-directory)) kind)
-           opencode--catalogs))
+  "Return the cached KIND catalog of DIRECTORY, or nil when not fetched.
+A catalog the stream's reopening left stale is returned too, being most
+likely still current; see `opencode-catalog-ensure'."
+  (gethash (opencode--catalog-key kind directory) opencode--catalogs))
 
 (defun opencode-catalog-cached-p (kind &optional directory)
-  "Return non-nil when the KIND catalog of DIRECTORY is cached, even empty."
-  (not (eq (gethash (cons (opencode-normalize-directory (or directory default-directory)) kind)
-                    opencode--catalogs 'missing)
+  "Return non-nil when the KIND catalog of DIRECTORY is cached, even empty or stale."
+  (not (eq (gethash (opencode--catalog-key kind directory) opencode--catalogs 'missing)
            'missing)))
+
+(defun opencode-catalog-location-generation (&optional directory)
+  "Return the count of changes of the catalogs of DIRECTORY.
+It grows whenever `opencode-catalog-changed-functions' run for
+DIRECTORY, so that values derived from one location's catalogs need not
+be computed again when another location's change."
+  (gethash (opencode-normalize-directory (or directory default-directory))
+           opencode--catalog-generations 0))
+
+(defun opencode--catalog-missing-p (key)
+  "Return non-nil when catalog KEY is not cached."
+  (eq (gethash key opencode--catalogs 'missing) 'missing))
+
+(defun opencode--catalog-wanted-p (key)
+  "Return non-nil when catalog KEY should be fetched for displays.
+It should when it is missing or stale, and neither fetched, queued, nor
+failed on this stream."
+  (and (or (opencode--catalog-missing-p key) (gethash key opencode--catalog-stale))
+       (not (gethash key opencode--catalog-failed))
+       (not (gethash key opencode--catalog-waiters))
+       (not (gethash key opencode--catalog-scheduled))))
+
+(defvar opencode--mode-line-directories nil
+  "Directories of the session buffers whose mode lines wait to be updated, or t for all.")
+
+(defvar opencode--mode-line-timer nil
+  "Timer updating the mode lines `opencode--mode-line-directories' names.")
+
+(defun opencode--update-mode-lines (&optional directory)
+  "Update the mode lines of DIRECTORY's session buffers, else of every one.
+Only those shown are redrawn, once however many calls a tick makes:
+forcing every mode line of every frame instead costs tens of
+milliseconds with many frames, and so did each catalog arriving."
+  (cond ((null directory) (setq opencode--mode-line-directories t))
+        ((listp opencode--mode-line-directories)
+         (cl-pushnew (opencode-normalize-directory directory) opencode--mode-line-directories
+                     :test #'equal)))
+  (unless (timerp opencode--mode-line-timer)
+    (setq opencode--mode-line-timer (run-at-time 0 nil #'opencode--update-mode-lines-now))))
+
+(defun opencode--update-mode-lines-now ()
+  "Update the mode lines `opencode--update-mode-lines' was asked for."
+  (let ((directories opencode--mode-line-directories))
+    (setq opencode--mode-line-timer nil
+          opencode--mode-line-directories nil)
+    (maphash (lambda (_id buffer)
+               (when (and (buffer-live-p buffer) (get-buffer-window buffer t))
+                 (with-current-buffer buffer
+                   (when (or (eq directories t)
+                             (member (opencode-normalize-directory default-directory) directories))
+                     (force-mode-line-update)))))
+             opencode-session-buffers)))
+
+(defun opencode--catalog-store (key data epoch)
+  "Cache DATA as catalog KEY, fetched since stream opening EPOCH.
+Return non-nil when it changed, after updating the mode lines that may
+show it.  DATA stays stale when the stream reopened since the fetch
+began, as the service may have changed meanwhile."
+  (let ((changed (not (equal (gethash key opencode--catalogs 'missing) data))))
+    (puthash key data opencode--catalogs)
+    (remhash key opencode--catalog-failed)
+    (if (= epoch opencode--catalog-epoch)
+        (remhash key opencode--catalog-stale)
+      (puthash key t opencode--catalog-stale))
+    (when changed
+      (cl-incf opencode-catalog-generation)
+      (cl-incf (gethash (car key) opencode--catalog-generations 0))
+      (opencode--update-mode-lines (car key)))
+    changed))
+
+(defun opencode--catalog-start (key)
+  "Fetch catalog KEY, then settle the callbacks waiting for it.
+A location's catalogs fill in shortly after its first request, so an
+empty answer is asked again before being cached."
+  (let ((epoch opencode--catalog-epoch)
+        (directory (car key))
+        (kind (cdr key)))
+    (cl-labels ((settle (function)
+                  (let ((waiters (nreverse (gethash key opencode--catalog-waiters))))
+                    (remhash key opencode--catalog-waiters)
+                    ;; Its slot is free for the fetches queued.
+                    (opencode--catalog-schedule)
+                    (funcall function waiters)))
+                (fetch (retries)
+                  (opencode-request
+                   'get (alist-get kind opencode--catalog-paths)
+                   :directory directory :buffer nil
+                   :then (lambda (response)
+                           (let ((data (opencode-request-data response)))
+                             (if (and (null data) (> retries 0))
+                                 (run-at-time 0.5 nil #'fetch (1- retries))
+                               (let ((changed (opencode--catalog-store key data epoch)))
+                                 (when (gethash key opencode--catalog-refetch)
+                                   (remhash key opencode--catalog-refetch)
+                                   (puthash key t opencode--catalog-stale)
+                                   (opencode--catalog-enqueue key))
+                                 (settle (lambda (waiters)
+                                           (dolist (waiter waiters)
+                                             (funcall (car waiter) data))))
+                                 (when changed
+                                   (opencode-state--run-hook 'opencode-catalog-changed-functions
+                                                             kind directory))))))
+                   :else (lambda (error)
+                           (remhash key opencode--catalog-refetch)
+                           (puthash key t opencode--catalog-failed)
+                           (settle (lambda (waiters)
+                                     (when (seq-some (lambda (waiter) (null (cdr waiter))) waiters)
+                                       (opencode-report-error (opencode-error-describe error)))
+                                     (dolist (waiter waiters)
+                                       (when (cdr waiter) (funcall (cdr waiter) error)))))))))
+      (fetch 2))))
+
+(defun opencode--catalog-join (key callback else)
+  "Have the fetch of catalog KEY call CALLBACK, or ELSE when it fails.
+The fetch starts unless one runs."
+  (let ((running (gethash key opencode--catalog-waiters)))
+    (push (cons callback else) (gethash key opencode--catalog-waiters))
+    (unless running
+      (opencode--catalog-start key))))
 
 (defun opencode-catalog-fetch (kind callback &optional directory else)
   "Call CALLBACK with the KIND catalog of DIRECTORY, fetching it when needed.
 ELSE, when given, receives the `opencode-error' of a failed fetch, which
-is otherwise reported.  A location's catalogs fill in shortly after its
-first request, so an empty answer is fetched again before being cached."
-  (let* ((directory (opencode-normalize-directory (or directory default-directory)))
-         (key (cons directory kind))
+is otherwise reported.  A stale catalog is fetched again first, so that
+commands act on the service's current one."
+  (let* ((key (opencode--catalog-key kind directory))
          (cached (gethash key opencode--catalogs 'missing)))
-    (if (not (eq cached 'missing))
-        (funcall callback cached)
-      (push (cons callback else) (gethash key opencode--catalog-waiters))
-      (when (null (cdr (gethash key opencode--catalog-waiters)))
-        (cl-labels ((finish (function value)
-                      (let ((waiters (nreverse (gethash key opencode--catalog-waiters))))
-                        (remhash key opencode--catalog-waiters)
-                        (funcall function waiters value)))
-                    (fetch (retries)
-                      (opencode-request
-                       'get (alist-get kind opencode--catalog-paths)
-                       :directory directory :buffer nil
-                       :then (lambda (response)
-                               (let ((data (opencode-request-data response)))
-                                 (if (and (null data) (> retries 0))
-                                     (run-at-time 0.5 nil #'fetch (1- retries))
-                                   (puthash key data opencode--catalogs)
-                                   (cl-incf opencode-catalog-generation)
-                                   (finish (lambda (waiters data)
-                                             (dolist (waiter waiters)
-                                               (funcall (car waiter) data)))
-                                           data)
-                                   (opencode-state--run-hook 'opencode-catalog-changed-functions
-                                                             kind directory))))
-                       :else (lambda (error)
-                               (finish (lambda (waiters error)
-                                         (when (seq-some (lambda (waiter) (null (cdr waiter))) waiters)
-                                           (opencode-report-error (opencode-error-describe error)))
-                                         (dolist (waiter waiters)
-                                           (when (cdr waiter) (funcall (cdr waiter) error))))
-                                       error)))))
-          (fetch 2))))))
+    (if (or (eq cached 'missing) (gethash key opencode--catalog-stale))
+        (opencode--catalog-join key callback else)
+      (funcall callback cached))))
 
 (defun opencode-catalog-wait (kind &optional directory)
   "Return the KIND catalog of DIRECTORY, waiting for it when not cached.
 For commands that prompt with it; see `opencode-wait'."
   (opencode-wait (lambda (then else) (opencode-catalog-fetch kind then directory else))))
 
+(defun opencode--catalog-enqueue (key)
+  "Queue the fetch of catalog KEY for displays."
+  (unless (gethash key opencode--catalog-scheduled)
+    (puthash key t opencode--catalog-scheduled)
+    (setq opencode--catalog-queue (nconc opencode--catalog-queue (list key))))
+  (opencode--catalog-schedule))
+
+(defun opencode--catalog-schedule ()
+  "Start the queued catalog fetches from a timer.
+Displays ask at redisplay, and a timer also lets one redisplay's asks
+queue up before any starts."
+  (when (and opencode--catalog-queue (not (timerp opencode--catalog-timer)))
+    (setq opencode--catalog-timer (run-at-time 0 nil #'opencode--catalog-pump))))
+
+(defun opencode--catalog-pump ()
+  "Start queued catalog fetches while fewer than `opencode-catalog-requests' run.
+Those of catalogs not cached go first: displays show identifiers until
+they arrive, and a stale catalog meanwhile."
+  (setq opencode--catalog-timer nil)
+  (setq opencode--catalog-queue
+        (append (seq-filter #'opencode--catalog-missing-p opencode--catalog-queue)
+                (seq-remove #'opencode--catalog-missing-p opencode--catalog-queue)))
+  (while (and opencode--catalog-queue
+              (< (hash-table-count opencode--catalog-waiters) (max 1 opencode-catalog-requests)))
+    (let* ((key (pop opencode--catalog-queue))
+           (missing (opencode--catalog-missing-p key)))
+      (remhash key opencode--catalog-scheduled)
+      (when (opencode--catalog-wanted-p key)
+        ;; Displays have the stale catalog meanwhile, so failing to
+        ;; renew it is not worth a report.
+        (opencode--catalog-join key #'ignore (unless missing #'ignore))))))
+
 (defun opencode-catalog-ensure (kind &optional directory)
   "Return the cached KIND catalog of DIRECTORY, else fetch it in the background.
-Return nil while fetching; mode lines are redisplayed once it arrives,
-and `opencode-catalog-changed-functions' run.
-Callers run at redisplay, so the request starts from a timer."
-  (let* ((directory (opencode-normalize-directory (or directory default-directory)))
-         (key (cons directory kind))
+Return nil while it is not cached.  A stale catalog is returned, and
+fetched again in the background.  Callers run at redisplay, so fetches
+start from a timer, at most `opencode-catalog-requests' at a time;
+once a catalog arrives changed, the mode lines of its location's
+session buffers are updated and `opencode-catalog-changed-functions'
+run.  A failed fetch is not tried again before the stream reopens or
+an event says the catalog changed."
+  (let* ((key (opencode--catalog-key kind directory))
          (cached (gethash key opencode--catalogs 'missing)))
-    (if (not (eq cached 'missing))
-        cached
-      ;; One redisplay may ask several times before the timer runs.
-      (unless (or (gethash key opencode--catalog-waiters)
-                  (gethash key opencode--catalog-scheduled))
-        (puthash key t opencode--catalog-scheduled)
-        (run-at-time 0 nil
-                     (lambda ()
-                       (remhash key opencode--catalog-scheduled)
-                       (opencode-catalog-fetch kind (lambda (_) (force-mode-line-update t))
-                                               directory))))
-      nil)))
+    (when (opencode--catalog-wanted-p key)
+      (opencode--catalog-enqueue key))
+    (unless (eq cached 'missing) cached)))
 
 (defun opencode--invalidate-catalog (event)
-  "Forget the catalog EVENT says changed in its location."
+  "Fetch again the catalogs EVENT says changed in its location.
+Displays keep the cached ones until the new ones arrive, and a fetch
+running may answer from before the change, so another follows it."
   (when-let* ((directory (opencode-event-directory event))
-              (kind (pcase (alist-get 'type event)
-                      ("agent.updated" '(agent))
-                      ((or "model.updated" "provider.updated" "integration.updated") '(model provider))
-                      ("command.updated" '(command)))))
-    (dolist (one kind)
-      (when (opencode-catalog-cached-p one directory)
-        (remhash (cons directory one) opencode--catalogs)
-        (opencode-state--run-hook 'opencode-catalog-changed-functions one directory)))
-    (cl-incf opencode-catalog-generation)))
+              (kinds (pcase (alist-get 'type event)
+                       ("agent.updated" '(agent))
+                       ((or "model.updated" "provider.updated" "integration.updated") '(model provider))
+                       ("command.updated" '(command)))))
+    (dolist (kind kinds)
+      (let ((key (cons directory kind)))
+        (remhash key opencode--catalog-failed)
+        (when (gethash key opencode--catalog-waiters)
+          (puthash key t opencode--catalog-refetch))
+        (unless (opencode--catalog-missing-p key)
+          (puthash key t opencode--catalog-stale)
+          (unless (gethash key opencode--catalog-waiters)
+            (opencode--catalog-enqueue key)))))))
 
-(defun opencode--clear-catalogs (_event)
-  "Forget every catalog when a stream opens: the service may have changed."
-  (let ((cached (> (hash-table-count opencode--catalogs) 0)))
-    (clrhash opencode--catalogs)
-    (cl-incf opencode-catalog-generation)
-    (when cached
-      (opencode-state--run-hook 'opencode-catalog-changed-functions nil nil))))
+(defun opencode--catalogs-connected (_event)
+  "Mark every cached catalog stale when a stream opens: the service may have changed.
+Displays keep showing them, and the first asking for one again fetches
+it, so that a reconnection costs only the requests of the catalogs in
+use, and redraws only for those that changed."
+  (cl-incf opencode--catalog-epoch)
+  (clrhash opencode--catalog-failed)
+  (maphash (lambda (key _) (puthash key t opencode--catalog-stale)) opencode--catalogs))
 
 (dolist (type '("agent.updated" "model.updated" "provider.updated" "integration.updated"
                 "command.updated"))
   (opencode-events-register type #'opencode--invalidate-catalog))
-(opencode-events-register "server.connected" #'opencode--clear-catalogs)
+(opencode-events-register "server.connected" #'opencode--catalogs-connected)
 
 (defun opencode-agent-info (agent &optional directory)
   "Return the catalog entry of AGENT in DIRECTORY, if fetched."

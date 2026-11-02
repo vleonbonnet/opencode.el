@@ -29,9 +29,11 @@
 ;;
 ;; They read the location's cached catalogs and never wait: a value
 ;; needing a catalog that is not fetched yet is nil, and the fetch
-;; starts.  Once it arrives, mode lines are redisplayed and
-;; `opencode-catalog-changed-functions' run, for other displays to
-;; compute theirs again.
+;; starts.  Once it arrives, the mode lines of the location's session
+;; buffers are redrawn and `opencode-catalog-changed-functions' run, for
+;; other displays to compute theirs again.  A reconnection keeps the
+;; catalogs, which displays go on showing while the first asking for
+;; one again has it renewed; it counts as a change only if it differs.
 ;;
 ;; A model can cost more per token once a request exceeds a context size,
 ;; as listed in its catalog pricing or in `opencode-long-context-tiers'.

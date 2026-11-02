@@ -145,10 +145,13 @@ Until the catalogs arrive, the agent, model and provider go by their IDs."
   "Return the session details as an alist of (SEGMENT . STRING-OR-NIL).
 SEGMENT is one of `agent', `model', `short-model', `variant', `provider'
 and `context'; `short-model' drops a leading \"Claude \".  They are
-computed again only when the session or a catalog changed, as the mode
-line is redrawn on every streamed chunk."
+computed again only when the session or its location's catalogs
+changed, as the mode line is redrawn on every streamed chunk, and once
+after each reconnection, so that the displays ask again for the
+catalogs it left stale (see `opencode-catalog-ensure')."
   (let ((key (list opencode-session-agent opencode-session-model opencode-session-tokens
-                   opencode-session-tokens-estimated opencode-catalog-generation default-directory
+                   opencode-session-tokens-estimated default-directory
+                   (opencode-catalog-location-generation) opencode--catalog-epoch
                    opencode-provider-icons opencode-mode-line-agent-faces opencode-default-variant-function
                    opencode-long-context-tiers opencode-long-context-near)))
     (if (equal key (car opencode--mode-line-segments))
@@ -178,7 +181,7 @@ line is redrawn on every streamed chunk."
 (defun opencode-mode-line-flush ()
   "Forget the measured widths of mode-line text, after fonts changed."
   (clrhash opencode--mode-line-width-cache)
-  (force-mode-line-update t))
+  (opencode--update-mode-lines))
 
 (defun opencode-mode-line-escape (string)
   "Return STRING with each % doubled, keeping its text properties."

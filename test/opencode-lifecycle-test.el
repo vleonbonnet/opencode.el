@@ -440,24 +440,22 @@ The stream then reopens for the session registry's clients."
   (declare (indent 1) (debug t))
   `(opencode-test-with-service
      (setf (opencode-test-service-routes opencode-test-service) (opencode-test-lifecycle-routes))
-     (let ((opencode-session-buffers (make-hash-table :test #'equal))
-           (opencode--catalogs (make-hash-table :test #'equal))
-           (opencode--catalog-waiters (make-hash-table :test #'equal))
-           (opencode--catalog-scheduled (make-hash-table :test #'equal))
-           (opencode-send-checks nil)
-           (opencode-before-send-functions nil)
-           (opencode-last-session-buffer nil)
-           (opencode-notify-os-function #'ignore)
-           (,buffer nil))
-       (cl-letf (((symbol-function 'display-buffer) (lambda (&rest _) (ert-fail "Unexpected display"))))
-         (unwind-protect
-             (progn
-               (opencode-session-open-by-id opencode-test-lifecycle-session :no-display t
-                                            :callback (lambda (_) (setq ,buffer (current-buffer))))
-               (opencode-test-wait-for (lambda () ,buffer))
-               (opencode-test-wait-for #'opencode-events-connected-p)
-               ,@body)
-           (when (buffer-live-p ,buffer) (kill-buffer ,buffer)))))))
+     (opencode-test-with-fresh-catalogs
+       (let ((opencode-session-buffers (make-hash-table :test #'equal))
+             (opencode-send-checks nil)
+             (opencode-before-send-functions nil)
+             (opencode-last-session-buffer nil)
+             (opencode-notify-os-function #'ignore)
+             (,buffer nil))
+         (cl-letf (((symbol-function 'display-buffer) (lambda (&rest _) (ert-fail "Unexpected display"))))
+           (unwind-protect
+               (progn
+                 (opencode-session-open-by-id opencode-test-lifecycle-session :no-display t
+                                              :callback (lambda (_) (setq ,buffer (current-buffer))))
+                 (opencode-test-wait-for (lambda () ,buffer))
+                 (opencode-test-wait-for #'opencode-events-connected-p)
+                 ,@body)
+             (when (buffer-live-p ,buffer) (kill-buffer ,buffer))))))))
 
 (defun opencode-test-type-prompt (buffer text)
   "Type TEXT at the input of BUFFER and send it as RET does."

@@ -206,13 +206,10 @@ Its arrival runs `opencode-catalog-changed-functions'."
   (opencode-test-with-server
     (let ((opencode-test-routes (opencode-test-display-routes))
           (workspace (opencode-normalize-directory opencode-test-workspace))
-          (timers nil)
           (changes nil))
       (let ((opencode-catalog-changed-functions
              (list (lambda (kind directory) (push (list kind directory) changes)))))
-        (cl-letf (((symbol-function 'run-at-time)
-                   (lambda (_time _repeat function &rest arguments)
-                     (push (cons function arguments) timers))))
+        (opencode-test-with-held-timers
           (should-not (opencode-model-display opencode-test-claude workspace))
           (should-not (opencode-provider-display "anthropic" workspace))
           (should-not (opencode-variant-display opencode-test-claude workspace))
@@ -220,11 +217,11 @@ Its arrival runs `opencode-catalog-changed-functions'."
           ;; A selected variant needs no catalog.
           (should (equal (opencode-variant-display opencode-test-sol workspace) "low"))
           (should-not opencode-test-requests)
-          ;; One fetch per catalog, however many displays asked for it.
-          (should (= (length timers) 2)))
-        (should-not changes)
-        (dolist (timer (reverse timers))
-          (apply (car timer) (cdr timer)))
+          ;; One timer starts every fetch asked for.
+          (should (= (length opencode-test-timers) 1))
+          (should-not changes)
+          (opencode-test-run-timers))
+        ;; One fetch per catalog, however many displays asked for it.
         (should (equal (sort (mapcar (lambda (request) (plist-get request :path)) opencode-test-requests))
                        '("/api/model" "/api/provider")))
         (should (equal (sort (copy-sequence changes) :key #'car)
@@ -235,29 +232,50 @@ Its arrival runs `opencode-catalog-changed-functions'."
         (should (equal (opencode-context-display 1000 opencode-test-claude workspace) "\U000F0A9E 0%"))))))
 
 (ert-deftest opencode-test-catalog-changed-hook ()
-  "Forgetting a cached catalog runs the hook; forgetting none does not."
+  "The hook runs when a catalog arrives different, not when it is renewed unchanged."
   (opencode-test-with-catalogs
     (let* ((workspace (opencode-normalize-directory opencode-test-workspace))
            (changes nil)
            (opencode-catalog-changed-functions
             (list (lambda (kind directory) (push (list kind directory) changes))))
+           (renamed nil)
+           (opencode-test-routes
+            (cons (list 'get "\\`/api/model\\'"
+                        (lambda (_)
+                          `((data . ,(append (alist-get 'data (opencode-test-fixture "model.json"))
+                                             (mapcar (lambda (model)
+                                                       (if (and renamed (equal (alist-get 'id model) "claude-opus-5-5"))
+                                                           (cons '(name . "Claude Opus 5.6") model)
+                                                         model))
+                                                     opencode-test-display-models))))))
+                  (opencode-test-display-routes)))
            (event (lambda (type)
                     `((type . ,type) (location (directory . ,(directory-file-name opencode-test-workspace)))
                       (data)))))
-      (opencode-test-dispatch (list (funcall event "agent.updated")))
-      (should-not changes)
-      (opencode-test-dispatch (list (funcall event "model.updated")))
-      (should (equal (reverse changes) `((model ,workspace) (provider ,workspace))))
-      (should-not (opencode-catalog-cached-p 'model workspace))
-      (cl-letf (((symbol-function 'run-at-time) #'ignore))
-        (should-not (opencode-model-display opencode-test-claude workspace)))
-      (opencode-catalog-fetch 'model #'ignore workspace)
-      (should (equal (car changes) `(model ,workspace)))
-      (setq changes nil)
-      (opencode-test-dispatch '(((type . "server.connected") (data))))
-      (should (equal changes '((nil nil))))
-      (opencode-test-dispatch '(((type . "server.connected") (data))))
-      (should (equal changes '((nil nil)))))))
+      (opencode-test-with-held-timers
+        ;; The agent catalog was never fetched: nothing to renew.
+        (opencode-test-dispatch (list (funcall event "agent.updated")))
+        (opencode-test-run-timers)
+        (should-not changes)
+        (should-not (opencode-catalog-cached-p 'agent workspace))
+        ;; Both catalogs are renewed, and found unchanged.
+        (setq opencode-test-requests nil)
+        (opencode-test-dispatch (list (funcall event "model.updated")))
+        (should (equal (opencode-model-display opencode-test-claude workspace) "Opus 5.5"))
+        (opencode-test-run-timers)
+        (should (equal (sort (mapcar (lambda (request) (plist-get request :path)) opencode-test-requests))
+                       '("/api/model" "/api/provider")))
+        (should-not changes)
+        (setq renamed t)
+        (opencode-test-dispatch (list (funcall event "model.updated")))
+        (opencode-test-run-timers)
+        (should (equal changes `((model ,workspace))))
+        (should (equal (opencode-model-display opencode-test-claude workspace) "Opus 5.6"))
+        ;; A reconnection announces nothing by itself.
+        (setq changes nil)
+        (opencode-test-dispatch '(((type . "server.connected") (data))))
+        (opencode-test-run-timers)
+        (should-not changes)))))
 
 (ert-deftest opencode-test-display-agent ()
   "Agents show their catalog name, bold, in their color, else a face by their place."
@@ -327,6 +345,228 @@ Its arrival runs `opencode-catalog-changed-functions'."
               (same 'context (opencode-context-display 250000 model)))))
         (should (equal (alist-get 'short-model (opencode-mode-line-segments)) "Opus 5.5"))
         (should (equal (alist-get 'context (opencode-mode-line-segments)) "\U000F0A9F 25% 2×"))))))
+
+;;;; Catalogs
+
+;; Displays ask for catalogs at redisplay.  A reconnection leaves the
+;; cached ones stale, still shown, and renews only those displays ask
+;; for again; only a catalog arriving different counts as a change, and
+;; it updates the mode lines of its location's session buffers alone,
+;; once per tick.
+
+(defun opencode-test-catalog-paths ()
+  "Return the (PATH DIRECTORY) of the catalog requests made, oldest first."
+  (seq-keep (lambda (request)
+              (when (member (plist-get request :path) '("/api/agent" "/api/model" "/api/provider"))
+                (list (plist-get request :path) (opencode-normalize-directory (plist-get request :directory)))))
+            (reverse opencode-test-requests)))
+
+(defun opencode-test-other-location ()
+  "Return a new scratch directory, normalized, standing for another location."
+  (opencode-normalize-directory (make-temp-file "opencode-location-" t)))
+
+(ert-deftest opencode-test-catalog-arrivals-update-mode-lines-once ()
+  "Catalogs arriving update the shown mode lines of their location alone, in one pass.
+Forcing every mode line of every frame once per catalog froze Emacs for
+seconds after a reconnection, with many frames and locations."
+  (opencode-test-with-server
+    (opencode-test-with-held-timers
+      (let* ((opencode-test-routes (opencode-test-display-routes))
+             (here (opencode-test-open (opencode-test-scenario "switch")))
+             (there (opencode-test-open (opencode-test-scenario "text")))
+             ;; It shares the location, but no window shows it.
+             (hidden (opencode-test-open (opencode-test-scenario "shell")))
+             (updates nil)
+             (passes 0))
+        (with-current-buffer there
+          (setq default-directory (opencode-test-other-location)))
+        (opencode-test-run-timers)
+        (clrhash opencode--catalogs)
+        (setq opencode-test-requests nil)
+        (save-window-excursion
+          (delete-other-windows)
+          (set-window-buffer (selected-window) here)
+          (set-window-buffer (split-window) there)
+          (cl-letf* ((update (symbol-function 'opencode--update-mode-lines-now))
+                     ((symbol-function 'opencode--update-mode-lines-now)
+                      (lambda () (cl-incf passes) (funcall update)))
+                     ((symbol-function 'force-mode-line-update)
+                      (lambda (&optional all) (push (if all 'all (current-buffer)) updates))))
+            (with-current-buffer here
+              (should-not (opencode-agent-display "build"))
+              (should-not (opencode-model-display opencode-session-model))
+              (should-not (opencode-provider-display "openai")))
+            (opencode-test-run-timers)
+            (should (= (length (opencode-test-catalog-paths)) 3))
+            (should (= passes 1))
+            (should (equal updates (list here)))
+            ;; Renewed unchanged, a catalog redraws nothing.
+            (setq updates nil passes 0)
+            (opencode-test-dispatch
+             `(((type . "agent.updated")
+                (location (directory . ,(directory-file-name opencode-test-workspace))) (data))))
+            (opencode-test-run-timers)
+            (should (= (length (opencode-test-catalog-paths)) 4))
+            (should (= passes 0))
+            (should-not updates)))
+        (should (buffer-live-p hidden))))))
+
+(ert-deftest opencode-test-catalogs-stale-across-reconnection ()
+  "A reconnection keeps catalogs shown and renews only those asked for again.
+A renewed catalog counts as a change only when it differs."
+  (opencode-test-with-catalogs
+    (let* ((workspace (opencode-normalize-directory opencode-test-workspace))
+           (other (opencode-test-other-location))
+           (changes nil)
+           (opencode-catalog-changed-functions
+            (list (lambda (kind directory) (push (list kind directory) changes))))
+           (renamed nil)
+           (opencode-test-routes
+            (cons (list 'get "\\`/api/model\\'"
+                        (lambda (_)
+                          `((data . ,(append (alist-get 'data (opencode-test-fixture "model.json"))
+                                             (mapcar (lambda (model)
+                                                       (if (and renamed (equal (alist-get 'id model) "claude-opus-5-5"))
+                                                           (cons '(name . "Claude Opus 5.6") model)
+                                                         model))
+                                                     opencode-test-display-models))))))
+                  opencode-test-routes)))
+      (opencode-catalog-fetch 'model #'ignore other)
+      (setq changes nil
+            opencode-test-requests nil)
+      (let ((generation opencode-catalog-generation)
+            (location (opencode-catalog-location-generation workspace))
+            (other-location (opencode-catalog-location-generation other)))
+        (opencode-test-with-held-timers
+          (opencode-test-dispatch '(((type . "server.connected") (data))))
+          (opencode-test-run-timers)
+          ;; Shown as before, and nothing fetched until asked for.
+          (should-not (opencode-test-catalog-paths))
+          (should (equal (opencode-model-display opencode-test-claude workspace) "Opus 5.5"))
+          (should (equal (opencode-model-display opencode-test-claude workspace) "Opus 5.5"))
+          (opencode-test-run-timers)
+          ;; Only the catalog asked for: neither the provider's, nor the other location's.
+          (should (equal (opencode-test-catalog-paths) `(("/api/model" ,workspace))))
+          (should-not changes)
+          (should (= generation opencode-catalog-generation))
+          (should (= location (opencode-catalog-location-generation workspace)))
+          ;; Renewed, it is current: asking again fetches nothing.
+          (opencode-model-display opencode-test-claude workspace)
+          (should (zerop (opencode-test-run-timers)))
+          (should (= (length (opencode-test-catalog-paths)) 1))
+          ;; A service restarted with another catalog.
+          (setq renamed t)
+          (opencode-test-dispatch '(((type . "server.connected") (data))))
+          (should (equal (opencode-model-display opencode-test-claude workspace) "Opus 5.5"))
+          (opencode-test-run-timers)
+          (should (equal changes `((model ,workspace))))
+          (should (= (1+ generation) opencode-catalog-generation))
+          (should (= (1+ location) (opencode-catalog-location-generation workspace)))
+          (should (= other-location (opencode-catalog-location-generation other)))
+          (should (equal (opencode-model-display opencode-test-claude workspace) "Opus 5.6"))
+          ;; The other location's stale catalog is still shown, and renewed once asked for.
+          (should (equal (opencode-model-display opencode-test-claude other) "Opus 5.5"))
+          (opencode-test-run-timers)
+          (should (equal (car (last (opencode-test-catalog-paths))) `("/api/model" ,other)))
+          (should (equal (opencode-model-display opencode-test-claude other) "Opus 5.6")))))))
+
+(ert-deftest opencode-test-catalog-fetch-renews-stale ()
+  "Commands fetching a stale catalog get it renewed, not the stale one."
+  (opencode-test-with-catalogs
+    (let ((workspace opencode-test-workspace)
+          (received nil))
+      (setq opencode-test-requests nil)
+      (opencode-test-dispatch '(((type . "server.connected") (data))))
+      (opencode-catalog-fetch 'provider (lambda (catalog) (push catalog received)) workspace)
+      (should (equal (mapcar #'car (opencode-test-catalog-paths)) '("/api/provider")))
+      (should (= (length received) 1))
+      (opencode-catalog-fetch 'provider (lambda (catalog) (push catalog received)) workspace)
+      (should (= (length (opencode-test-catalog-paths)) 1))
+      (should (equal (car received) (cadr received))))))
+
+(ert-deftest opencode-test-catalog-invalidated-while-fetching ()
+  "An event saying a catalog changed while it is fetched fetches it once more."
+  (opencode-test-with-catalogs
+    (let* ((held nil)
+           (opencode-test-routes
+            (cons (list 'get "\\`/api/agent\\'"
+                        (lambda (_)
+                          (if held
+                              (cons :defer (lambda () (opencode-test-fixture "agent.json")))
+                            (opencode-test-fixture "agent.json"))))
+                  opencode-test-routes))
+           (event `((type . "agent.updated")
+                    (location (directory . ,(directory-file-name opencode-test-workspace))) (data))))
+      (opencode-test-with-held-timers
+        (should-not (opencode-agent-display "build" opencode-test-workspace))
+        (setq held t)
+        (opencode-test-run-timers)
+        (should (= (length (opencode-test-catalog-paths)) 3))
+        (should opencode-test-deferred)
+        (opencode-test-dispatch (list event event))
+        (opencode-test-run-timers)
+        (should (= (length (opencode-test-catalog-paths)) 3))
+        (setq held nil)
+        (opencode-test-release)
+        ;; Shown at once, and renewed, since its answer may predate the change.
+        (should (equal (opencode-agent-display "build" opencode-test-workspace) "Build"))
+        (opencode-test-run-timers)
+        (should (equal (mapcar #'car (last (opencode-test-catalog-paths) 2)) '("/api/agent" "/api/agent")))
+        (should (= (length (opencode-test-catalog-paths)) 4))
+        (opencode-agent-display "build" opencode-test-workspace)
+        (should (zerop (opencode-test-run-timers)))))))
+
+(ert-deftest opencode-test-catalog-fetches-capped ()
+  "Displays fetch a few catalogs at a time, those not cached before stale ones."
+  (opencode-test-with-catalogs
+    (let* ((opencode-catalog-requests 2)
+           (stale (opencode-normalize-directory opencode-test-workspace))
+           (first (opencode-test-other-location))
+           (second (opencode-test-other-location))
+           (opencode-test-routes
+            (cons (list 'get "\\`/api/model\\'"
+                        (lambda (_) (cons :defer (lambda () (opencode-test-fixture "model.json")))))
+                  opencode-test-routes)))
+      (setq opencode-test-requests nil)
+      (opencode-test-with-held-timers
+        (opencode-test-dispatch '(((type . "server.connected") (data))))
+        (dolist (directory (list stale first second))
+          (opencode-model-display opencode-test-sol directory))
+        (opencode-test-run-timers)
+        (should (equal (opencode-test-catalog-paths) `(("/api/model" ,first) ("/api/model" ,second))))
+        (opencode-test-release)
+        (opencode-test-run-timers)
+        (should (equal (car (last (opencode-test-catalog-paths))) `("/api/model" ,stale)))
+        (should (= (length (opencode-test-catalog-paths)) 3))
+        (while (opencode-test-release))
+        (opencode-test-run-timers)
+        (should (= (length (opencode-test-catalog-paths)) 3))
+        (should (equal (opencode-model-display opencode-test-sol first) "GPT-6 Sol"))))))
+
+(ert-deftest opencode-test-catalog-failure-waits-for-reconnection ()
+  "A catalog that failed to arrive is not asked for at every redisplay.
+The next stream asks again, and so does an event saying it changed."
+  (opencode-test-with-server
+    (let ((opencode-test-routes
+           (cons (list 'get "\\`/api/model\\'" (lambda (_) '(:error 500 "Broken")))
+                 opencode-test-routes))
+          (event `((type . "model.updated")
+                   (location (directory . ,(directory-file-name opencode-test-workspace))) (data))))
+      (cl-letf (((symbol-function 'message) #'ignore))
+        (opencode-test-with-held-timers
+          (should-not (opencode-model-display opencode-test-sol opencode-test-workspace))
+          (opencode-test-run-timers)
+          (should (= (length (opencode-test-catalog-paths)) 1))
+          (should-not (opencode-model-display opencode-test-sol opencode-test-workspace))
+          (should (zerop (opencode-test-run-timers)))
+          (opencode-test-dispatch '(((type . "server.connected") (data))))
+          (should-not (opencode-model-display opencode-test-sol opencode-test-workspace))
+          (opencode-test-run-timers)
+          (should (= (length (opencode-test-catalog-paths)) 2))
+          (opencode-test-dispatch (list event))
+          (should-not (opencode-model-display opencode-test-sol opencode-test-workspace))
+          (opencode-test-run-timers)
+          (should (= (length (opencode-test-catalog-paths)) 3)))))))
 
 (provide 'opencode-display-test)
 ;;; opencode-display-test.el ends here
