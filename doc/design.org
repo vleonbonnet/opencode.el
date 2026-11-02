@@ -100,7 +100,7 @@ Emacs's default process filter has every mode line of every frame redrawn after 
 | Catalog requests                  | 159           | 72                     | 72                 |
 | Catalog changes announced         | 160           | 0                      | 0                  |
 
-A redisplay changing nothing costs 0.1 ms throughout, and one forcing every mode line 38 to 41 ms before, 29 to 35 ms after: Emacs's own share is most of it. The Lisp time of a session mode line whose inputs did not change fell from 285 to 320 µs to 76 to 138 µs, most of what remains formatting the rest of the mode line. The list is not redrawn at a reconnection, since the registry finds nothing changed, so only the session buffers' catalogs are renewed; a list redrawn then, as drover's is after its own reconnection requests, renews those it shows too, four at a time, redrawing nothing when they are unchanged.
+A redisplay changing nothing costs 0.1 ms throughout, and one forcing every mode line 38 to 41 ms before, 29 to 35 ms after: Emacs's own share is most of it. The Lisp time of a session mode line whose inputs did not change fell from 285 to 320 µs to 76 to 138 µs, most of what remains formatting the rest of the mode line. The list is not redrawn at a reconnection, since the registry finds nothing changed, so only the session buffers' catalogs are renewed; a list redrawn then, as drover's is after its own reconnection requests, renews those it shows too, four at a time, redrawing nothing when they are unchanged. The benchmark has since grown into the one of [[*Catching up after a reconnection][Catching up after a reconnection]], whose sessions change while the stream is down.
 
 * No session list
 
@@ -139,6 +139,22 @@ At a reconnection, every buffer fetches its session, adopting its location, titl
 Answers and events race: an event arriving while a buffer fetches may be in the answer already, or not. So a buffer withholds its session's events from the stream's reopening, and from the start of any whole load, until it has written what it fetched, then applies them in order, and nothing already rendered is rendered twice. An event appending a known message renders nothing; events of the parts of a finished step change nothing; a step still running in the answer has its finished parts noted as shown, and those still empty, whose deltas were missed, are shown whole when they end; a tool call never goes back from finished to running. A withheld end of a tool call shown finished already still runs the hooks of a finished call, as the call did end live, and the status is first set to the one before the first withheld turn event, so that applying them leaves the status they lead to.
 
 Buffers shown in a window catch up first, =opencode-resync-requests= at a time. A reconnection during a catch-up abandons it and begins again; a buffer loading its whole transcript catches up once loaded, as its answer may predate the reconnection. Transcripts are written =opencode-replay-slice= seconds at a time from timers. While a buffer writes its whole transcript, its windows show its start between slices, which redisplay fontified already, rather than the newest text of every slice, tens of milliseconds a slice for a window of Markdown; they go back to its end once it is written. Summaries written meanwhile are fitted only where a window shows them, or will once redisplayed: fitting thousands after each slice cost tens of milliseconds, and those elsewhere are fitted when scrolled to.
+
+=dev/bench/run.sh= now opens 26 session buffers in its graphical =emacs -Q= with the user's garbage collection thresholds (100 MiB, 0.5), 24 of them shown in 21 frames, three of them split, the list in the 22nd: four transcripts of 400 turns, eight of 60 and fourteen of 8, of six parts each (a prompt, reasoning, a file read, a shell command with its output, an answer in Markdown, with a table every seventh turn, and the turn's end), 2400 parts for the long ones. While the stream is down before each reconnection, the service adds a turn to half of the open sessions, the long ones included, and starts or ends a turn in another, which then runs at the reconnection; before the second, it also reverts a long session's last turn and replaces it, so that one buffer must render its whole transcript again. Three sessions of the list live in directories that do not exist. After the last reconnection, every open buffer is compared with its whole transcript rendered afresh. Over two runs of three reconnections each, the second one being the revert:
+
+| Per reconnection                  | Before         | After, others | After, with the revert |
+|-----------------------------------+----------------+---------------+------------------------|
+| Until settled                     | 2.3 to 13.7 s  | 1.4 to 1.5 s  | 2.2 to 2.3 s           |
+| Longest main-thread block         | 1.1 to 7.6 s   | 40 to 46 ms   | 75 to 83 ms            |
+| Time in blocks over 50 ms         | 1.9 to 12.3 s  | 0             | 0.26 to 0.44 s         |
+| Time in blocks over 100 ms        | 1.5 to 12.1 s  | 0             | 0                      |
+| Transcripts written whole         | 14 to 15       | 0             | 1                      |
+| Pages of newest messages          | 0 to 1         | 27            | 26, and 6 more         |
+| Garbage collections               | 8 to 45        | 0             | 1                      |
+| Locations not found reported      | 9              | 0             | 0                      |
+| Buffers differing from afresh     | 0              | 0             | 0                      |
+
+Before, five of the six reconnections settled in 9.4 to 13.7 s, holding Emacs for 3 to 7.6 s at once, as the user's did. What remains is mostly the 166 catalog requests renewing the stale catalogs, four at a time, which the list, redrawn as the registry saw the sessions change, asks for. Opening the 26 buffers, which writes 26 whole transcripts, settles in 6.5 to 11 s instead of 16.5 to 21, and holds Emacs at most 1 s instead of 5: what remains is the first fontification of the 24 windows, which creates their parsers.
 
 * Writing a transcript in linear time
 

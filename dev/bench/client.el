@@ -14,20 +14,28 @@
 ;; service of service.el, through $BENCH_ROOT/service.json, and never
 ;; runs the OpenCode CLI.  The scene stands for a heavy user's: moody
 ;; and minions in the mode line, FiraCode Nerd Font, the tron-legacy
-;; theme, $BENCH_FRAMES frames showing session buffers of distinct
-;; locations, a few of them split, and a list of every session drawn
-;; with the displays of opencode-display.el as drover draws its own,
-;; redrawn 0.1 s after the registry or a catalog changed.
+;; theme, the user's garbage collection thresholds, $BENCH_OPEN session
+;; buffers of distinct locations with long transcripts, as many as
+;; $BENCH_FRAMES frames have windows shown in them, a few frames split,
+;; the others hidden, and a list of every session drawn with the
+;; displays of opencode-display.el as drover draws its own, redrawn
+;; 0.1 s after the registry or a catalog changed.
 ;;
 ;; It measures the first load, then $BENCH_RECONNECTS reconnections of
-;; the event stream, each from the stream's `server.connected' until
-;; nothing is in flight for two seconds: the longest the main thread
-;; went without running a 10 ms timer, the time it spent in gaps over
-;; 50 ms, the redraws of every mode line forced, the mode-line updates
-;; of one buffer, the catalog requests and announcements, and the
-;; calls of `opencode-mode-line' with their cost.  It then measures a
-;; steady redisplay, unforced and with every mode line forced.  Results
-;; go to $BENCH_OUT as an alist.
+;; the event stream.  Before each, with the stream down, the service
+;; adds a turn to half of the open sessions and starts or ends one in
+;; another, as agents working while Emacs is disconnected do.  Each is
+;; measured from the stream's `server.connected' until nothing is in
+;; flight for two seconds: the longest the main thread went without
+;; running a 10 ms timer, the time it spent in gaps over 50 and over
+;; 100 ms, the garbage collections, the transcript requests by kind,
+;; the redraws of every mode line forced, the mode-line updates of one
+;; buffer, the catalog requests and announcements, the reports of
+;; locations not found, and the calls of `opencode-mode-line' with their
+;; cost.  It then checks that every open buffer shows what a buffer
+;; rendering its whole transcript afresh shows, and measures a steady
+;; redisplay, unforced and with every mode line forced.  Results go to
+;; $BENCH_OUT as an alist.
 
 ;;; Code:
 
@@ -39,10 +47,16 @@
   "File the results are written to.")
 (defvar bench-frames (string-to-number (or (getenv "BENCH_FRAMES") "22"))
   "Number of frames; the last shows the list, three others are split.")
+(defvar bench-open (string-to-number (or (getenv "BENCH_OPEN") "26"))
+  "Number of session buffers open.")
 (defvar bench-reconnects (string-to-number (or (getenv "BENCH_RECONNECTS") "3"))
   "Number of reconnections measured.")
 (defvar bench-builds (expand-file-name (or (getenv "BENCH_BUILDS") "~/.emacs.d/elpaca/builds"))
   "Directory of the packages dressing the mode line, one subdirectory each.")
+
+;; As the user's configuration has them: collections are rare.
+(setq gc-cons-threshold (string-to-number (or (getenv "BENCH_GC_THRESHOLD") "104857600"))
+      gc-cons-percentage 0.5)
 
 ;; Never the user's service, nor the CLI.
 (setq opencode-service-registration-file (expand-file-name "service.json" bench-root)
@@ -53,6 +67,9 @@
 (add-to-list 'custom-theme-load-path (expand-file-name "tron-legacy-theme" bench-builds))
 
 (require 'opencode)
+
+(when (getenv "BENCH_SLICE")
+  (setq opencode-replay-slice (string-to-number (getenv "BENCH_SLICE"))))
 
 ;;;; The scene
 
@@ -139,8 +156,12 @@ run, so they are made first, showing nothing yet."
   "Return the frames of the scene, the initial one first."
   (cons (selected-frame) (remq (selected-frame) (reverse (frame-list)))))
 
+(defvar bench-buffers nil
+  "The session buffers open, in the order their windows were made.")
+
 (defun bench-scene (then)
-  "Open frames showing session buffers of distinct locations and the list, then call THEN."
+  "Open session buffers of distinct locations, show them in frames with the list, then call THEN.
+Those that no window shows stay open, hidden."
   (opencode-state-ensure)
   (bench-when
    #'opencode-state-ready-p 30 "the registry"
@@ -150,23 +171,23 @@ run, so they are made first, showing nothing yet."
                                     (unless (member (plist-get entry :directory) seen)
                                       (push (plist-get entry :directory) seen)))
                                   (opencode-state-sessions)))
-            (buffers nil)
-            (wanted (+ bench-frames 2)))
-       (dolist (entry (seq-take sessions wanted))
+            (buffers nil))
+       (dolist (entry (seq-take sessions bench-open))
          (opencode-session-open-by-id (plist-get entry :id) :no-display t
                                       :callback (lambda (_) (push (current-buffer) buffers))))
        (bench-when
-        (lambda () (>= (length buffers) wanted)) 60 "the session buffers"
+        (lambda () (>= (length buffers) bench-open)) 300 "the session buffers"
         (lambda ()
-          (setq buffers (nreverse buffers))
+          (setq buffers (sort buffers :key #'buffer-name)
+                bench-buffers (copy-sequence buffers))
           (let ((frames (bench-frames)))
             ;; The last frame shows the list; three others are split in two.
             (cl-loop for frame in (butlast frames)
                      for index from 0
                      do (let ((window (frame-root-window frame)))
                           (delete-other-windows window)
-                          (set-window-buffer window (pop buffers))
-                          (when (< index 3)
+                          (when buffers (set-window-buffer window (pop buffers)))
+                          (when (and (< index 3) buffers)
                             (set-window-buffer (split-window window nil 'right) (pop buffers)))))
             (set-window-buffer (frame-root-window (car (last frames))) (get-buffer-create "*bench-list*"))
             (bench-list-changed))
@@ -191,13 +212,45 @@ run, so they are made first, showing nothing yet."
       (let ((gap (- now bench-last-tick)))
         (setf (alist-get 'max-gap bench-counts) (max gap (or (alist-get 'max-gap bench-counts) 0)))
         (when (> gap 0.05)
-          (bench-count 'blocked gap))))
+          (bench-count 'blocked gap))
+        (when (> gap 0.1)
+          (bench-count 'blocks-over-100ms)
+          (bench-count 'blocked-over-100ms gap))))
     (setq bench-last-tick now))
   (when (bench-busy-p)
     (setf (alist-get 'last-busy bench-counts) (float-time))))
 
 (advice-add 'force-mode-line-update :before
             (lambda (&optional all) (bench-count (if all 'forced-all 'forced-one))))
+
+(when (getenv "BENCH_TRACE")
+  (advice-add 'force-mode-line-update :before
+              (lambda (&rest _)
+                (let* ((frames (backtrace-frames))
+                       (callers (seq-take (seq-keep (lambda (frame)
+                                                      (let ((function (cadr frame)))
+                                                        (and (symbolp function)
+                                                             (string-prefix-p "opencode" (symbol-name function))
+                                                             function)))
+                                                    frames)
+                                          3))
+                       (forced (alist-get 'forced-by bench-counts)))
+                  (setf (alist-get callers forced nil nil #'equal) (1+ (alist-get callers forced 0 nil #'equal)))
+                  (setf (alist-get 'forced-by bench-counts) forced)))))
+
+;; BENCH_TIME names functions whose longest and total times are counted.
+(dolist (name (split-string (or (getenv "BENCH_TIME") "") "[ ,]+" t))
+  (let ((function (intern name)))
+    (advice-add function :around
+                (lambda (original &rest arguments)
+                  (let ((start (float-time)))
+                    (prog1 (apply original arguments)
+                      (let ((seconds (- (float-time) start))
+                            (timed (alist-get 'timed bench-counts)))
+                        (setf (alist-get function timed)
+                              (list (max seconds (or (car (alist-get function timed)) 0))
+                                    (+ seconds (or (cadr (alist-get function timed)) 0))))
+                        (setf (alist-get 'timed bench-counts) timed))))))))
 
 (advice-add 'opencode-mode-line :around
             (lambda (function &rest arguments)
@@ -207,9 +260,22 @@ run, so they are made first, showing nothing yet."
                   (bench-count 'mode-line-seconds (- (float-time) start))))))
 
 (advice-add 'opencode-request :before
-            (lambda (_method path &rest _)
-              (when (member path '("/api/agent" "/api/model" "/api/provider" "/api/command"))
-                (bench-count 'catalog-requests))))
+            (lambda (_method path &rest arguments)
+              (cond
+               ((member path '("/api/agent" "/api/model" "/api/provider" "/api/command"))
+                (bench-count 'catalog-requests))
+               ((and (string-suffix-p "/message" path)
+                     ;; The registry's context sizes ask for one type.
+                     (not (alist-get 'type (plist-get arguments :query))))
+                (let ((query (plist-get arguments :query)))
+                  (bench-count (cond ((equal (alist-get 'order query) "asc") 'transcripts-whole)
+                                     ((alist-get 'cursor query) 'transcript-pages-more)
+                                     (t 'transcript-pages-newest))))))))
+
+(advice-add 'opencode-report-error :before
+            (lambda (text)
+              (when (string-match-p "Location not found" text)
+                (bench-count 'location-reports))))
 
 (add-hook 'opencode-catalog-changed-functions (lambda (&rest _) (bench-count 'catalog-announcements)))
 
@@ -240,7 +306,7 @@ run, so they are made first, showing nothing yet."
          opencode-events--handlers)
 
 (defun bench-busy-reasons ()
-  "Return what is busy: requests running, the registry, or the list."
+  "Return what is busy: requests running, the registry, the list, or buffers catching up."
   (delq nil
         (list (and (seq-some (lambda (process)
                                (and (process-live-p process)
@@ -250,35 +316,103 @@ run, so they are made first, showing nothing yet."
                              (process-list))
                    'requests)
               (and (not (opencode-state-ready-p)) 'registry)
-              (and (timerp bench-list-timer) 'list))))
+              (and (timerp bench-list-timer) 'list)
+              ;; Absent from versions that reload transcripts whole.
+              (and (or (bound-and-true-p opencode--resync-queue)
+                       (bound-and-true-p opencode--resync-running)
+                       (seq-some (lambda (buffer)
+                                   (and (buffer-live-p buffer)
+                                        (or (buffer-local-value 'opencode--holding buffer)
+                                            (buffer-local-value 'opencode--loading buffer))))
+                                 (and (boundp 'opencode--holding) bench-buffers)))
+                   'catching-up))))
 
 (defun bench-busy-p ()
   "Return non-nil while requests run or results wait to be drawn."
   (bench-busy-reasons))
 
 (defun bench-measure (name start-function then)
-  "Measure NAME: call START-FUNCTION with a continuation, settle, then call THEN."
+  "Measure NAME: call START-FUNCTION with a continuation, settle, then call THEN.
+With BENCH_PROFILE, a CPU profile of each measure is written next to the results."
   (setq bench-counts nil
         bench-connected nil)
-  (let ((start (float-time)))
+  (when (getenv "BENCH_PROFILE")
+    (profiler-start 'cpu))
+  (let ((start (float-time))
+        (gcs gcs-done)
+        (gc-seconds gc-elapsed))
     (funcall
      start-function
      (lambda ()
        (setf (alist-get 'last-busy bench-counts) (float-time))
        (bench-when
-        (lambda () (> (- (float-time) (alist-get 'last-busy bench-counts)) 2)) 120 "quiet"
+        (lambda () (> (- (float-time) (alist-get 'last-busy bench-counts)) 2)) 300 "quiet"
         (lambda ()
+          (when (getenv "BENCH_PROFILE")
+            (profiler-stop)
+            (profiler-write-profile (profiler-cpu-profile) (format "%s.%s.prof" bench-out name)))
           (push `(,name
                   (settle-seconds . ,(- (alist-get 'last-busy bench-counts) (or bench-connected start)))
-                  ,@(seq-remove (lambda (pair) (eq (car pair) 'last-busy)) bench-counts))
+                  (garbage-collections . ,(- gcs-done gcs))
+                  (garbage-collection-seconds . ,(- gc-elapsed gc-seconds))
+                  ;; Copied, as counting goes on in the same cells.
+                  ,@(copy-tree (seq-remove (lambda (pair) (eq (car pair) 'last-busy)) bench-counts)))
                 bench-results)
+          (setq bench-counts nil)
           (garbage-collect)
           (funcall then)))))))
 
 (defun bench-reconnect (then)
-  "Drop the stream as a lost connection does, and call THEN once it reopened after its backoff."
+  "Drop the stream as a lost connection does, and call THEN once it reopened after its backoff.
+While it is down, agents work: the service adds turns to sessions."
   (delete-process opencode-events--process)
+  (opencode-request-sync 'post "/api/bench/activity" :directory nil :timeout 10)
+  (setq bench-counts nil
+        bench-last-tick nil)
   (bench-when (lambda () (and bench-connected (opencode-events-connected-p))) 30 "the stream" then))
+
+;;;; Checks
+
+(defun bench-transcript-text (buffer)
+  "Return the transcript BUFFER shows, without its idle prompt or the input."
+  (with-current-buffer buffer
+    (let ((end (if (opencode-prompt-shown-p) (marker-position opencode--prompt-start) (opencode-pmark))))
+      (string-trim-right (buffer-substring-no-properties (point-min) end)))))
+
+(defun bench-fetch-transcript (id)
+  "Return the whole transcript of session ID, oldest first, waiting for it."
+  (let ((messages nil)
+        (cursor nil)
+        (done nil))
+    (while (not done)
+      (let* ((response (opencode-request-sync
+                        'get (format "/api/session/%s/message" id) :directory nil :timeout 30
+                        :query `((limit . 200) ,@(if cursor `((cursor . ,cursor)) '((order . "asc"))))))
+             (data (alist-get 'data response)))
+        (setq messages (append messages data)
+              cursor (alist-get 'next (alist-get 'cursor response))
+              done (or (null data) (null cursor)))))
+    messages))
+
+(defun bench-check ()
+  "Return how many open buffers show other than a whole transcript rendered afresh.
+The value is an alist: the count, and the IDs of those that differ."
+  (let ((different nil)
+        (opencode-replay-slice nil))
+    (dolist (buffer bench-buffers)
+      (when (buffer-live-p buffer)
+        (let* ((id (buffer-local-value 'opencode-session-id buffer))
+               (directory (buffer-local-value 'default-directory buffer))
+               (fresh (with-temp-buffer
+                        (setq default-directory directory)
+                        (opencode-session-mode)
+                        (opencode--make-process (current-buffer))
+                        (setq opencode-session-id id)
+                        (opencode-replay-messages (bench-fetch-transcript id))
+                        (bench-transcript-text (current-buffer)))))
+          (unless (equal fresh (bench-transcript-text buffer))
+            (push id different)))))
+    `((buffers . ,(length bench-buffers)) (different . ,(length different)) (ids . ,different))))
 
 (defun bench-redisplay (force)
   "Return the seconds a redisplay takes, every mode line forced when FORCE."
@@ -331,6 +465,7 @@ run, so they are made first, showing nothing yet."
                       (bench-measure (intern (format "reconnect-%d" (cl-incf reconnects)))
                                      #'bench-reconnect #'reconnect)
                     (cancel-timer tick)
+                    (push `(check ,@(bench-check)) bench-results)
                     (push `(redisplay-unforced ,@(bench-redisplay nil)) bench-results)
                     (push `(redisplay-forced ,@(bench-redisplay t)) bench-results)
                     (push `(mode-line-parts-us ,@(bench-parts)) bench-results)
@@ -338,13 +473,14 @@ run, so they are made first, showing nothing yet."
                                                            (frame-list))))
                           bench-results)
                     (push `(frames . ,(length (frame-list))) bench-results)
+                    (push `(buffers . ,(length bench-buffers)) bench-results)
                     (bench-finish))))
       (bench-measure 'first-load #'bench-scene #'reconnect))))
 
 (add-hook 'window-setup-hook (lambda () (run-at-time 0.5 nil #'bench-run)))
 
 ;; Whatever stalls the run, its results and messages are written.
-(run-at-time (string-to-number (or (getenv "BENCH_DEADLINE") "400")) nil
+(run-at-time (string-to-number (or (getenv "BENCH_DEADLINE") "560")) nil
              (lambda () (bench-finish (format "Deadline passed; busy: %S" (bench-busy-reasons)))))
 
 ;;; client.el ends here

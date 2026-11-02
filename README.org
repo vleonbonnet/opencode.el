@@ -161,7 +161,7 @@ Session buffers are saved with the desktop by session ID, directory and point, a
 | =make compile=  | byte compilation with warnings as errors                        |
 | =make lint=     | checkdoc                                                        |
 
-=dev/bench/run.sh SOURCES OUT= measures how long the main thread is held when the event stream reconnects, in a graphical =emacs -Q= with 22 frames of session buffers, moody and minions, talking to a fake service in a batch Emacs of its own: see =doc/design.org=.
+=dev/bench/run.sh SOURCES OUT= measures how long the main thread is held when the event stream reconnects, in a graphical =emacs -Q= with 22 frames showing session buffers among 26 open with long transcripts, moody and minions, talking to a fake service in a batch Emacs of its own, where agents work while the stream is down: see =doc/design.org=.
 
 =DEPS= names the directory holding the dependencies, one subdirectory each, elpaca's builds directory by default. Tests replay events and messages recorded from a real service (=test/fixtures/v2=) and talk HTTP to a local fake service; they never touch a running Emacs session or OpenCode service. See =doc/design.org= for the module map and the main design choices.
 

@@ -9,10 +9,16 @@
 # it alone.  Each Emacs runs under a timeout, and both are killed when
 # either grows past 2 GB.
 #
-# BENCH_FRAMES (22), BENCH_RECONNECTS (3) and BENCH_DEADLINE (400 s)
-# shape the run, BENCH_DIRS (53), BENCH_SESSIONS (120) and
-# BENCH_MODEL_COPIES (5) the service; BENCH_LOG logs every request on
-# both sides, and BENCH_KEEP keeps the scratch directory and its logs.
+# BENCH_FRAMES (22), BENCH_OPEN (26), BENCH_RECONNECTS (3) and
+# BENCH_DEADLINE (560 s) shape the run, BENCH_GC_THRESHOLD (100 MiB) the
+# client's garbage collections, BENCH_DIRS (53), BENCH_SESSIONS (120),
+# BENCH_MODEL_COPIES (5) and BENCH_LONG_TURNS, BENCH_MEDIUM_TURNS and
+# BENCH_SHORT_TURNS (400, 60, 8) the service; BENCH_LOG logs every
+# request on both sides, and BENCH_KEEP keeps the scratch directory and
+# its logs.  For diagnosis, BENCH_PROFILE writes a CPU profile of each
+# measure next to OUT, BENCH_TIME counts the longest and total times of
+# the functions it names, BENCH_TRACE counts the callers of mode-line
+# updates, and BENCH_SLICE sets opencode-replay-slice.
 
 set -eu
 
