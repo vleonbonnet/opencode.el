@@ -271,6 +271,30 @@ description, may hold a URL that was made a button on its own."
 ;; Last, so that a URL in a link of another kind is left to it.
 (add-hook 'opencode-buttonize-functions #'opencode--buttonize-bare-urls 90)
 
+;;;; Prompts rendered without their links
+
+(defun opencode-link-sent-prompts ()
+  "Make the links of the prompts sent in this session buffer that lack them.
+A prompt gets its links when it becomes sent text; earlier versions of
+this package made none, and the prompts a buffer showed then keep none
+until it is rendered again.  The input is left as it is."
+  (when-let* ((process (get-buffer-process (current-buffer))))
+    (let ((end (marker-position (process-mark process)))
+          (pos (point-min)))
+      (with-silent-modifications
+        (while (< pos end)
+          (let ((next (next-single-property-change pos 'opencode-prompt nil end)))
+            (when (get-text-property pos 'opencode-prompt)
+              (opencode-buttonize pos next t))
+            (setq pos next)))))))
+
+;; Loaded over an earlier version, this one links the prompts of the
+;; session buffers that version rendered.
+(dolist (buffer (buffer-list))
+  (when (provided-mode-derived-p (buffer-local-value 'major-mode buffer) 'opencode-session-mode)
+    (with-current-buffer buffer
+      (opencode-link-sent-prompts))))
+
 ;;;; Opening links
 
 (defun opencode--prompt-positions ()
