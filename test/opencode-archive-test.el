@@ -241,5 +241,44 @@ the service answered; the prompts then go in the order they were sent."
       (should (plist-get (opencode-state-get id) :archived))
       (should (opencode-session-archived-p id)))))
 
+(ert-deftest opencode-test-archived-input-keeps-attachments ()
+  "Input waiting for its session to leave the archive keeps its attachments, and sends them."
+  (let ((opencode-test-restore-answer 'hold))
+    (opencode-test-with-archived
+      (let* ((file (expand-file-name "README.md" opencode-test-workspace))
+             (uri (opencode--file-uri file)))
+        (opencode-test-archive-type "read ")
+        (opencode--attach-file file)
+        (opencode--insert-mention "explore")
+        (opencode-send-input)
+        (should (equal (opencode-test-archive-kinds) '(patch)))
+        (should (= (length opencode--attachments) 2))
+        (should (string-prefix-p "read `" (opencode-test-archive-input)))
+        (should (opencode-test-release))
+        (pcase-let ((`(,_ (prompt ,body)) (opencode-test-archive-traffic)))
+          (should (equal (mapcar (lambda (file) (alist-get 'uri file)) (alist-get 'files body)) (list uri)))
+          (should (equal (alist-get 'agents body) [((name . "explore"))])))
+        (should-not opencode--attachments)
+        (should-not (seq-some (lambda (overlay) (overlay-get overlay 'opencode-attachment))
+                              (overlays-in (point-min) (point-max))))))))
+
+(ert-deftest opencode-test-archived-session-send-keeps-files ()
+  "Files and mentions given to `opencode-session-send' go with the prompt once restored."
+  (let ((opencode-test-restore-answer 'hold)
+        (files [((uri . "file:///tmp/a.txt") (name . "a.txt"))])
+        (agents [((name . "explore"))]))
+    (opencode-test-with-archived
+      (opencode-session-send "with files" :show t :files files :agents agents)
+      (should (opencode-test-release))
+      (pcase-let ((`((patch ,_) (prompt ,body)) (opencode-test-archive-traffic)))
+        (should (equal (alist-get 'files body) files))
+        (should (equal (alist-get 'agents body) agents)))
+      ;; And at once from a session not archived.
+      (setq opencode-test-requests nil)
+      (opencode-session-send "again" :show t :files files :agents agents)
+      (pcase-let ((`((prompt ,body)) (opencode-test-archive-traffic)))
+        (should (equal (alist-get 'files body) files))
+        (should (equal (alist-get 'agents body) agents))))))
+
 (provide 'opencode-archive-test)
 ;;; opencode-archive-test.el ends here

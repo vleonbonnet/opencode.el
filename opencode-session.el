@@ -632,6 +632,9 @@ first selectable entry of the cached catalog."
   "M-n" #'opencode-next-input-or-button
   "TAB" #'opencode-tab-dwim
   "<backtab>" #'backward-button
+  ;; Any key sending input goes through the checks, the archive and the
+  ;; attachments, as RET does.
+  "<remap> <comint-send-input>" #'opencode-send-input
   ;; C-c C-o opens links, as in Org, instead of deleting the last output.
   "C-c C-o" #'opencode-open-link-at-point
   "/" #'opencode-electric-slash
@@ -2704,6 +2707,19 @@ an alist of metadata to attach to it.")
 (defvar opencode--send-decision nil
   "Outcome of the checks of the input being sent: t, or metadata to attach.")
 
+(defvar opencode--sending-input nil
+  "The session buffer whose input Comint is taking to send it, or nil.
+Comint deletes the input and inserts it again as sent text, which must
+not drop the attachments whose labels it holds: they go with the prompt.
+Bound by `opencode--comint-send', whatever command runs, rather than
+read from `this-command', which names RET's command, not Comint's; it
+ends once Comint hands the input over to `opencode--send-input'.")
+
+(defun opencode--comint-send ()
+  "Have Comint send the input at point, keeping its attachments for the prompt."
+  (let ((opencode--sending-input (current-buffer)))
+    (comint-send-input)))
+
 (defun opencode-input-request (string)
   "Return what sending input STRING requests, as a plist.
 :kind is `prompt', `command' or `shell'; :text is STRING; a command also
@@ -2747,7 +2763,7 @@ and the input sent once the service restored it; were the restore
 refused, the input stays at the prompt."
   (interactive)
   (if (not (and opencode-session-id (get-buffer-process (current-buffer))))
-      (comint-send-input)
+      (opencode--comint-send)
     (let ((input (if (>= (point) (opencode-pmark))
                      (buffer-substring-no-properties (opencode-pmark) (point-max))
                    (funcall comint-get-old-input))))
@@ -2784,7 +2800,7 @@ the prompt or on an earlier input; were the restore refused, it stays."
            (message "Nothing to send")
          (let ((opencode--send-decision decision)
                (opencode-prompt-delivery delivery))
-           (comint-send-input))))
+           (opencode--comint-send))))
      (lambda (error)
        (setq settled t
              opencode--input-awaits-restore nil)
@@ -2826,10 +2842,14 @@ Input that did not go through `opencode-send-input' is checked here.  The
 input of a prompt or a command gets the ID of the message it makes once
 the service delivers it, which reverting and forking at point need; a
 shell command makes no prompt, only a shell message and its result,
-which like other messages between prompts never start a cut."
+which like other messages between prompts never start a cut.  The
+prompt's attachments are those whose labels the input held; Comint
+leaves their overlays emptied, which go."
   (opencode-highlight-input)
   (opencode-output "\n")
-  (let* ((request (opencode-input-request string))
+  (opencode--forget-attachment-labels comint-last-input-start comint-last-input-end)
+  (let* ((opencode--sending-input nil)
+         (request (opencode-input-request string))
          (string (plist-get request :text))
          (decision (or opencode--send-decision (opencode-check-send request)))
          (metadata (and (consp decision) decision))
@@ -2855,14 +2875,23 @@ which like other messages between prompts never start a cut."
 
 ;;;; Attachments
 
+(defun opencode--forget-attachment-labels (start end)
+  "Delete the overlays of the attachment labels between START and END.
+Comint taking the input to send it leaves them there, emptied."
+  (dolist (overlay (overlays-in start end))
+    (when (overlay-get overlay 'opencode-attachment)
+      (delete-overlay overlay))))
+
 (defun opencode--in-attachment-p ()
   "Return non-nil when point is inside an attachment label."
   (cl-loop for overlay in (overlays-at (point))
            thereis (overlay-get overlay 'opencode-attachment)))
 
 (defun opencode--remove-attachment (overlay after _beg _end &optional _length)
-  "Drop OVERLAY's attachment once its label is deleted, AFTER the change."
-  (when (and after (not (eq this-command 'comint-send-input)))
+  "Drop OVERLAY's attachment once its label is deleted, AFTER the change.
+Comint taking the input to send it deletes the labels too, which drops
+nothing (see `opencode--sending-input')."
+  (when (and after (not (eq opencode--sending-input (current-buffer))))
     (let ((attachment (overlay-get overlay 'opencode-attachment))
           (start (overlay-start overlay))
           (end (overlay-end overlay)))

@@ -57,7 +57,7 @@ command loop applies key remapping as typing them would."
                              "<remap> <comint-delchar-or-maybe-eof>" "<remap> <comint-delete-output>"
                              "<remap> <comint-interrupt-subjob>" "<remap> <comint-kill-subjob>"
                              "<remap> <comint-quit-subjob>" "<remap> <comint-send-eof>"
-                             "<remap> <comint-stop-subjob>")
+                             "<remap> <comint-send-input>" "<remap> <comint-stop-subjob>")
                        #'string<)))
   (should (equal (opencode-test-own-keys opencode-desktop-pending-mode-map) '("g"))))
 
@@ -69,6 +69,8 @@ command loop applies key remapping as typing them would."
         (should (eq (key-binding (kbd "C-c C-o")) 'opencode-open-link-at-point))
         (should (eq (key-binding (kbd "C-c C-c")) 'opencode-interrupt))
         (should (eq (key-binding (kbd "C-d")) 'delete-char))
+        ;; Any key sending input sends it as RET does.
+        (should (eq (command-remapping 'comint-send-input) 'opencode-send-input))
         (goto-char (point-max))
         (insert "typed"))
       (let ((transcript (opencode-test-text buffer)))
@@ -339,6 +341,84 @@ command loop applies key remapping as typing them would."
             (with-current-buffer source (opencode-add-buffer-dwim))
             (should (equal (opencode-test-input other) "`attach-source` ")))
         (kill-buffer source)))))
+
+(defun opencode-test-type-attachments ()
+  "Type a prompt attaching the workspace's README.md and mentioning a subagent.
+Return the URI of the file."
+  (let ((file (expand-file-name "README.md" opencode-test-workspace)))
+    (goto-char (point-max))
+    (insert "look at ")
+    (opencode--attach-file file)
+    (opencode--insert-mention "explore")
+    (opencode--file-uri file)))
+
+(defun opencode-test-sent-prompt ()
+  "Return the body of the latest prompt requested."
+  (plist-get (seq-find (lambda (request) (string-suffix-p "/prompt" (plist-get request :path)))
+                       opencode-test-requests)
+             :body))
+
+(defun opencode-test-attachment-overlays ()
+  "Return the overlays of attachment labels left in the current buffer."
+  (seq-filter (lambda (overlay) (overlay-get overlay 'opencode-attachment))
+              (overlays-in (point-min) (point-max))))
+
+(defun opencode-test-check-sent-attachments (uri)
+  "Check that the latest prompt carried the file of URI and the mention, and nothing is left."
+  (let ((body (opencode-test-sent-prompt)))
+    (should (equal (mapcar (lambda (file) (alist-get 'uri file)) (alist-get 'files body)) (list uri)))
+    (should (equal (alist-get 'agents body) [((name . "explore"))]))
+    (should (string-prefix-p "look at `" (alist-get 'text body))))
+  (should-not opencode--attachments)
+  (should-not (opencode-test-attachment-overlays))
+  (should (equal (opencode-test-input (current-buffer)) "")))
+
+(ert-deftest opencode-test-attachments-go-with-ret ()
+  "RET sends the attachments whose labels the input holds, the files and the mentions."
+  (opencode-test-with-server
+    (let ((buffer (opencode-test-open-empty (opencode-test-scenario "text"))))
+      (with-current-buffer buffer
+        (let ((uri (opencode-test-type-attachments)))
+          (should (= (length opencode--attachments) 2))
+          (should-not (opencode-test-press buffer "RET"))
+          (opencode-test-check-sent-attachments uri))))))
+
+(ert-deftest opencode-test-attachments-go-with-queued-input ()
+  "Queued input sends its attachments too."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
+      (let ((uri (opencode-test-type-attachments)))
+        (opencode-queue-input)
+        (should (equal (alist-get 'delivery (opencode-test-sent-prompt)) "queue"))
+        (opencode-test-check-sent-attachments uri)))))
+
+(ert-deftest opencode-test-attachment-label-deleted-drops-it ()
+  "Deleting an attachment's label drops the attachment, which is then not sent."
+  (opencode-test-with-server
+    (let ((buffer (opencode-test-open-empty (opencode-test-scenario "text"))))
+      (with-current-buffer buffer
+        (opencode-test-type-attachments)
+        ;; Back over the end of the mention's label.
+        (goto-char (point-max))
+        (delete-char -2)
+        (should (equal (mapcar (lambda (attachment) (car attachment)) opencode--attachments) '(:file)))
+        (should (= (length (opencode-test-attachment-overlays)) 1))
+        (should-not (string-search "explore" (opencode-test-input buffer)))
+        (should-not (opencode-test-press buffer "RET"))
+        (let ((body (opencode-test-sent-prompt)))
+          (should (alist-get 'files body))
+          (should-not (alist-get 'agents body)))
+        ;; Deleting the label of a file drops it as well.
+        (opencode-test-type-attachments)
+        (let ((label (car (seq-filter (lambda (overlay) (plist-get (overlay-get overlay 'opencode-attachment) :file))
+                                      (opencode-test-attachment-overlays)))))
+          (delete-region (overlay-start label) (overlay-end label)))
+        (should (equal (mapcar (lambda (attachment) (car attachment)) opencode--attachments) '(:agent)))
+        (setq opencode-test-requests nil)
+        (should-not (opencode-test-press buffer "RET"))
+        (let ((body (opencode-test-sent-prompt)))
+          (should-not (alist-get 'files body))
+          (should (alist-get 'agents body)))))))
 
 ;;;; Mentions
 
