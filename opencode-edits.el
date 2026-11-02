@@ -47,7 +47,10 @@
 ;; whether to reread a stale buffer.  Processing never asks: it visits
 ;; files noninteractively, rereads only unmodified buffers, skips a file
 ;; with unsaved Emacs edits, and refuses to save over a file that changed
-;; again.  Buffers opened only for processing are killed afterwards.
+;; again.  It runs from events, so it never asks anything else either:
+;; a file visited gets only its safe local variables, and a question a
+;; mode hook would ask is an error (see `opencode-without-asking').
+;; Buffers opened only for processing are killed afterwards.
 ;; `opencode-session-roots-functions' reports the directories sessions
 ;; work in, for configuring such rereads elsewhere.
 
@@ -114,14 +117,27 @@ It runs whenever a session buffer opens or is killed."
 (defvar-local opencode--edit-owned-buffer nil
   "Non-nil when this buffer was opened only to process an agent edit.")
 
+(defmacro opencode-without-asking (&rest body)
+  "Run BODY, which processes files in the background, so that it never asks.
+Visiting a file applies its local variables and runs its mode's hooks:
+only safe local variables apply, and anything asking a question, such
+as a directory-local variable that is risky, a hook prompting or a lock,
+signals `inhibited-interaction' instead.  The echo area is left alone."
+  (declare (indent 0) (debug t))
+  `(let ((enable-local-variables (and enable-local-variables :safe))
+         (inhibit-interaction t)
+         (inhibit-message t))
+     ,@body))
+
 (defun opencode-visit-edited-file (file)
   "Return an unmodified buffer visiting FILE, or nil when it has unsaved edits.
-A stale buffer is reread without asking."
+A stale buffer is reread without asking.  Visiting never asks
+anything: see `opencode-without-asking'."
   (when (and (stringp file) (file-regular-p file) (file-readable-p file))
     (setq file (expand-file-name file))
     (condition-case err
         (let* ((existing (find-buffer-visiting file))
-               (buffer (or existing (find-file-noselect file t))))
+               (buffer (or existing (opencode-without-asking (find-file-noselect file t)))))
           (with-current-buffer buffer
             (unless existing
               (setq opencode--edit-owned-buffer t))
@@ -134,10 +150,10 @@ A stale buffer is reread without asking."
                   nil)
               (setq opencode--edit-conflict-notified nil)
               (unless (verify-visited-file-modtime buffer)
-                (let ((inhibit-message t))
+                (opencode-without-asking
                   (revert-buffer t t t)))
               buffer)))
-      (file-error
+      ((file-error inhibited-interaction)
        (message "OpenCode left %s alone: %s" (abbreviate-file-name file) (error-message-string err))
        nil))))
 
@@ -364,17 +380,20 @@ INPUT and METADATA are the call's; FILE is relative to the session."
        (list (list path))))))
 
 (defun opencode--edits-tool-finished (overlay)
-  "Run the edit hooks for the files the finished tool call of OVERLAY changed."
+  "Run the edit hooks for the files the finished tool call of OVERLAY changed.
+Only a live turn's calls count: a replayed transcript's never do."
   (let ((data (opencode-block-data overlay)))
     (when (and (equal (plist-get data :status) "completed")
-               (eq opencode-session-status 'busy))
+               (eq opencode-session-status 'busy)
+               (not opencode--replaying))
       (dolist (entry (opencode-tool-edited-files (plist-get data :tool) (plist-get data :input)
                                                  (plist-get data :metadata)))
         (when-let* ((file (opencode-resolve-file-reference (car entry))))
           (cl-pushnew file opencode--files-edited-this-turn :test #'equal)
           (dolist (function opencode-file-edited-functions)
             (condition-case err
-                (funcall function file (cdr entry))
+                (opencode-without-asking
+                  (funcall function file (cdr entry)))
               (error (message "OpenCode: %s failed on %s: %s" function
                               (abbreviate-file-name file) (error-message-string err))))))))))
 
@@ -437,7 +456,8 @@ INPUT and METADATA are the call's; FILE is relative to the session."
         (if-let* ((function (pop (plist-get run :functions))))
             (let ((result (condition-case err
                               (progn (plist-put run :active function)
-                                     (funcall function (plist-get run :files)))
+                                     (opencode-without-asking
+                                       (funcall function (plist-get run :files))))
                             (error
                              (message "OpenCode: %s failed: %s" function (error-message-string err))
                              nil))))

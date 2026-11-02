@@ -203,5 +203,108 @@
               (run-pending)
               (should-not (car reports)))))))))
 
+;;;; Never asking
+
+(defvar opencode-test-risky-applied nil
+  "Set by the risky directory-local `eval' of `opencode-test-with-risky-project'.")
+
+(defvar opencode-test-asked nil
+  "Questions asked while processing files, newest first.")
+
+(defmacro opencode-test-with-risky-project (file &rest body)
+  "Run BODY with FILE bound to a Lisp file of a project with risky local variables.
+Its .dir-locals.el sets a safe variable and evaluates a form, which is
+risky.  Any question asked is recorded in `opencode-test-asked', as
+batch Emacs never asks: confirming local variables, reading a
+character, a yes or no, unless interaction is inhibited."
+  (declare (indent 1) (debug t))
+  `(let* ((root (file-name-as-directory (make-temp-file "opencode-risky-" t)))
+          (,file (expand-file-name "edited.el" root))
+          (opencode-test-risky-applied nil)
+          (opencode-test-asked nil))
+     (with-temp-file (expand-file-name ".dir-locals.el" root)
+       (prin1 '((nil . ((fill-column . 61) (eval . (setq opencode-test-risky-applied t)))))
+              (current-buffer)))
+     (with-temp-file ,file
+       (insert "(defun edited ()\n'x)\n"))
+     (unwind-protect
+         (cl-flet ((ask (kind)
+                     (lambda (&rest _)
+                       (if inhibit-interaction
+                           (signal 'inhibited-interaction nil)
+                         (push kind opencode-test-asked)
+                         nil))))
+           (cl-letf (((symbol-function 'hack-local-variables-confirm) (ask 'local-variables))
+                     ((symbol-function 'read-char-from-minibuffer) (ask 'read-char))
+                     ((symbol-function 'y-or-n-p) (ask 'y-or-n))
+                     ((symbol-function 'yes-or-no-p) (ask 'yes-or-no)))
+             ,@body))
+       (when-let* ((buffer (find-buffer-visiting ,file)))
+         (with-current-buffer buffer (set-buffer-modified-p nil))
+         (kill-buffer buffer))
+       (delete-directory root t))))
+
+(ert-deftest opencode-test-visit-edited-file-never-asks ()
+  "Visiting a file to process it applies safe local variables only and asks nothing.
+A risky directory-local variable is left out without asking whether to
+apply it, and a mode hook asking signals instead of waiting for an
+answer."
+  (opencode-test-with-risky-project file
+    (let ((buffer (opencode-visit-edited-file file)))
+      (should buffer)
+      (with-current-buffer buffer
+        (should (derived-mode-p 'emacs-lisp-mode))
+        (should (= fill-column 61)))
+      (opencode-release-edited-file buffer))
+    (should-not opencode-test-asked)
+    (should-not opencode-test-risky-applied)
+    (let ((emacs-lisp-mode-hook (list (lambda () (y-or-n-p "Set this buffer up? ")))))
+      (opencode-release-edited-file (opencode-visit-edited-file file)))
+    (should-not opencode-test-asked)
+    (should-not opencode-test-risky-applied)))
+
+(ert-deftest opencode-test-live-edit-processing-never-asks ()
+  "A live turn's edit of a file under risky local variables is processed without asking."
+  (opencode-test-with-risky-project file
+    (opencode-test-with-server
+      (let* ((id (opencode-test-scenario "edit-tools"))
+             (buffer (opencode-test-open-empty id))
+             (base `((sessionID . ,id) (assistantMessageID . "msg_risky_a") (id . "call_risky"))))
+        (opencode-test-turn id "started")
+        (opencode-test-dispatch
+         `(((type . "session.step.started") (data (sessionID . ,id) (assistantMessageID . "msg_risky_a")))
+           ((type . "session.tool.input.started") (data ,@base (name . "write")))
+           ((type . "session.tool.called") (data ,@base (input (path . ,file) (content . "x"))))
+           ((type . "session.tool.success") (data ,@base (content ((type . "text") (text . "Wrote it.")))))))
+        (with-current-buffer buffer
+          (should (equal opencode--files-edited-this-turn (list file))))
+        ;; Reindented by the default hooks, and saved.
+        (should (equal (with-temp-buffer (insert-file-contents file) (buffer-string))
+                       "(defun edited ()\n  'x)\n"))
+        (should-not (find-buffer-visiting file))))
+    (should-not opencode-test-asked)
+    (should-not opencode-test-risky-applied)))
+
+(ert-deftest opencode-test-replay-runs-no-edit-hooks ()
+  "A transcript written while a turn runs processes none of the files it edited."
+  (opencode-test-with-risky-project file
+    (opencode-test-with-server
+      (let ((opencode-test-edits nil)
+            (opencode-file-edited-functions (list #'opencode-test-record-edit))
+            (buffer (opencode-test-open-empty (opencode-test-scenario "edit-tools"))))
+        (opencode-test-turn (opencode-test-scenario "edit-tools") "started")
+        (with-current-buffer buffer
+          (should (eq opencode-session-status 'busy))
+          (opencode-replay-messages
+           `(((id . "msg_risky_r") (type . "assistant") (time (created . 1) (completed . 2))
+              (content ((type . "tool") (id . "call_risky_r") (name . "write")
+                        (state (status . "completed") (input (path . ,file) (content . "x"))
+                               (content ((type . "text") (text . "Wrote it.")))))))))
+          (should (opencode-block "call_risky_r"))
+          (should-not opencode--files-edited-this-turn))
+        (should-not opencode-test-edits)
+        (should-not (find-buffer-visiting file))))
+    (should-not opencode-test-asked)))
+
 (provide 'opencode-edits-test)
 ;;; opencode-edits-test.el ends here
