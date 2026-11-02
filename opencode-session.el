@@ -1237,19 +1237,22 @@ The session's events are withheld meanwhile, then applied."
 
 (defun opencode--render-again (&optional then)
   "Render this session's transcript again from the server, then call THEN.
-The input and the viewport are kept as `opencode-session-reload' says."
-  (let ((input (and (get-buffer-process (current-buffer))
-                    (buffer-substring-no-properties (opencode-pmark) (point-max))))
-        (viewport (opencode-save-viewport)))
+The input and the viewport are kept as `opencode-session-reload' says;
+the input keeps its attachments, and comes back too when the transcript
+cannot be loaded, the failure being reported."
+  (let* ((viewport (opencode-save-viewport))
+         (input (opencode--take-input)))
     (opencode--erase-transcript)
     (opencode-session-load
      (lambda ()
-       (goto-char (point-max))
-       (when (and input (not (string-empty-p input)))
-         (let ((buffer-undo-list t))
-           (insert input)))
+       (let ((buffer-undo-list t))
+         (opencode--put-back-input input))
        (opencode-restore-viewport viewport)
-       (when then (funcall then))))))
+       (when then (funcall then)))
+     (lambda (error)
+       (let ((buffer-undo-list t))
+         (opencode--put-back-input input))
+       (opencode-report-error (opencode-error-describe error))))))
 
 (defun opencode-session-reload ()
   "Render this session's transcript again from the server.
@@ -1291,9 +1294,8 @@ reloads."
 Input still being typed is lifted out and put back afterwards."
   (opencode-without-undo
     (let* ((process (get-buffer-process (current-buffer)))
-           (pending (buffer-substring (opencode-pmark) (point-max)))
-           (inhibit-read-only t))
-      (delete-region (opencode-pmark) (point-max))
+           (inhibit-read-only t)
+           (pending (opencode--take-input)))
       (unless (opencode-prompt-shown-p)
         (opencode-open-block 'user)
         (opencode-show-prompt))
@@ -1310,9 +1312,7 @@ Input still being typed is lifted out and put back afterwards."
         (opencode-output (opencode-fontify-as (propertize (concat note "\n") 'font-lock-face 'opencode-notice)
                                               'verbatim)))
       (setq opencode--last-block-kind 'user)
-      (goto-char (point-max))
-      (insert pending)
-      (set-marker (process-mark process) (- (point-max) (length pending))))))
+      (set-marker (process-mark process) (opencode--put-back-input pending)))))
 
 (defun opencode--user-message-text (message)
   "Return the prompt text of user MESSAGE with its attachments named."
@@ -2720,6 +2720,41 @@ ends once Comint hands the input over to `opencode--send-input'.")
   (let ((opencode--sending-input (current-buffer)))
     (comint-send-input)))
 
+(defvar opencode--input-sent nil
+  "The input Comint is taking to send, as `opencode--copy-input' returns it.
+A send check that keeps input Comint took already puts it back from
+this, with its attachment labels.  Nil when Comint sends an earlier
+input rather than the one at the prompt.")
+
+(defvar opencode--routing-input nil
+  "Non-nil while `comint-send-input' called in a session buffer runs as RET.")
+
+(defun opencode--comint-send-input (send &rest arguments)
+  "Run Comint's SEND, `comint-send-input', with ARGUMENTS as session buffers send.
+In a session buffer, input sent otherwise than by `opencode--comint-send',
+such as with `execute-extended-command', goes through
+`opencode-send-input' as RET's does: its checks, the archive, its
+attachments.  Input Comint then takes keeps the attachments its labels
+stand for.  Elsewhere, and for text a session buffer writes through
+Comint with another sender, SEND runs as it is."
+  (cond
+   ((not (and (derived-mode-p 'opencode-session-mode)
+              (eq comint-input-sender #'opencode--send-input)))
+    (apply send arguments))
+   ((and (not (seq-some #'identity arguments))
+         (not (eq opencode--sending-input (current-buffer)))
+         (not opencode--routing-input))
+    (let ((opencode--routing-input t))
+      (opencode-send-input)))
+   (t
+    (let ((opencode--sending-input (current-buffer))
+          (opencode--input-sent (and (get-buffer-process (current-buffer))
+                                     (>= (point) (opencode-pmark))
+                                     (opencode--copy-input))))
+      (apply send arguments)))))
+
+(advice-add 'comint-send-input :around #'opencode--comint-send-input)
+
 (defun opencode-input-request (string)
   "Return what sending input STRING requests, as a plist.
 :kind is `prompt', `command' or `shell'; :text is STRING; a command also
@@ -2832,9 +2867,14 @@ the prompt or on an earlier input; were the restore refused, it stays."
     (forward-button count)))
 
 (defun opencode--restore-input (text)
-  "Put TEXT back at the prompt after a send was cancelled."
-  (goto-char (point-max))
-  (insert text))
+  "Put TEXT back at the prompt after a send was cancelled.
+The input Comint took is put back whole, with its attachment labels,
+when known (see `opencode--input-sent'); else TEXT, an earlier input
+Comint sent."
+  (if opencode--input-sent
+      (opencode--put-back-input opencode--input-sent)
+    (goto-char (point-max))
+    (insert text)))
 
 (defun opencode--send-input (_process string)
   "Send STRING typed at the prompt: a prompt, a /command or a !shell command.
@@ -2905,15 +2945,75 @@ nothing (see `opencode--sending-input')."
 (defun opencode--insert-attachment (label attachment)
   "Insert an intangible LABEL standing for ATTACHMENT at point."
   (push attachment opencode--attachments)
-  (let* ((start (point))
-         (end (progn (insert "`" (propertize label 'cursor-intangible t)
-                             (propertize "`" 'rear-nonsticky t))
-                     (point)))
-         (overlay (make-overlay start end)))
+  (let ((start (point)))
+    (insert "`" (propertize label 'cursor-intangible t)
+            (propertize "`" 'rear-nonsticky t))
+    (opencode--label-attachment start (point) attachment (propertize label 'face 'markdown-ts-code))))
+
+(defun opencode--label-attachment (start end attachment display)
+  "Make the text from START to END the label of ATTACHMENT, shown as DISPLAY.
+Deleting any of it drops the attachment.  Return the label's overlay."
+  (let ((overlay (make-overlay start end)))
     (overlay-put overlay 'opencode-attachment attachment)
-    (overlay-put overlay 'display (propertize label 'face 'markdown-ts-code))
+    (overlay-put overlay 'display display)
     (overlay-put overlay 'modification-hooks '(opencode--remove-attachment))
     overlay))
+
+;; Rendering lifts the input out and puts it back: another client's
+;; prompt goes before it, and a transcript rendered again erases it.  Its
+;; text alone would lose the attachments its labels stand for, so every
+;; path lifting it goes through this pair.
+
+(defun opencode--copy-input (&optional take)
+  "Return the input typed at the prompt, its attachment labels included.
+The value, for `opencode--put-back-input', is a plist: :text, the input
+with its text properties; :labels, its attachment labels, as (START END
+ATTACHMENT DISPLAY) with START and END offsets in :text; :attachments,
+the attachments it takes along.  With TAKE, the input is removed, and
+the next prompt's attachments go with it, out of `opencode--attachments'
+until put back: the labels' overlays go first, so that removing their
+text drops nothing.  Without TAKE, the input and the attachments stay,
+and :attachments is nil.  Return nil without a prompt."
+  (when (get-buffer-process (current-buffer))
+    (let* ((start (opencode-pmark))
+           (end (point-max))
+           (overlays (seq-filter (lambda (overlay) (overlay-get overlay 'opencode-attachment))
+                                 (overlays-in start end)))
+           (input (list :text (buffer-substring start end)
+                        :labels (mapcar (lambda (overlay)
+                                          (list (- (overlay-start overlay) start)
+                                                (- (overlay-end overlay) start)
+                                                (overlay-get overlay 'opencode-attachment)
+                                                (overlay-get overlay 'display)))
+                                        (seq-filter (lambda (overlay)
+                                                      (< (overlay-start overlay) (overlay-end overlay)))
+                                                    overlays))
+                        :attachments (and take opencode--attachments))))
+      (when take
+        (mapc #'delete-overlay overlays)
+        (setq opencode--attachments nil)
+        (let ((inhibit-read-only t))
+          (delete-region start end)))
+      input)))
+
+(defun opencode--take-input ()
+  "Remove the input typed at the prompt; return it for `opencode--put-back-input'.
+See `opencode--copy-input'."
+  (opencode--copy-input t))
+
+(defun opencode--put-back-input (input)
+  "Insert INPUT, which `opencode--copy-input' returned, at the end of the buffer.
+Its labels stand for their attachments again, deleting one dropping
+it, and the attachments it took along are the next prompt's again.
+Point ends after it.  Return where it starts."
+  (goto-char (point-max))
+  (let ((start (point)))
+    (when input
+      (insert (plist-get input :text))
+      (pcase-dolist (`(,from ,to ,attachment ,display) (plist-get input :labels))
+        (opencode--label-attachment (+ start from) (+ start to) attachment display))
+      (setq opencode--attachments (append opencode--attachments (plist-get input :attachments))))
+    start))
 
 (defun opencode--prompt-buffer ()
   "Return the session buffer whose input prompt commands edit.

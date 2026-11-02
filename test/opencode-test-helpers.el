@@ -437,6 +437,29 @@ session registry starts empty and follows events once a test dispatches
     (search-forward text)
     (match-beginning 0)))
 
+;;;; Attachments
+
+(defun opencode-test-type-attachments ()
+  "Type a prompt attaching the workspace's README.md and mentioning a subagent.
+Return the URI of the file."
+  (let ((file (expand-file-name "README.md" opencode-test-workspace)))
+    (goto-char (point-max))
+    (insert "look at ")
+    (opencode--attach-file file)
+    (opencode--insert-mention "explore")
+    (opencode--file-uri file)))
+
+(defun opencode-test-sent-prompt ()
+  "Return the body of the latest prompt requested."
+  (plist-get (seq-find (lambda (request) (string-suffix-p "/prompt" (plist-get request :path)))
+                       opencode-test-requests)
+             :body))
+
+(defun opencode-test-attachment-overlays ()
+  "Return the overlays of attachment labels left in the current buffer."
+  (seq-filter (lambda (overlay) (overlay-get overlay 'opencode-attachment))
+              (overlays-in (point-min) (point-max))))
+
 ;;;; Transcripts
 
 (defvar opencode-test-transcript nil
