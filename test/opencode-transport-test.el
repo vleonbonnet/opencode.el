@@ -69,6 +69,30 @@ separate locations."
       ;; A share no drive is mapped to keeps its UNC name.
       (should (equal (opencode-normalize-directory "//other/share/x/") "//other/share/x/")))))
 
+(ert-deftest opencode-test-request-output-redraws-nothing ()
+  "Request output is inserted without the default process filter.
+That filter has every mode line of every frame redrawn after each chunk,
+which froze Emacs for seconds over the requests of a reconnection."
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service)
+          (list (cons "/api/agent" (lambda (_) '(200 . ((data . [((id . "build") (name . "Build"))])))))))
+    (let ((processes nil)
+          (result nil))
+      (cl-letf* ((plz (symbol-function 'plz))
+                 ((symbol-function 'plz)
+                  (lambda (&rest arguments)
+                    (let ((process (apply plz arguments)))
+                      (push process processes)
+                      process))))
+        (opencode-request 'get "/api/agent" :buffer nil :directory opencode-test-workspace
+                          :then (lambda (response) (setq result (opencode-request-data response))))
+        (opencode-test-wait-for (lambda () result)))
+      ;; The service's lookup, then the request.
+      (should (cdr processes))
+      (dolist (process processes)
+        (should (eq (process-filter process) #'opencode--plz-insert)))
+      (should (equal result '(((id . "build") (name . "Build"))))))))
+
 (ert-deftest opencode-test-request-errors ()
   "Failed requests carry the status and the server's message."
   (opencode-test-with-service

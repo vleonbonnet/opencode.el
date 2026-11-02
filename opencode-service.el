@@ -143,11 +143,30 @@ While it runs, the waiters wait for it rather than look for a service.")
 
 ;;;; Requests that always settle
 
+(defun opencode--plz-insert (process output)
+  "Insert OUTPUT of curl PROCESS at its mark, as the default process filter does.
+The default filter has every mode line of every frame redrawn after each
+chunk it inserts, which costs tens of milliseconds with many frames,
+for a request buffer that no window shows."
+  (when-let* ((buffer (process-buffer process))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t)
+            (mark (process-mark process)))
+        (save-restriction
+          (widen)
+          ;; Before markers, as the default filter: a point at the end follows.
+          (save-excursion
+            (goto-char (or (marker-position mark) (point-max)))
+            (insert-before-markers output)
+            (set-marker mark (point))))))))
+
 (defun opencode-plz (method url &rest arguments)
   "Request METHOD of URL asynchronously with `plz' ARGUMENTS; return the process.
 ARGUMENTS are `plz' keywords, functions :then and :else among them.
 Exactly one of THEN and ELSE runs, and the process buffer is killed
-once the request is over, whatever ends it.
+once the request is over, whatever ends it.  Without :filter, the
+output is inserted by `opencode--plz-insert'.
 
 `plz' settles a request only on the curl exits it recognizes, and some
 systems describe a signal with its number, such as \"killed: 9\" on
@@ -162,7 +181,10 @@ receives a `plz-error' saying why instead."
          (unreadable (make-symbol "unreadable"))
          (settled nil)
          (arguments (cl-loop for (key value) on arguments by #'cddr
-                             unless (memq key '(:then :else :as)) append (list key value))))
+                             unless (memq key '(:then :else :as)) append (list key value)))
+         (arguments (if (plist-member arguments :filter)
+                        arguments
+                      (append arguments (list :filter #'opencode--plz-insert)))))
     (cl-flet ((settle (function value)
                 (unless settled
                   (setq settled t)
