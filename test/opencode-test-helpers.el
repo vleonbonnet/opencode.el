@@ -129,6 +129,32 @@ The service refuses message pages asked for so."
   (let ((query (plist-get request :query)))
     (and (alist-get 'cursor query) (assq 'order query))))
 
+(defun opencode-test-message-page (messages request)
+  "Return the page of MESSAGES, oldest first, that REQUEST asks for, as the service does.
+REQUEST's query may hold `limit', `order' (default \"desc\") or a
+`cursor', which carries the order of the first page and refuses one."
+  (let* ((query (plist-get request :query))
+         (cursor (alist-get 'cursor query))
+         (decoded (and cursor (json-parse-string (base64-decode-string cursor t)
+                                                 :object-type 'alist)))
+         (order (if decoded (alist-get 'order decoded) (or (alist-get 'order query) "desc")))
+         (limit (alist-get 'limit query))
+         (ordered (if (equal order "asc") messages (reverse messages)))
+         (rest (if decoded
+                   (cdr (seq-drop-while (lambda (message)
+                                          (not (equal (alist-get 'id message) (alist-get 'id decoded))))
+                                        ordered))
+                 ordered))
+         (page (if limit (seq-take rest (if (stringp limit) (string-to-number limit) limit)) rest)))
+    (cl-flet ((cursor (message direction)
+                (base64url-encode-string
+                 (json-serialize `((id . ,(alist-get 'id message)) (order . ,order) (direction . ,direction)))
+                 t)))
+      `((data . ,page)
+        (cursor ,@(when page
+                    `((previous . ,(cursor (car page) "previous"))
+                      (next . ,(cursor (car (last page)) "next")))))))))
+
 (defun opencode-test-default-routes ()
   "Return routes serving the recorded sessions and catalogs."
   (list
@@ -139,11 +165,13 @@ The service refuses message pages asked for so."
               ;; As the service does: a cursor carries its order.
               ((opencode-test-cursor-with-order-p request)
                '(:error 400 "Cursor cannot be combined with order"))
-              ((or (plist-get request :cursor-seen)
-                   (not (file-exists-p (expand-file-name (concat "fixtures/v2/" file)
-                                                         opencode-test-directory))))
+              ((not (file-exists-p (expand-file-name (concat "fixtures/v2/" file)
+                                                     opencode-test-directory)))
                '((data) (cursor)))
-              (t (opencode-test-fixture file))))))
+              (t (let ((fixture (opencode-test-fixture file)))
+                   (if (assq 'data fixture)
+                       (opencode-test-message-page (alist-get 'data fixture) request)
+                     fixture)))))))
    (list 'get "\\`/api/session/\\(ses_[A-Za-z0-9]+\\)\\'"
          (lambda (request)
            (let* ((file (format "session-%s.json" (plist-get request :match)))
@@ -311,6 +339,12 @@ session registry starts empty and follows events once a test dispatches
              (opencode-test-deferred nil)
              (opencode-test-routes (opencode-test-default-routes))
              (opencode-session-buffers (make-hash-table :test #'equal))
+             ;; Answers come synchronously, and so does the transcript.
+             (opencode-replay-slice nil)
+             (opencode--resync-epoch 0)
+             (opencode--resync-queue nil)
+             (opencode--resync-running nil)
+             (opencode--resync-active nil)
              (opencode--projects nil)
              (opencode-last-session-buffer nil)
              (opencode-alerted-sessions nil)

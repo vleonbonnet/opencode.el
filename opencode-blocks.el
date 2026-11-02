@@ -828,7 +828,8 @@ at its start, and those following output after it, as
           (progn (opencode--show-narration overlay text)
                  (setq opencode--last-block-kind 'text))
         (opencode-block-update overlay :text (or text "")
-                               :hidden-kind (opencode-reasoning-hidden-kind text native))))))
+                               :hidden-kind (opencode-reasoning-hidden-kind text native)
+                               :ended t)))))
 
 (defun opencode-reasoning-mark-dropped (key dropped)
   "Relabel reasoning block KEY with its DROPPED marker."
@@ -1030,15 +1031,38 @@ Skip it when its text, font and WINDOW's ROOM are those last fitted."
         (opencode--fit-window window overlays)
       (opencode--fit-visible window))))
 
+(defun opencode--fit-near (window overlays)
+  "Return those of OVERLAYS that WINDOW shows, or will once redisplayed.
+They are those from a screen above to two below its start, as
+`opencode--fit-visible' fits them, and those within a screen of its
+point, which redisplay brings into view."
+  (save-excursion
+    (save-restriction
+      (widen)
+      (let* ((height (window-body-height window))
+             (ranges (mapcar (lambda (position)
+                               (goto-char position)
+                               (cons (line-beginning-position (- 1 height))
+                                     (line-end-position (* 2 height))))
+                             (list (window-start window) (window-point window)))))
+        (seq-filter (lambda (overlay)
+                      (and (overlay-buffer overlay)
+                           (seq-some (lambda (range) (<= (car range) (overlay-start overlay) (cdr range)))
+                                     ranges)))
+                    overlays)))))
+
 (defun opencode--fit-flush (buffer)
-  "Fit BUFFER's pending summaries in the windows showing it."
+  "Fit BUFFER's pending summaries that its windows show.
+A transcript written whole changes thousands, which fitting all cost
+tens of milliseconds a slice; the others are fitted when scrolled to."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (let ((pending (seq-uniq opencode--fit-pending #'eq)))
         (setq opencode--fit-pending nil
               opencode--fit-timer nil)
         (when pending
-          (opencode-summary-fit-all-windows pending))))))
+          (dolist (window (get-buffer-window-list nil nil t))
+            (opencode--fit-window window (opencode--fit-near window pending))))))))
 
 (defun opencode-summary-fit-queue (overlay)
   "Fit changed summary OVERLAY in every window showing its buffer."

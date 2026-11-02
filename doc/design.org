@@ -3,31 +3,31 @@
 
 * Modules
 
-| Module                    | Responsibility                                                                                                                        |
-|---------------------------+---------------------------------------------------------------------------------------------------------------------------------------|
-| =opencode.el=             | Entry point: loads every module, autoloads the commands and the desktop handler                                                       |
-| =opencode-common.el=      | Groups, faces, shared state, key hints, directory normalization, identifiers, small helpers                                           |
-| =opencode-service.el=     | Service discovery, probing, =opencode service start/restart/stop=, version checks, =opencode-plz=, which settles every request        |
-| =opencode-http.el=        | =opencode-request=: authentication, location header, JSON, retries, error reporting                                                   |
-| =opencode-events.el=      | The one SSE stream: frame scanning, queued dispatch, heartbeat watchdog, reconnection                                                 |
-| =opencode-state.el=       | Session registry: every session's live state and status, bootstrap, the server-side read marker, context sizes, prompt-cache expiries |
-| =opencode-render.el=      | Output and prompt management, fontification that survives Markdown, tables, prompt-only undo                                          |
-| =opencode-links.el=       | File, Org and Markdown links in the transcript                                                                                        |
-| =opencode-blocks.el=      | Collapsible reasoning, tool and notice blocks, their summaries, fitting to the window                                                 |
-| =opencode-session.el=     | Session buffers: opening, replay, live events, sending, attachments, agent and model, navigation; actions by session ID               |
-| =opencode-requests.el=    | What permissions and questions share: providers, subagent propagation, transients, answering by session ID, send check                |
-| =opencode-permission.el=  | Permission requests, their transient and the hand-off to another agent                                                                |
-| =opencode-form.el=        | Question forms and other forms                                                                                                        |
-| =opencode-notify.el=      | Notification log, filters and operating-system backends                                                                               |
-| =opencode-display.el=     | Agent, model, provider, variant and context-use displays for any session, long-context pricing tiers                                  |
-| =opencode-modeline.el=    | The session mode line, and reporting a context passing its price tier                                                                 |
-| =opencode-variant.el=     | The variant a model runs with when none is selected, from the catalogs                                                                |
-| =opencode-sessions.el=    | Session pickers and their status icons, projects, worktree branches, worktrees, MCP servers                                           |
-| =opencode-edits.el=       | Post-edit hooks, safe visiting and saving, indentation, Prettier, Flycheck                                                            |
-| =opencode-desktop.el=     | Desktop saving and in-place restoring                                                                                                 |
-| =opencode-convert.el=     | Markdown transcripts                                                                                                                  |
-| =opencode-cache.el=       | Prompt-cache preflight guard, stale-thinking consent, refused turns                                                                   |
-| =opencode-diff-parser.el= | Line ranges of unified diffs                                                                                                          |
+| Module                    | Responsibility                                                                                                                                            |
+|---------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =opencode.el=             | Entry point: loads every module, autoloads the commands and the desktop handler                                                                           |
+| =opencode-common.el=      | Groups, faces, shared state, key hints, directory normalization, identifiers, small helpers                                                               |
+| =opencode-service.el=     | Service discovery, probing, =opencode service start/restart/stop=, version checks, =opencode-plz=, which settles every request                            |
+| =opencode-http.el=        | =opencode-request=: authentication, location header, JSON, retries, error reporting                                                                       |
+| =opencode-events.el=      | The one SSE stream: frame scanning, queued dispatch, heartbeat watchdog, reconnection                                                                     |
+| =opencode-state.el=       | Session registry: every session's live state and status, bootstrap, the server-side read marker, context sizes, prompt-cache expiries                     |
+| =opencode-render.el=      | Output and prompt management, fontification that survives Markdown, tables, prompt-only undo                                                              |
+| =opencode-links.el=       | File, Org and Markdown links in the transcript                                                                                                            |
+| =opencode-blocks.el=      | Collapsible reasoning, tool and notice blocks, their summaries, fitting to the window                                                                     |
+| =opencode-session.el=     | Session buffers: opening, replay, catching up after a reconnection, live events, sending, attachments, agent and model, navigation; actions by session ID |
+| =opencode-requests.el=    | What permissions and questions share: providers, subagent propagation, transients, answering by session ID, send check                                    |
+| =opencode-permission.el=  | Permission requests, their transient and the hand-off to another agent                                                                                    |
+| =opencode-form.el=        | Question forms and other forms                                                                                                                            |
+| =opencode-notify.el=      | Notification log, filters and operating-system backends                                                                                                   |
+| =opencode-display.el=     | Agent, model, provider, variant and context-use displays for any session, long-context pricing tiers                                                      |
+| =opencode-modeline.el=    | The session mode line, and reporting a context passing its price tier                                                                                     |
+| =opencode-variant.el=     | The variant a model runs with when none is selected, from the catalogs                                                                                    |
+| =opencode-sessions.el=    | Session pickers and their status icons, projects, worktree branches, worktrees, MCP servers                                                               |
+| =opencode-edits.el=       | Post-edit hooks, safe visiting and saving, indentation, Prettier, Flycheck                                                                                |
+| =opencode-desktop.el=     | Desktop saving and in-place restoring                                                                                                                     |
+| =opencode-convert.el=     | Markdown transcripts                                                                                                                                      |
+| =opencode-cache.el=       | Prompt-cache preflight guard, stale-thinking consent, refused turns                                                                                       |
+| =opencode-diff-parser.el= | Line ranges of unified diffs                                                                                                                              |
 
 * The server is authoritative
 
@@ -35,7 +35,7 @@ Buffers render what the service reports and keep only interface state: which blo
 
 * One service, one stream
 
-OpenCode 2 runs one background service per user. Emacs never starts a server of its own and never stops the service: the TUI and the desktop app share it, and it resumes running turns after a restart. Every location's events arrive on a single =GET /api/event= stream. The process filter only splits frames and queues them, and a zero-delay timer dispatches them in time-bounded batches, because the service drops a subscriber that falls 4096 frames behind and a slow handler must not stall the socket. Frame scanning resumes where the previous chunk ended, so a multi-megabyte tool result costs linear time. Nothing is replayed after a reconnect: =server.connected= makes every buffer compare its session with the service and reload the transcript when it changed.
+OpenCode 2 runs one background service per user. Emacs never starts a server of its own and never stops the service: the TUI and the desktop app share it, and it resumes running turns after a restart. Every location's events arrive on a single =GET /api/event= stream. The process filter only splits frames and queues them, and a zero-delay timer dispatches them in time-bounded batches, because the service drops a subscriber that falls 4096 frames behind and a slow handler must not stall the socket. Frame scanning resumes where the previous chunk ended, so a multi-megabyte tool result costs linear time. Nothing is replayed after a reconnect: =server.connected= has every open buffer catch up with the service, writing only what it missed (see [[*Catching up after a reconnection][Catching up after a reconnection]]).
 
 Locations are keyed by the exact directory string the service receives, so every directory is normalized the same way: truename, trailing slash, and an uppercase drive letter on Windows.
 
@@ -127,6 +127,18 @@ Opening a session renders its projected messages; afterwards the event stream dr
 - The package tracks its own prompt start marker: =comint-last-prompt= would count the last line of output as the prompt.
 - Notices are inserted before the idle prompt, and a turn started elsewhere lifts the prompt first.
 - A background job's completion is a synthetic message, keyed by its message ID, which its inbox item shares. Its metadata makes it a block of the job's tool, and the element wrapping its text is removed only when it is exactly what the service writes, so an unexpected text shows whole.
+
+* Catching up after a reconnection
+
+The service replays nothing to a stream that reconnects, so every open buffer must find what it missed. It used to compare its session's update time with the one it fetched when it opened, and render its whole transcript again when they differed or a turn ran. Events never refreshed that time, so every buffer whose session had run a turn since it opened rendered its whole transcript again at every reconnection. With 26 buffers open, some with thousands of parts, a reconnection held Emacs for 9.6 s in one stretch.
+
+The live events tell which messages a buffer renders: the service names a message after the event appending it (=msg_= and the event ID's suffix), a prompt or note after its inbox item, a step after its =assistantMessageID=. So the buffer records the ID of each message it renders, from events and transcripts alike, and whether it is open, as a running step, shell command or compaction is, or finished. Whenever none is open, everything up to the newest message is rendered for good: that message and the end of the transcript, before the idle prompt, are where the buffer is in sync (=opencode--synced=, =opencode-synced-end=), with the state writing more needs, the kind of the last block, the errors shown in the turn and the start of the last answer. Expanding the block ending there writes at that point, which then moves after the expansion.
+
+At a reconnection, every buffer fetches its session, adopting its location, title and selections, then the newest page of its messages, five of them, and pages of 25, 100 and 200 further back until one holds the message it is in sync with. Most buffers missed nothing, or a turn: the first page tells, and a buffer with nothing newer and nothing open writes nothing at all. Otherwise it deletes what follows its sync point, the step that was running included, and writes the messages after its sync message from the state saved there. As live rendering equals replay, that is what a buffer opened afresh shows. When the first page lacks that message, the service is asked whether it still has it: a revert or a fork-and-replace removed it, and the buffer renders its whole transcript again rather than page back through all of it. The status comes from the running sessions, asked once for every buffer.
+
+Answers and events race: an event arriving while a buffer fetches may be in the answer already, or not. So a buffer withholds its session's events from the stream's reopening, and from the start of any whole load, until it has written what it fetched, then applies them in order, and nothing already rendered is rendered twice. An event appending a known message renders nothing; events of the parts of a finished step change nothing; a step still running in the answer has its finished parts noted as shown, and those still empty, whose deltas were missed, are shown whole when they end; a tool call never goes back from finished to running. A withheld end of a tool call shown finished already still runs the hooks of a finished call, as the call did end live, and the status is first set to the one before the first withheld turn event, so that applying them leaves the status they lead to.
+
+Buffers shown in a window catch up first, =opencode-resync-requests= at a time. A reconnection during a catch-up abandons it and begins again; a buffer loading its whole transcript catches up once loaded, as its answer may predate the reconnection. Transcripts are written =opencode-replay-slice= seconds at a time from timers. While a buffer writes its whole transcript, its windows show its start between slices, which redisplay fontified already, rather than the newest text of every slice, tens of milliseconds a slice for a window of Markdown; they go back to its end once it is written. Summaries written meanwhile are fitted only where a window shows them, or will once redisplayed: fitting thousands after each slice cost tens of milliseconds, and those elsewhere are fitted when scrolled to.
 
 * Writing a transcript in linear time
 

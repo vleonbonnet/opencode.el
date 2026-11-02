@@ -767,5 +767,37 @@ an agent of mode `all'."
                  (concat "edit notes.txt:\n"
                          (opencode-fenced-block "@@ -1,2 +1,2 @@\n a\n-b\n+c\n" "diff")))))
 
+(ert-deftest opencode-test-fit-flush-fits-what-windows-show ()
+  "Summaries written while redisplay is inhibited are fitted where windows show them.
+A transcript written whole changes thousands: those far from what a
+window shows, or will once redisplayed, are fitted when scrolled to."
+  (opencode-test-with-server
+    (let ((buffer (opencode-test-open-empty (opencode-test-scenario "shell")))
+          (overlays nil))
+      (with-current-buffer buffer
+        (let ((inhibit-redisplay t))
+          (dotimes (index 300)
+            (opencode-open-block 'tool)
+            (push (opencode-tool-start (format "call_fit_%d" index) "shell" '((command . "make check")) "completed")
+                  overlays)))
+        (setq overlays (nreverse overlays))
+        (save-window-excursion
+          (delete-other-windows)
+          (set-window-buffer (selected-window) buffer)
+          (set-window-start (selected-window) (point-min))
+          (set-window-point (selected-window) (point-min))
+          (opencode--fit-flush buffer)
+          (should (overlay-get (car overlays) 'opencode-fit-state))
+          (should-not (overlay-get (car (last overlays)) 'opencode-fit-state))
+          (opencode--fit-visible (selected-window) (overlay-start (car (last overlays))))
+          (should (overlay-get (car (last overlays)) 'opencode-fit-state))
+          ;; What a window following output brings into view is fitted.
+          (set-window-point (selected-window) (point-max))
+          (let ((inhibit-redisplay t))
+            (opencode-block-update (car (last overlays)) :status "error" :error '((message . "failed"))))
+          (should-not (overlay-get (car (last overlays)) 'opencode-fit-state))
+          (opencode--fit-flush buffer)
+          (should (overlay-get (car (last overlays)) 'opencode-fit-state)))))))
+
 (provide 'opencode-session-test)
 ;;; opencode-session-test.el ends here

@@ -42,8 +42,10 @@
 ;; the job ended.
 ;;
 ;; Nothing is replayed after the stream reconnects, so every open buffer
-;; reconciles with the server then, and reloads its transcript when the
-;; session changed meanwhile.
+;; catches up with the server then: it fetches the messages after the
+;; last one it knows complete and writes only those again, and renders
+;; its whole transcript again only when that message is gone, as after
+;; a revert.
 
 ;;; Code:
 
@@ -171,10 +173,18 @@ messages delivered there; see `opencode--conversation-position'.")
   "Number of messages of input typed here that were delivered.")
 
 (defvar-local opencode--text-blocks nil
-  "Hash table of text block keys to plists (:start MARKER :text STRING).")
+  "Hash table of the text block keys of open messages to plists (:text STRING).
+:text is what is shown of the block; :done marks one that ended.  A
+message's keys go once it is finished, so the table stays small.")
 
 (defvar-local opencode--current-assistant nil
   "ID of the assistant message streaming in this buffer.")
+
+(defvar-local opencode--reasoning-native nil
+  "Hash table of reasoning keys to the native data their start event carried.")
+
+(defvar-local opencode--pending-inbox nil
+  "Hash table of inbox IDs to items enqueued by others, rendered once delivered.")
 
 (defvar-local opencode--attachments nil
   "Files and agents to send with the next prompt, newest first.
@@ -184,7 +194,13 @@ Each is a plist (:file URI-ALIST) or (:agent NAME).")
   "Temporary files to delete once sent or when the buffer is killed.")
 
 (defvar-local opencode--replaying nil
-  "Non-nil while the transcript is being replayed.")
+  "Non-nil while the transcript is being replayed.
+Nothing replayed is live: it never runs the hooks of live events, such
+as those processing the files an edit changed.")
+
+(defvar-local opencode--render-generation 0
+  "Count of the times the transcript was erased or cut.
+A replay sliced over timers stops when it changes.")
 
 (defvar-local opencode--turn-errors nil
   "Error messages already shown during the current turn.")
@@ -673,6 +689,7 @@ the server."
              (eq (gethash opencode-session-id opencode-session-buffers) (current-buffer)))
     (remhash opencode-session-id opencode-session-buffers)
     (run-hook-with-args 'opencode-session-buffer-functions opencode-session-id))
+  (opencode--resync-forget (current-buffer))
   (when-let* ((process (get-buffer-process (current-buffer))))
     (delete-process process))
   (mapc (lambda (file) (ignore-errors (delete-file file))) opencode--temp-files)
@@ -888,6 +905,213 @@ is otherwise reported.  NO-DISPLAY leaves every window alone."
   (interactive (list (when current-prefix-arg (read-string "Title: "))))
   (opencode-session-create :directory (opencode-project-directory) :title title))
 
+;;;; What the transcript holds
+
+;; The service names every message it appends after the event appending
+;; it, or after the inbox item delivered, so the live events tell which
+;; messages a buffer renders as well as the transcript does.  A message
+;; is open while it may still change, as a step running, a shell
+;; command or a compaction in progress; once none is open, everything
+;; up to the newest message is rendered for good, and the end of the
+;; transcript is where the buffer is in sync, `opencode--synced'.  A
+;; reconnection then fetches only the messages after that one and
+;; writes them again from there.
+;;
+;; Answers and events race: an event arriving while the transcript is
+;; fetched or written may be in the answer already.  So the buffer
+;; withholds its session's events meanwhile and applies them once the
+;; answer is written, and a message or part already rendered is never
+;; rendered again: events appending a known message, or updating a
+;; finished one, change nothing.
+
+(defvar-local opencode--messages nil
+  "Hash table of the IDs of the server messages rendered here.
+Each maps to `open' while the message may still change, else `final'.")
+
+(defvar-local opencode--open-messages nil
+  "IDs of the rendered messages that are open, newest first.")
+
+(defvar-local opencode--open-shells nil
+  "Alist of the shell IDs of running shell messages to their message IDs.")
+
+(defvar-local opencode--open-compaction nil
+  "ID of the compaction message in progress, or nil.")
+
+(defvar-local opencode--awaited-parts nil
+  "Hash table of the text and reasoning keys a fetched transcript had in progress.
+Their earlier deltas were missed, so they are shown whole once they end.")
+
+(defvar-local opencode--newest-message nil
+  "ID of the newest server message rendered here, or nil.")
+
+(defvar-local opencode--synced nil
+  "Where this buffer is in sync with the service, or nil when unknown.
+A plist: :id, the newest message such that it and every one before it
+are rendered and finished; :kind, `opencode--last-block-kind' after it;
+:errors, `opencode--turn-errors' then; :response, a marker at
+`opencode-last-response-start' then.  `opencode-synced-end' marks
+where what follows that message is rendered.")
+
+(defvar-local opencode--holding nil
+  "Non-nil while this buffer withholds its session's events.")
+
+(defvar-local opencode--loading nil
+  "Non-nil while this buffer's transcript is being fetched and written whole.")
+
+(defvar-local opencode--pinned nil
+  "Non-nil while this buffer's windows show its start, as its transcript is written whole.
+Its windows and point go to its end once it is written.")
+
+(defvar-local opencode--resync-wanted nil
+  "Non-nil when this buffer must catch up once its transcript is loaded.")
+
+(defvar-local opencode--held-events nil
+  "Events withheld while the transcript is fetched, newest first.
+Each is (EVENT . FUNCTION), FUNCTION applying EVENT in this buffer.")
+
+(defvar opencode--releasing nil
+  "Non-nil while withheld events are applied.")
+
+(defun opencode--message-table ()
+  "Return `opencode--messages', made on first use."
+  (or opencode--messages
+      (setq opencode--messages (make-hash-table :test #'equal))))
+
+(defun opencode--message-known-p (id)
+  "Return non-nil when message ID is rendered here."
+  (and id (gethash id (opencode--message-table))))
+
+(defun opencode--message-final-p (id)
+  "Return non-nil when message ID is rendered here and finished."
+  (and id (eq (gethash id (opencode--message-table)) 'final)))
+
+(defun opencode--event-message-id (event)
+  "Return the ID of the message EVENT appends, as the service names it, or nil."
+  (when-let* ((id (alist-get 'id event)))
+    (if (string-prefix-p "evt_" id) (concat "msg_" (substring id 4)) id)))
+
+(defun opencode--settle ()
+  "Note that the transcript is in sync up to its end, unless a message is open."
+  (when (and opencode--newest-message (null opencode--open-messages)
+             (get-buffer-process (current-buffer)))
+    ;; Before the idle prompt, which is rewritten after any new message.
+    (let ((end (if (opencode-prompt-shown-p) (marker-position opencode--prompt-start) (opencode-pmark)))
+          (response (plist-get opencode--synced :response)))
+      (if (markerp opencode-synced-end)
+          (set-marker opencode-synced-end end)
+        (setq opencode-synced-end (copy-marker end)))
+      (when (markerp response) (set-marker response nil))
+      (setq opencode--synced
+            (list :id opencode--newest-message
+                  :kind opencode--last-block-kind
+                  :errors (copy-sequence opencode--turn-errors)
+                  :response (and (markerp opencode-last-response-start)
+                                 (marker-buffer opencode-last-response-start)
+                                 (copy-marker opencode-last-response-start)))))))
+
+(defun opencode--note-message (id &optional open)
+  "Note that message ID is rendered, OPEN while it may still change."
+  (when id
+    (puthash id (if open 'open 'final) (opencode--message-table))
+    (setq opencode--newest-message id)
+    (if open
+        (cl-pushnew id opencode--open-messages :test #'equal)
+      (setq opencode--open-messages (delete id opencode--open-messages)))
+    (opencode--settle)))
+
+(defun opencode--forget-parts (id)
+  "Forget the text parts of message ID, which no event changes any longer."
+  (when (hash-table-p opencode--text-blocks)
+    (let ((prefix (concat id "/"))
+          (keys nil))
+      (maphash (lambda (key _) (when (string-prefix-p prefix key) (push key keys)))
+               opencode--text-blocks)
+      (dolist (key keys)
+        (remhash key opencode--text-blocks)))))
+
+(defun opencode--finish-message (id)
+  "Note that open message ID is finished."
+  (when (and id (eq (gethash id (opencode--message-table)) 'open))
+    (puthash id 'final opencode--messages)
+    (setq opencode--open-messages (delete id opencode--open-messages))
+    (opencode--forget-parts id)
+    (opencode--settle)))
+
+(defun opencode--forget-messages ()
+  "Forget which messages are rendered, as the transcript is erased."
+  (when (hash-table-p opencode--messages) (clrhash opencode--messages))
+  (when (hash-table-p opencode--awaited-parts) (clrhash opencode--awaited-parts))
+  (when (markerp (plist-get opencode--synced :response))
+    (set-marker (plist-get opencode--synced :response) nil))
+  (setq opencode--open-messages nil
+        opencode--open-shells nil
+        opencode--open-compaction nil
+        opencode--newest-message nil
+        opencode--synced nil))
+
+(defun opencode--part-awaited-p (key)
+  "Return non-nil when part KEY is shown only once it ends."
+  (and (hash-table-p opencode--awaited-parts) (gethash key opencode--awaited-parts)))
+
+(defun opencode--await-part (key)
+  "Show part KEY only once it ends: a fetched transcript had it in progress."
+  (unless (hash-table-p opencode--awaited-parts)
+    (setq opencode--awaited-parts (make-hash-table :test #'equal)))
+  (puthash key t opencode--awaited-parts))
+
+(defun opencode--projected-open-p (message)
+  "Return non-nil when projected MESSAGE may still change."
+  (pcase (alist-get 'type message)
+    ("assistant" (not (alist-get 'completed (alist-get 'time message))))
+    ((or "shell" "compaction") (equal (alist-get 'status message) "running"))))
+
+;;;; Withholding events
+
+(defun opencode--hold ()
+  "Withhold this buffer's session events until `opencode--release'."
+  (setq opencode--holding t))
+
+(defun opencode--when-live (event function)
+  "Call FUNCTION, applying EVENT in this buffer, now or once events are released."
+  (if opencode--holding
+      (push (cons event function) opencode--held-events)
+    (funcall function)))
+
+(defun opencode--release ()
+  "Apply the events withheld, oldest first, and follow events again.
+Those the transcript fetched meanwhile already holds change nothing.
+An event that has the buffer withhold events again, as a reload does,
+leaves the rest withheld."
+  (let ((buffer (current-buffer))
+        (events (nreverse opencode--held-events))
+        (opencode--releasing t))
+    (setq opencode--holding nil
+          opencode--held-events nil)
+    (while (and events (buffer-live-p buffer))
+      (with-current-buffer buffer
+        (if opencode--holding
+            (setq opencode--held-events (append opencode--held-events (reverse events))
+                  events nil)
+          (let ((entry (pop events)))
+            (condition-case err
+                (funcall (cdr entry))
+              (error
+               (message "OpenCode: %s handler failed: %s"
+                        (alist-get 'type (car entry)) (error-message-string err))))))))))
+
+(defun opencode--held-status ()
+  "Return the status before the first withheld turn event, or nil without one.
+Applying the withheld events then leaves the status they lead to."
+  (seq-some (lambda (entry)
+              (let ((event (car entry)))
+                (pcase (alist-get 'type event)
+                  ("session.execution.started" 'idle)
+                  ((or "session.execution.succeeded" "session.execution.failed") 'busy)
+                  ("session.execution.interrupted"
+                   (unless (equal (alist-get 'reason (alist-get 'data event)) "shutdown")
+                     'busy)))))
+            (reverse opencode--held-events)))
+
 ;;;; Loading the transcript
 
 (defun opencode--fetch-messages (id callback &optional else cursor accumulated)
@@ -906,31 +1130,121 @@ order of the first page, and the service refuses both together."
                  (opencode--fetch-messages id callback else next (nconc accumulated data))
                (funcall callback (nconc accumulated data)))))))
 
+(defun opencode--show-status (active)
+  "Adopt the status ACTIVE gives, non-nil while a turn runs, with its idle prompt."
+  (setq opencode-session-status (if active 'busy 'idle))
+  (if active
+      (opencode-lift-prompt)
+    (unless (opencode-prompt-shown-p)
+      (opencode-call-preserving-viewport
+       (current-buffer)
+       (lambda ()
+         (opencode-open-block 'user)
+         (opencode-show-prompt)))))
+  (force-mode-line-update))
+
+(defun opencode--status-after-fetch (active)
+  "Return non-nil when a turn runs, from ACTIVE, what a request asked meanwhile said.
+The withheld events say better: the status before the first turn
+event among them, so that applying them leaves the status they lead to."
+  (pcase (opencode--held-status)
+    ('busy t)
+    ('idle nil)
+    (_ active)))
+
+(defun opencode--unpin ()
+  "Show the end of the transcript written whole, where its windows follow output."
+  (when opencode--pinned
+    (setq opencode--pinned nil)
+    (opencode--pin-viewport t)))
+
+(defun opencode--loaded ()
+  "Follow events again once the transcript is loaded, catching up when asked to."
+  (opencode--unpin)
+  (setq opencode--loading nil)
+  (opencode--release)
+  (when opencode--resync-wanted
+    (setq opencode--resync-wanted nil)
+    (opencode--resync-enqueue (current-buffer))))
+
+(defun opencode--load-failure (else)
+  "Return the handler of a failed load: follow events again, then call ELSE.
+Without ELSE, the failure is reported."
+  (lambda (error)
+    (opencode--loaded)
+    (if else
+        (funcall else error)
+      (opencode-report-error (opencode-error-describe error)))))
+
 (defun opencode-session-load (&optional callback else)
   "Replay this session's transcript, then adopt its status and run CALLBACK.
-ELSE, when given, receives the `opencode-error' of a failed request."
-  (let ((id opencode-session-id))
+ELSE, when given, receives the `opencode-error' of a failed request.
+The session's events are withheld meanwhile, then applied."
+  (let ((id opencode-session-id)
+        (else (opencode--load-failure else)))
+    (setq opencode--loading t
+          opencode--pinned t)
+    (opencode--hold)
     (opencode--fetch-messages
      id
      (lambda (messages)
-       (opencode-replay-messages messages)
-       (opencode-request
-        'get "/api/session/active"
-        :else else
-        :then (lambda (response)
-                (let ((active (assq (intern id) (opencode-request-data response))))
-                  (setq opencode-session-status (if active 'busy 'idle))
-                  (unless active
-                    (opencode-open-block 'user)
-                    (opencode-show-prompt))
-                  (force-mode-line-update)
-                  (run-hooks 'opencode-session-replayed-hook)
-                  (when callback (funcall callback))))))
+       (opencode-replay-messages
+        messages
+        (lambda ()
+          (opencode-request
+           'get "/api/session/active"
+           :else else
+           :then (lambda (response)
+                   (opencode--unpin)
+                   (opencode--show-status
+                    (opencode--status-after-fetch
+                     (assq (intern id) (opencode-request-data response))))
+                   (run-hooks 'opencode-session-replayed-hook)
+                   (opencode--loaded)
+                   (when callback (funcall callback)))))))
      else)))
 
 (defun opencode--session-revert (&rest _)
   "Reload the transcript, as `revert-buffer' does in a session buffer."
   (opencode-session-reload))
+
+(defun opencode--erase-transcript ()
+  "Erase the transcript and the input, and forget what they showed."
+  (cl-incf opencode--render-generation)
+  (let ((inhibit-read-only t)
+        (buffer-undo-list t))
+    (remove-overlays)
+    (erase-buffer))
+  ;; The prompt's records point into the text erased.
+  (when (listp buffer-undo-list)
+    (setq buffer-undo-list nil))
+  (set-marker (process-mark (get-buffer-process (current-buffer))) (point-min))
+  (opencode--sent-inputs-erased)
+  (clrhash opencode--text-blocks)
+  (when (hash-table-p opencode--blocks) (clrhash opencode--blocks))
+  (when (hash-table-p opencode--reasoning-native) (clrhash opencode--reasoning-native))
+  (setq opencode--last-block-kind nil
+        opencode--current-assistant nil
+        opencode--turn-errors nil)
+  ;; Replaying the transcript finds the size again, if any remains.
+  (setq opencode-session-tokens nil opencode-session-tokens-estimated nil)
+  (opencode--forget-messages))
+
+(defun opencode--render-again (&optional then)
+  "Render this session's transcript again from the server, then call THEN.
+The input and the viewport are kept as `opencode-session-reload' says."
+  (let ((input (and (get-buffer-process (current-buffer))
+                    (buffer-substring-no-properties (opencode-pmark) (point-max))))
+        (viewport (opencode-save-viewport)))
+    (opencode--erase-transcript)
+    (opencode-session-load
+     (lambda ()
+       (goto-char (point-max))
+       (when (and input (not (string-empty-p input)))
+         (let ((buffer-undo-list t))
+           (insert input)))
+       (opencode-restore-viewport viewport)
+       (when then (funcall then))))))
 
 (defun opencode-session-reload ()
   "Render this session's transcript again from the server.
@@ -944,26 +1258,8 @@ transcript or in the input stay there, others at their line, as
      opencode-session-id
      (lambda (info)
        (opencode-with-session-buffer (alist-get 'id info)
-         (let ((input (and (get-buffer-process (current-buffer))
-                           (buffer-substring-no-properties (opencode-pmark) (point-max))))
-               (viewport (opencode-save-viewport)))
-           (let ((inhibit-read-only t))
-             (remove-overlays)
-             (erase-buffer))
-           (set-marker (process-mark (get-buffer-process (current-buffer))) (point-min))
-           (opencode--sent-inputs-erased)
-           (clrhash opencode--text-blocks)
-           (when (hash-table-p opencode--blocks) (clrhash opencode--blocks))
-           (setq opencode--last-block-kind nil opencode--current-assistant nil)
-           ;; Replaying the transcript finds the size again, if any remains.
-           (setq opencode-session-tokens nil opencode-session-tokens-estimated nil)
-           (opencode--adopt-info info location-generation)
-           (opencode-session-load
-            (lambda ()
-              (goto-char (point-max))
-              (when (and input (not (string-empty-p input)))
-                (insert input))
-              (opencode-restore-viewport viewport)))))))))
+         (opencode--adopt-info info location-generation)
+         (opencode--render-again))))))
 
 (defun opencode--render-user-prompt (text &optional message-id note)
   "Render a user prompt with TEXT for MESSAGE-ID, followed by NOTE when given.
@@ -1003,35 +1299,46 @@ Input still being typed is lifted out and put back afterwards."
                        (mapcar (lambda (agent) (concat "@" (alist-get 'name agent))) .agents)))
      " ")))
 
-(defun opencode--render-assistant-content (message)
-  "Render the content of projected assistant MESSAGE."
+(defun opencode--render-assistant-content (message &optional open)
+  "Render the content of projected assistant MESSAGE.
+OPEN means the step still runs: events may follow for its parts, so
+those ended are noted as shown whole, and those still empty, whose
+deltas were missed, are shown once they end."
   (let ((id (alist-get 'id message))
         (text-ordinal 0)
         (reasoning-ordinal 0))
     (dolist (item (alist-get 'content message))
       (pcase (alist-get 'type item)
         ("text"
-         (let ((text (string-trim (or (alist-get 'text item) ""))))
-           (unless (string-empty-p text)
+         (let ((text (string-trim (or (alist-get 'text item) "")))
+               (key (format "%s/t/%d" id text-ordinal)))
+           (if (string-empty-p text)
+               (when open (opencode--await-part key))
              (opencode-open-block 'text)
              (opencode-set-last-response-start (opencode-pmark))
              (setq opencode--table-scan-marker (copy-marker (opencode-pmark)))
              (opencode--output-message text id)
              (opencode-buttonize-output-end)
-             (opencode-align-finished-tables t)))
+             (opencode-align-finished-tables t)
+             (when open
+               (puthash key (list :text text :done t) opencode--text-blocks))))
          (cl-incf text-ordinal))
         ("reasoning"
          (let ((text (alist-get 'text item))
                (native (alist-get 'native item))
                (key (opencode-reasoning-key id reasoning-ordinal)))
-           (if (opencode-narration-p text native)
-               (progn (opencode-open-block 'text)
-                      (opencode--output-message (string-trim text) id)
-                      (opencode-buttonize-output-end))
-             (when (or (not (string-empty-p (or text "")))
-                       (opencode-reasoning-hidden-kind text native))
-               (opencode-open-block 'reasoning)
-               (opencode-reasoning-end key text native))))
+           (cond
+            ((opencode-narration-p text native)
+             (opencode-open-block 'text)
+             (opencode--output-message (string-trim text) id)
+             (opencode-buttonize-output-end)
+             (when open
+               (puthash key (list :text text :done t) opencode--text-blocks)))
+            ((or (not (string-empty-p (or text "")))
+                 (opencode-reasoning-hidden-kind text native))
+             (opencode-open-block 'reasoning)
+             (opencode-reasoning-end key text native))
+            (open (opencode--await-part key))))
          (cl-incf reasoning-ordinal))
         ("tool"
          (opencode-open-block 'tool)
@@ -1138,79 +1445,143 @@ error face unless the job completed; any other message is a notice."
 
 (defun opencode-replay-message (message)
   "Render projected MESSAGE of the transcript."
-  (pcase (alist-get 'type message)
-    ("user"
-     (opencode--render-user-prompt (opencode--user-message-text message) (alist-get 'id message)))
-    ("assistant" (opencode--render-assistant-content message))
-    ("synthetic"
-     (opencode--render-synthetic (alist-get 'id message) (alist-get 'description message)
-                                 (alist-get 'text message) (alist-get 'metadata message)))
-    ("system"
-     (opencode-open-block 'tool)
-     (opencode-notice-block (or (alist-get 'description message) "Instructions updated")
-                            (alist-get 'text message) (alist-get 'id message)))
-    ("skill"
-     (opencode-open-block 'tool)
-     (opencode-notice-block (format "Skill %s activated" (alist-get 'name message))
-                            (alist-get 'text message) (alist-get 'id message)))
-    ("shell"
-     (opencode-open-block 'tool)
-     (let ((overlay (opencode-tool-start (alist-get 'shellID message) "shell"
-                                         `((command . ,(alist-get 'command message)))
-                                         (if (equal (alist-get 'status message) "running")
-                                             "running" "completed"))))
-       (opencode-block-update overlay :output (opencode--shell-output (alist-get 'output message)))))
-    ("compaction"
-     (when (equal (alist-get 'status message) "completed")
-       (opencode--note-compaction (alist-get 'context message)))
-     (opencode-open-block 'tool)
-     (opencode-notice-block (pcase (alist-get 'status message)
-                              ("failed" "Compaction failed")
-                              ("running" "Compacting…")
-                              (_ "Conversation compacted"))
-                            (or (alist-get 'summary message)
-                                (alist-get 'message (alist-get 'error message)))
-                            (alist-get 'id message)))
-    ("agent-switched"
-     (when opencode-show-switch-notices
-       (opencode-output-notice (format "Switched to the %s agent" (alist-get 'agent message)))))
-    ("model-switched"
-     (when opencode-show-switch-notices
-       (opencode-output-notice (format "Switched to %s" (opencode-model-label (alist-get 'model message))))))
-    ("location-switched"
-     (opencode-output-notice (format "Moved to %s" (opencode--session-directory message))))
-    ("idle"
-     (pcase (alist-get 'outcome message)
-       ("failed" (when-let* ((error (alist-get 'error message))) (opencode--output-error error)))
-       ("interrupted" (opencode-output-notice "Interrupted"))))))
+  (let ((open (opencode--projected-open-p message))
+        (id (alist-get 'id message)))
+    (pcase (alist-get 'type message)
+      ("user"
+       (opencode--render-user-prompt (opencode--user-message-text message) id))
+      ("assistant"
+       (opencode--render-assistant-content message open)
+       (when open (setq opencode--current-assistant id)))
+      ("synthetic"
+       (opencode--render-synthetic id (alist-get 'description message)
+                                   (alist-get 'text message) (alist-get 'metadata message)))
+      ("system"
+       (opencode-open-block 'tool)
+       (opencode-notice-block (or (alist-get 'description message) "Instructions updated")
+                              (alist-get 'text message) id))
+      ("skill"
+       (opencode-open-block 'tool)
+       (opencode-notice-block (format "Skill %s activated" (alist-get 'name message))
+                              (alist-get 'text message) id))
+      ("shell"
+       (opencode-open-block 'tool)
+       (let ((overlay (opencode-tool-start (alist-get 'shellID message) "shell"
+                                           `((command . ,(alist-get 'command message)))
+                                           (if open "running" "completed"))))
+         (opencode-block-update overlay :output (opencode--shell-output (alist-get 'output message))))
+       (when open
+         (push (cons (alist-get 'shellID message) id) opencode--open-shells)))
+      ("compaction"
+       (when (equal (alist-get 'status message) "completed")
+         (opencode--note-compaction (alist-get 'context message)))
+       (opencode-open-block 'tool)
+       (let ((overlay (opencode-notice-block (pcase (alist-get 'status message)
+                                               ("failed" "Compaction failed")
+                                               ("running" "Compacting…")
+                                               (_ "Conversation compacted"))
+                                             (or (alist-get 'summary message)
+                                                 (alist-get 'message (alist-get 'error message)))
+                                             id)))
+         (when open
+           ;; The events ending it find it as they find a live one.
+           (puthash (concat opencode-session-id "/compaction") overlay opencode--blocks)
+           (setq opencode--open-compaction id))))
+      ("agent-switched"
+       (when opencode-show-switch-notices
+         (opencode-output-notice (format "Switched to the %s agent" (alist-get 'agent message)))))
+      ("model-switched"
+       (when opencode-show-switch-notices
+         (opencode-output-notice (format "Switched to %s" (opencode-model-label (alist-get 'model message))))))
+      ("location-switched"
+       (opencode-output-notice (format "Moved to %s" (opencode--session-directory message))))
+      ("idle"
+       (pcase (alist-get 'outcome message)
+         ("failed" (when-let* ((error (alist-get 'error message))) (opencode--output-error error)))
+         ("interrupted" (opencode-output-notice "Interrupted")))
+       ;; As at the end of a live turn: the next one shows its errors anew.
+       (setq opencode--turn-errors nil)))
+    (opencode--note-message id open)))
 
 (defun opencode--shell-output (output)
   "Return the text of shell OUTPUT, a string or an alist with `text'."
   (cond ((stringp output) output)
         ((consp output) (or (alist-get 'text output) (alist-get 'output output)))))
 
-(defun opencode-replay-messages (messages)
-  "Render MESSAGES, the projected transcript, oldest first."
+(defcustom opencode-replay-slice 0.03
+  "Seconds a transcript is written at a time, at most, or nil for no limit.
+A long transcript written at once would hold Emacs for seconds, the
+more so as a reconnection has every open session buffer catch up at
+once: it is written a slice at a time instead, from timers, with other
+work running in between."
+  :type '(choice (const :tag "No limit" nil) number)
+  :group 'opencode)
+
+(defun opencode--replay-slice (messages deadline)
+  "Render MESSAGES, at least one, until DEADLINE passes; return those left.
+DEADLINE nil renders them all."
   (let ((inhibit-redisplay t)
         (opencode--replaying t)
         (comint-output-filter-functions
          (remove #'comint-postoutput-scroll-to-bottom comint-output-filter-functions)))
-    (dolist (message messages)
-      (condition-case err
-          (opencode-replay-message message)
-        (error (message "OpenCode: cannot render message %s: %s"
-                        (alist-get 'id message) (error-message-string err)))))))
+    (opencode-without-undo
+      (while (and messages
+                  (progn
+                    (let ((message (pop messages)))
+                      (condition-case err
+                          (opencode-replay-message message)
+                        (error (message "OpenCode: cannot render message %s: %s"
+                                        (alist-get 'id message) (error-message-string err)))))
+                    (or (null deadline) (< (float-time) deadline))))))
+    messages))
+
+(defun opencode-replay-messages (messages &optional then)
+  "Render MESSAGES, the projected transcript or its end, oldest first; call THEN.
+They are rendered `opencode-replay-slice' seconds at a time, the rest
+from a timer.  Erasing or cutting the transcript meanwhile stops them,
+and THEN is not called.  While a transcript is written whole (see
+`opencode--pinned'), its windows show its start between slices."
+  (let ((buffer (current-buffer))
+        (generation opencode--render-generation))
+    (cl-labels ((slice (messages)
+                  (when (buffer-live-p buffer)
+                    (with-current-buffer buffer
+                      (when (= generation opencode--render-generation)
+                        (let ((left (opencode--replay-slice
+                                     messages
+                                     (and opencode-replay-slice
+                                          (+ (float-time) opencode-replay-slice)))))
+                          (if (not left)
+                              (when then (funcall then))
+                            (when opencode--pinned (opencode--pin-viewport))
+                            (run-at-time 0 nil #'slice left))))))))
+      (slice messages))))
+
+(defun opencode--pin-viewport (&optional end)
+  "Show the start of this buffer, or its END, in its windows and at its point.
+Redisplay between the slices of a transcript written whole then shows
+text it fontified already, rather than fontify the newest text of
+every slice: tens of milliseconds a slice for a window of Markdown."
+  (let ((position (if end (point-max) (point-min))))
+    (goto-char position)
+    (dolist (window (get-buffer-window-list nil nil t))
+      (set-window-point window position)
+      (unless end
+        (set-window-start window position t)))))
 
 (declare-function opencode-model-label "opencode-display")
 
 ;;;; Live events
 
 (defmacro opencode--on-session-event (event &rest body)
-  "Run BODY in the buffer of EVENT's session, with `data' bound to its data."
+  "Run BODY in the buffer of EVENT's session, with `data' bound to its data.
+While the buffer withholds events, BODY runs once they are released."
   (declare (indent 1))
-  `(let ((data (alist-get 'data ,event)))
-     (opencode-with-session-buffer (alist-get 'sessionID data)
-       ,@body)))
+  (let ((held (make-symbol "event")))
+    `(let* ((,held ,event)
+            (data (alist-get 'data ,held)))
+       (opencode-with-session-buffer (alist-get 'sessionID data)
+         (opencode--when-live ,held (lambda () ,@body))))))
 
 (defun opencode--text-key (data)
   "Return the text block key of fragment event DATA."
@@ -1219,27 +1590,51 @@ error face unless the job completed; any other message is a notice."
 (defun opencode--event-step-started (event)
   "Handle `session.step.started' EVENT."
   (opencode--on-session-event event
-    (setq opencode--current-assistant (alist-get 'assistantMessageID data)
-          opencode-session-retry nil
-          opencode-session-agent (or (alist-get 'agent data) opencode-session-agent)
-          opencode-session-model (or (alist-get 'model data) opencode-session-model))
-    (force-mode-line-update)))
+    (let ((id (alist-get 'assistantMessageID data))
+          (previous opencode--current-assistant))
+      (setq opencode--current-assistant id
+            opencode-session-retry nil
+            opencode-session-agent (or (alist-get 'agent data) opencode-session-agent)
+            opencode-session-model (or (alist-get 'model data) opencode-session-model))
+      (pcase (gethash id (opencode--message-table))
+        ('final
+         ;; Restarted, as after a retry: where it starts is not known,
+         ;; so the next reconnection renders the transcript whole.
+         (setq opencode--synced nil)
+         (opencode--note-message id t))
+        ('open nil)
+        (_
+         ;; The service finishes the step that ran before.
+         (unless (equal previous id)
+           (opencode--finish-message previous))
+         (opencode--note-message id t)))
+      (force-mode-line-update))))
+
+(defun opencode--live-part-p (data)
+  "Return non-nil when the events of the part DATA names still change it.
+A finished message's parts are rendered whole already."
+  (not (opencode--message-final-p (alist-get 'assistantMessageID data))))
+
+(defun opencode--text-start (key)
+  "Start text block KEY at the end of the transcript, unless it is known."
+  (unless (gethash key opencode--text-blocks)
+    (opencode-align-finished-tables t)
+    (opencode-open-block 'text)
+    (opencode-set-last-response-start (opencode-pmark))
+    (setq opencode--table-scan-marker (copy-marker (opencode-pmark)))
+    (puthash key (list :text "") opencode--text-blocks)))
 
 (defun opencode--event-text-started (event)
   "Handle `session.text.started' EVENT."
   (opencode--on-session-event event
     (let ((key (opencode--text-key data)))
-      (unless (gethash key opencode--text-blocks)
-        (opencode-align-finished-tables t)
-        (opencode-open-block 'text)
-        (opencode-set-last-response-start (opencode-pmark))
-        (setq opencode--table-scan-marker (copy-marker (opencode-pmark)))
-        (puthash key (list :start (copy-marker (opencode-pmark)) :text "")
-                 opencode--text-blocks)))))
+      (when (and (opencode--live-part-p data) (not (opencode--part-awaited-p key)))
+        (opencode--text-start key)))))
 
 (defun opencode--text-append (data delta)
   "Write DELTA of the text block of fragment DATA, when it is the open block."
-  (when-let* ((block (gethash (opencode--text-key data) opencode--text-blocks)))
+  (when-let* ((block (gethash (opencode--text-key data) opencode--text-blocks))
+              ((not (plist-get block :done))))
     (let* ((text (plist-get block :text))
            (delta (if (string-empty-p text) (string-trim-left delta) delta)))
       (unless (string-empty-p delta)
@@ -1251,75 +1646,101 @@ error face unless the job completed; any other message is a notice."
 (defun opencode--event-text-delta (event)
   "Handle `session.text.delta' EVENT."
   (opencode--on-session-event event
-    (opencode--text-append data (alist-get 'delta data))))
+    (when (and (opencode--live-part-p data) (not (opencode--part-awaited-p (opencode--text-key data))))
+      (opencode--text-append data (alist-get 'delta data)))))
 
 (defun opencode--event-text-ended (event)
-  "Handle `session.text.ended' EVENT: complete text missing from the deltas."
+  "Handle `session.text.ended' EVENT: complete text missing from the deltas.
+A block whose earlier deltas were missed is written whole now."
   (opencode--on-session-event event
-    (unless (gethash (opencode--text-key data) opencode--text-blocks)
-      (opencode--event-text-started event))
-    (let* ((block (gethash (opencode--text-key data) opencode--text-blocks))
-           (shown (plist-get block :text))
-           (full (string-trim-left (or (alist-get 'text data) ""))))
-      (cond
-       ((string= shown full))
-       ((string-prefix-p shown full)
-        (opencode--text-append data (substring full (length shown))))
-       (t (message "OpenCode: streamed text diverged from the final text; reloading")
-          (opencode-session-reload)))
-      (opencode-buttonize-output-end)
-      (opencode-align-finished-tables t))))
+    (let ((key (opencode--text-key data)))
+      (when (and (opencode--live-part-p data)
+                 (not (plist-get (gethash key opencode--text-blocks) :done)))
+        (when (hash-table-p opencode--awaited-parts)
+          (remhash key opencode--awaited-parts))
+        (opencode--text-start key)
+        (let* ((block (gethash key opencode--text-blocks))
+               (shown (plist-get block :text))
+               (full (string-trim-left (or (alist-get 'text data) ""))))
+          (cond
+           ((string= shown full))
+           ((string-prefix-p shown full)
+            (opencode--text-append data (substring full (length shown))))
+           (t (message "OpenCode: streamed text diverged from the final text; reloading")
+              (opencode-session-reload)))
+          (plist-put block :done t)
+          (opencode-buttonize-output-end)
+          (opencode-align-finished-tables t))))))
 
-(defvar-local opencode--reasoning-native nil
-  "Hash table of reasoning keys to the native data their start event carried.")
+(defun opencode--reasoning-ended-p (overlay)
+  "Return non-nil when reasoning block OVERLAY is shown whole."
+  (and overlay
+       (or (overlay-get overlay 'opencode-narration)
+           (plist-get (opencode-block-data overlay) :ended))))
 
 (defun opencode--event-reasoning (event)
   "Handle the `session.reasoning.*' EVENT.
 A block is written once it has content: providers that keep their
-reasoning encrypted stream empty blocks, which replay omits too."
+reasoning encrypted stream empty blocks, which replay omits too.  One
+whose earlier deltas were missed is written whole once it ends."
   (opencode--on-session-event event
     (let ((key (opencode-reasoning-key (alist-get 'assistantMessageID data)
                                        (alist-get 'ordinal data))))
       (unless (hash-table-p opencode--reasoning-native)
         (setq opencode--reasoning-native (make-hash-table :test #'equal)))
-      (pcase (alist-get 'type event)
-        ("session.reasoning.started"
-         (puthash key (alist-get 'native data) opencode--reasoning-native))
-        ("session.reasoning.delta"
-         (unless (opencode-block key)
-           (opencode-align-finished-tables t)
-           (opencode-open-block 'reasoning)
-           (opencode-reasoning-start key "" (gethash key opencode--reasoning-native)))
-         (opencode-reasoning-append key (alist-get 'delta data)))
-        ("session.reasoning.ended"
-         (let ((text (alist-get 'text data))
-               (native (alist-get 'native data)))
-           (remhash key opencode--reasoning-native)
-           (when (or (opencode-block key)
-                     (not (string-empty-p (or text "")))
-                     (opencode-reasoning-hidden-kind text native))
+      (when (and (opencode--live-part-p data)
+                 (not (plist-get (gethash key opencode--text-blocks) :done)))
+        (pcase (alist-get 'type event)
+          ("session.reasoning.started"
+           (unless (opencode--part-awaited-p key)
+             (puthash key (alist-get 'native data) opencode--reasoning-native)))
+          ("session.reasoning.delta"
+           (unless (or (opencode--part-awaited-p key) (opencode--reasoning-ended-p (opencode-block key)))
              (unless (opencode-block key)
                (opencode-align-finished-tables t)
-               (opencode-open-block (if (opencode-narration-p text native) 'text 'reasoning)))
-             (opencode-reasoning-end key text native))))))))
+               (opencode-open-block 'reasoning)
+               (opencode-reasoning-start key "" (gethash key opencode--reasoning-native)))
+             (opencode-reasoning-append key (alist-get 'delta data))))
+          ("session.reasoning.ended"
+           (let ((text (alist-get 'text data))
+                 (native (alist-get 'native data)))
+             (remhash key opencode--reasoning-native)
+             (when (hash-table-p opencode--awaited-parts)
+               (remhash key opencode--awaited-parts))
+             (when (or (opencode-block key)
+                       (not (string-empty-p (or text "")))
+                       (opencode-reasoning-hidden-kind text native))
+               (unless (opencode-block key)
+                 (opencode-align-finished-tables t)
+                 (opencode-open-block (if (opencode-narration-p text native) 'text 'reasoning)))
+               (opencode-reasoning-end key text native)))))))))
 
 (defun opencode--event-tool (event)
-  "Handle the `session.tool.*' EVENT."
+  "Handle the `session.tool.*' EVENT.
+An event for a call shown finished, or of a finished step, changes
+nothing: the call is shown as it ended.  Withheld, its end still runs
+the hooks of a finished call, as the call did end live."
   (opencode--on-session-event event
-    (let ((id (alist-get 'id data))
-          (message (alist-get 'assistantMessageID data)))
+    (let* ((id (alist-get 'id data))
+           (message (alist-get 'assistantMessageID data))
+           (overlay (opencode-block id))
+           (done (and overlay (member (plist-get (opencode-block-data overlay) :status)
+                                      '("completed" "error"))))
+           (live (not (opencode--message-final-p message))))
       (pcase (alist-get 'type event)
         ("session.tool.input.started"
-         (opencode-align-finished-tables t)
-         (opencode-open-block 'tool)
-         (opencode-block-update (opencode-tool-start id (alist-get 'name data)) :message message))
-        ("session.tool.called"
-         (unless (opencode-block id)
+         (when (and live (not overlay))
+           (opencode-align-finished-tables t)
            (opencode-open-block 'tool)
-           (opencode-tool-start id (or (alist-get 'name data) "tool")))
-         (opencode-tool-update id :input (alist-get 'input data) :status "running" :message message))
+           (opencode-block-update (opencode-tool-start id (alist-get 'name data)) :message message)))
+        ("session.tool.called"
+         (when (and live (not done))
+           (unless overlay
+             (opencode-open-block 'tool)
+             (opencode-tool-start id (or (alist-get 'name data) "tool")))
+           (opencode-tool-update id :input (alist-get 'input data) :status "running" :message message)))
         ("session.tool.progress"
-         (when-let* ((overlay (opencode-block id)))
+         (when (and overlay (not done))
            (let* ((metadata (alist-get 'metadata data))
                   (known (plist-get (opencode-block-data overlay) :session-id))
                   (session (or (alist-get 'sessionID metadata) known)))
@@ -1327,38 +1748,50 @@ reasoning encrypted stream empty blocks, which replay omits too."
              ;; A subagent's session is first known here.
              (unless (equal session known)
                (run-hook-with-args 'opencode-blocks-attach-functions overlay)))))
-        ("session.tool.success"
-         (let ((metadata (alist-get 'metadata data)))
-           (opencode-tool-update id :status "completed"
+        ((or "session.tool.success" "session.tool.failed")
+         (cond
+          (done
+           (when opencode--releasing
+             (run-hook-with-args 'opencode-blocks-finished-functions overlay)))
+          ((not live))
+          ((equal (alist-get 'type event) "session.tool.success")
+           (let ((metadata (alist-get 'metadata data)))
+             (opencode-tool-update id :status "completed"
+                                   :output (opencode-content-text (alist-get 'content data))
+                                   :metadata metadata
+                                   :answers (alist-get 'answers metadata)
+                                   :session-id (or (alist-get 'sessionID metadata)
+                                                   (and overlay
+                                                        (plist-get (opencode-block-data overlay) :session-id))))))
+          (t
+           (opencode-tool-update id :status "error" :error (alist-get 'error data)
                                  :output (opencode-content-text (alist-get 'content data))
-                                 :metadata metadata
-                                 :answers (alist-get 'answers metadata)
-                                 :session-id (or (alist-get 'sessionID metadata)
-                                                 (when-let* ((overlay (opencode-block id)))
-                                                   (plist-get (opencode-block-data overlay) :session-id))))))
-        ("session.tool.failed"
-         (opencode-tool-update id :status "error" :error (alist-get 'error data)
-                               :output (opencode-content-text (alist-get 'content data))
-                               :metadata (alist-get 'metadata data)))))))
+                                 :metadata (alist-get 'metadata data)))))))))
 
 (defun opencode--event-step-ended (event)
   "Handle `session.step.ended' EVENT."
   (opencode--on-session-event event
-    (opencode-align-finished-tables t)
-    (opencode--note-tokens (alist-get 'tokens data))
-    (run-hook-with-args 'opencode-step-ended-functions data)))
+    (let ((id (alist-get 'assistantMessageID data)))
+      (unless (opencode--message-final-p id)
+        (opencode-align-finished-tables t)
+        (opencode--note-tokens (alist-get 'tokens data))
+        (run-hook-with-args 'opencode-step-ended-functions data)
+        (opencode--finish-message id)))))
 
 (defun opencode--event-step-failed (event)
   "Handle `session.step.failed' EVENT."
   (opencode--on-session-event event
-    (opencode-align-finished-tables t)
-    ;; A step failing after the provider answered records that usage on
-    ;; its message, which replay reads.
-    (opencode--note-tokens (alist-get 'tokens data))
-    (unless (or (run-hook-with-args-until-success 'opencode-step-failed-functions data)
-                ;; The execution's interruption notice says it.
-                (equal (alist-get 'type (alist-get 'error data)) "aborted"))
-      (opencode--output-error (alist-get 'error data)))))
+    (let ((id (alist-get 'assistantMessageID data)))
+      (unless (opencode--message-final-p id)
+        (opencode-align-finished-tables t)
+        ;; A step failing after the provider answered records that usage on
+        ;; its message, which replay reads.
+        (opencode--note-tokens (alist-get 'tokens data))
+        (unless (or (run-hook-with-args-until-success 'opencode-step-failed-functions data)
+                    ;; The execution's interruption notice says it.
+                    (equal (alist-get 'type (alist-get 'error data)) "aborted"))
+          (opencode--output-error (alist-get 'error data)))
+        (opencode--finish-message id)))))
 
 (defun opencode--event-execution (event)
   "Handle the `session.execution.*' EVENT: a turn starts or ends."
@@ -1371,33 +1804,39 @@ reasoning encrypted stream empty blocks, which replay omits too."
        (opencode-lift-prompt)
        (force-mode-line-update))
       (type
-       (let ((outcome (pcase type
-                        ("session.execution.succeeded" 'succeeded)
-                        ("session.execution.failed" 'failed)
-                        (_ 'interrupted))))
+       (let* ((outcome (pcase type
+                         ("session.execution.succeeded" 'succeeded)
+                         ("session.execution.failed" 'failed)
+                         (_ 'interrupted)))
+              ;; A shutdown is resumed by the restarted service.
+              (shutdown (equal (alist-get 'reason data) "shutdown"))
+              (idle (unless shutdown (opencode--event-message-id event)))
+              (shown (opencode--message-known-p idle)))
          (opencode-align-finished-tables t)
-         (pcase outcome
-           ('failed (opencode--output-error (alist-get 'error data)))
-           ('interrupted
-            (unless (equal (alist-get 'reason data) "shutdown")
-              (opencode-output-notice "Interrupted"))))
-         ;; A shutdown is resumed by the restarted service.
-         (unless (equal (alist-get 'reason data) "shutdown")
+         (unless shown
+           (pcase outcome
+             ('failed (opencode--output-error (alist-get 'error data)))
+             ('interrupted
+              (unless shutdown
+                (opencode-output-notice "Interrupted")))))
+         (unless shutdown
+           (opencode--finish-message opencode--current-assistant)
            (setq opencode-session-status 'idle
                  opencode-session-retry nil
-                 opencode--current-assistant nil)
+                 opencode--current-assistant nil
+                 opencode--turn-errors nil)
            (opencode-call-preserving-viewport
             (current-buffer)
             (lambda ()
-              (opencode-open-block 'user)
-              (opencode-show-prompt)))
+              ;; Shown already when the transcript fetched held the end.
+              (unless (opencode-prompt-shown-p)
+                (opencode-open-block 'user)
+                (opencode-show-prompt))))
+           (opencode--note-message idle)
            (force-mode-line-update)
            (run-hook-with-args 'opencode-turn-ended-functions outcome)
            (opencode-notify-turn-ended outcome)
            (run-hook-with-args 'opencode-session-idle-functions outcome)))))))
-
-(defvar-local opencode--pending-inbox nil
-  "Hash table of inbox IDs to items enqueued by others, rendered once delivered.")
 
 (defun opencode--render-inbox-item (id item)
   "Render inbox ITEM of inbox ID where it entered the conversation."
@@ -1429,15 +1868,20 @@ delivered: that is where the transcript places them."
            ;; Own prompts too: one whose input a reload erased is shown once delivered.
            (puthash id item opencode--pending-inbox)))
         ("session.inbox.delivered"
-         (let ((item (gethash id opencode--pending-inbox))
-               (own (gethash id opencode--own-inputs))
-               (sent (opencode--stamp-sent-input id)))
+         (let* ((item (gethash id opencode--pending-inbox))
+                (own (gethash id opencode--own-inputs))
+                (sent (opencode--stamp-sent-input id))
+                ;; Prompts and notes become messages named after the item.
+                (appended (if item (member (alist-get 'type item) '("user" "synthetic")) own)))
            (remhash id opencode--pending-inbox)
            (remhash id opencode--own-inputs)
-           (when (and item (or (not own) (plist-get sent :lost)))
+           (when (and item (or (not own) (plist-get sent :lost))
+                      (not (opencode--message-known-p id)))
              (opencode-call-preserving-viewport
               (current-buffer)
-              (lambda () (opencode--render-inbox-item id item))))))
+              (lambda () (opencode--render-inbox-item id item))))
+           (when appended
+             (opencode--note-message id))))
         ("session.inbox.cancelled"
          (remhash id opencode--pending-inbox)
          (opencode--release-sent-input id)
@@ -1448,24 +1892,31 @@ delivered: that is where the transcript places them."
 (defun opencode--event-notice (event)
   "Render the notice EVENT reports: a synthetic message, new instructions or a skill."
   (opencode--on-session-event event
-    (let ((id (alist-get 'id event)))
-      (opencode-before-prompt
-        (pcase (alist-get 'type event)
-          ("session.synthetic"
-           (opencode--render-synthetic id (alist-get 'description data)
-                                       (alist-get 'text data) (alist-get 'metadata data)))
-          ("session.instructions.updated"
-           (when-let* ((text (alist-get 'text data)))
+    (let* ((id (opencode--event-message-id event))
+           (type (alist-get 'type event))
+           ;; New instructions without their text make no message.
+           (appended (and id (or (not (equal type "session.instructions.updated"))
+                                 (alist-get 'text data)))))
+      (unless (opencode--message-known-p id)
+        (opencode-before-prompt
+          (pcase type
+            ("session.synthetic"
+             (opencode--render-synthetic id (alist-get 'description data)
+                                         (alist-get 'text data) (alist-get 'metadata data)))
+            ("session.instructions.updated"
+             (when-let* ((text (alist-get 'text data)))
+               (opencode-open-block 'tool)
+               (opencode-notice-block
+                (format "Instructions updated: %s"
+                        (mapconcat (lambda (entry) (symbol-name (car entry)))
+                                   (alist-get 'delta data) ", "))
+                text id)))
+            ("session.skill.activated"
              (opencode-open-block 'tool)
-             (opencode-notice-block
-              (format "Instructions updated: %s"
-                      (mapconcat (lambda (entry) (symbol-name (car entry)))
-                                 (alist-get 'delta data) ", "))
-              text id)))
-          ("session.skill.activated"
-           (opencode-open-block 'tool)
-           (opencode-notice-block (format "Skill %s activated" (alist-get 'name data))
-                                  (alist-get 'text data) id)))))))
+             (opencode-notice-block (format "Skill %s activated" (alist-get 'name data))
+                                    (alist-get 'text data) id)))))
+      (when appended
+        (opencode--note-message id)))))
 
 (defun opencode--event-shell (event)
   "Handle `session.shell.started' and `session.shell.ended' EVENT."
@@ -1474,38 +1925,62 @@ delivered: that is where the transcript places them."
            (id (alist-get 'id shell)))
       (pcase (alist-get 'type event)
         ("session.shell.started"
-         (opencode-before-prompt
-           (opencode-open-block 'tool)
-           (opencode-tool-start id "shell" `((command . ,(alist-get 'command shell))) "running")))
+         (let ((message (opencode--event-message-id event)))
+           (unless (opencode--message-known-p message)
+             (opencode-before-prompt
+               (opencode-open-block 'tool)
+               (opencode-tool-start id "shell" `((command . ,(alist-get 'command shell))) "running")))
+           (when message
+             (unless (assoc id opencode--open-shells)
+               (push (cons id message) opencode--open-shells))
+             (opencode--note-message message t))))
         ("session.shell.ended"
          (opencode-tool-update id :status "completed"
-                               :output (opencode--shell-output (alist-get 'output data))))))))
+                               :output (opencode--shell-output (alist-get 'output data)))
+         (when-let* ((message (cdr (assoc id opencode--open-shells))))
+           (setq opencode--open-shells (assoc-delete-all id opencode--open-shells))
+           (opencode--finish-message message)))))))
 
 (defun opencode--event-compaction (event)
-  "Handle the `session.compaction.*' EVENT."
+  "Handle the `session.compaction.*' EVENT.
+Withheld while no compaction is open here, its end is the one of a
+compaction the transcript fetched meanwhile shows finished already."
   (opencode--on-session-event event
-    (let ((key (concat (alist-get 'sessionID data) "/compaction")))
-      (pcase (alist-get 'type event)
+    (let ((key (concat (alist-get 'sessionID data) "/compaction"))
+          (type (alist-get 'type event)))
+      (pcase type
         ("session.compaction.started"
-         (when (opencode-block key) (remhash key opencode--blocks))
-         (opencode-before-prompt
-           (opencode-open-block 'tool)
-           (opencode-notice-block "Compacting…" "" key)))
+         (let ((message (or (alist-get 'inputID data) (opencode--event-message-id event))))
+           (unless (opencode--message-known-p message)
+             (when (opencode-block key) (remhash key opencode--blocks))
+             (opencode-before-prompt
+               (opencode-open-block 'tool)
+               (opencode-notice-block "Compacting…" "" key)))
+           (when message
+             (setq opencode--open-compaction message)
+             (opencode--note-message message t))))
         ("session.compaction.delta"
          (when-let* ((overlay (opencode-block key)))
            (opencode-block-update overlay :text (concat (plist-get (opencode-block-data overlay) :text)
                                                         (alist-get 'text data)))))
-        ("session.compaction.ended"
+        ((guard (and opencode--releasing (null opencode--open-compaction))))
+        (_
          (when-let* ((overlay (opencode-block key)))
-           (opencode-replace-summary
-            overlay (opencode-fontify-as (propertize "Conversation compacted" 'font-lock-face 'opencode-notice)
-                                         'verbatim))
-           (opencode-block-update overlay :text (alist-get 'text data)))
-         (opencode--note-compaction (alist-get 'context data))
-         (run-hook-with-args 'opencode-compaction-ended-functions data))
-        ("session.compaction.failed"
-         (when-let* ((overlay (opencode-block key)))
-           (opencode-block-update overlay :error (alist-get 'error data))))))))
+           (if (equal type "session.compaction.ended")
+               (progn
+                 (opencode-replace-summary
+                  overlay (opencode-fontify-as (propertize "Conversation compacted" 'font-lock-face 'opencode-notice)
+                                               'verbatim))
+                 (opencode-block-update overlay :text (alist-get 'text data)))
+             (opencode-block-update overlay :error (alist-get 'error data)))
+           ;; Finished: later deltas are no longer its.
+           (remhash key opencode--blocks))
+         (when (equal type "session.compaction.ended")
+           (opencode--note-compaction (alist-get 'context data))
+           (run-hook-with-args 'opencode-compaction-ended-functions data))
+         (when opencode--open-compaction
+           (opencode--finish-message (prog1 opencode--open-compaction
+                                       (setq opencode--open-compaction nil)))))))))
 
 (defun opencode--event-session (event)
   "Handle session lifecycle EVENT: renames, selections, reverts, deletion."
@@ -1519,42 +1994,53 @@ delivered: that is where the transcript places them."
          (opencode-output-notice "This session was deleted" 'error)
          (remhash id opencode-session-buffers)
          (run-hook-with-args 'opencode-session-buffer-functions id)))
+      ("session.renamed"
+       (opencode-with-session-buffer id
+         (setf (alist-get 'title opencode-session-info) (alist-get 'title data))
+         (rename-buffer (opencode-session-buffer-name opencode-session-info) t)
+         (force-mode-line-update)))
       (type
        (opencode-with-session-buffer id
-         (pcase type
-           ("session.renamed"
-            (setf (alist-get 'title opencode-session-info) (alist-get 'title data))
-            (rename-buffer (opencode-session-buffer-name opencode-session-info) t))
-           ("session.agent.selected"
-            (setq opencode-session-agent (alist-get 'agent data))
-            (when opencode-show-switch-notices
-              (opencode-output-notice (format "Switched to the %s agent" (alist-get 'agent data)))))
-           ("session.model.selected"
-            (setq opencode-session-model (alist-get 'model data))
-            (when opencode-show-switch-notices
-              (opencode-output-notice (format "Switched to %s" (opencode-model-label (alist-get 'model data))))))
-           ("session.usage.updated"
-            (setf (alist-get 'cost opencode-session-info) (alist-get 'cost data)
-                  (alist-get 'tokens opencode-session-info) (alist-get 'tokens data)))
-           ("session.retry.scheduled"
-            (setq opencode-session-retry data)
-            (opencode-notify-retry data))
-           ("session.revert.staged"
-            (setq opencode-session-revert (alist-get 'revert data))
-            (opencode-output-notice
-             (format "A revert is staged: the next prompt drops everything after it, %s cancels it"
-                     (opencode-command-keys 'opencode-revert-clear))))
-           ("session.revert.cleared"
-            (setq opencode-session-revert nil)
-            (opencode-output-notice "The staged revert was cancelled"))
-           ("session.revert.committed"
-            (setq opencode-session-revert nil)
-            (opencode-session-reload))
-           ("session.moved"
-            (cl-incf opencode--location-generation)
-            (opencode--adopt-location data)
-            (opencode-output-notice (format "Moved to %s" default-directory))))
-         (force-mode-line-update))))))
+         (opencode--when-live
+          event
+          (lambda ()
+            (let* ((message (opencode--event-message-id event))
+                   (shown (opencode--message-known-p message)))
+              (pcase type
+                ("session.agent.selected"
+                 (setq opencode-session-agent (alist-get 'agent data))
+                 (when (and opencode-show-switch-notices (not shown))
+                   (opencode-output-notice (format "Switched to the %s agent" (alist-get 'agent data))))
+                 (opencode--note-message message))
+                ("session.model.selected"
+                 (setq opencode-session-model (alist-get 'model data))
+                 (when (and opencode-show-switch-notices (not shown))
+                   (opencode-output-notice (format "Switched to %s" (opencode-model-label (alist-get 'model data)))))
+                 (opencode--note-message message))
+                ("session.usage.updated"
+                 (setf (alist-get 'cost opencode-session-info) (alist-get 'cost data)
+                       (alist-get 'tokens opencode-session-info) (alist-get 'tokens data)))
+                ("session.retry.scheduled"
+                 (setq opencode-session-retry data)
+                 (opencode-notify-retry data))
+                ("session.revert.staged"
+                 (setq opencode-session-revert (alist-get 'revert data))
+                 (opencode-output-notice
+                  (format "A revert is staged: the next prompt drops everything after it, %s cancels it"
+                          (opencode-command-keys 'opencode-revert-clear))))
+                ("session.revert.cleared"
+                 (setq opencode-session-revert nil)
+                 (opencode-output-notice "The staged revert was cancelled"))
+                ("session.revert.committed"
+                 (setq opencode-session-revert nil)
+                 (opencode-session-reload))
+                ("session.moved"
+                 (cl-incf opencode--location-generation)
+                 (opencode--adopt-location data)
+                 (unless shown
+                   (opencode-output-notice (format "Moved to %s" default-directory)))
+                 (opencode--note-message message))))
+            (force-mode-line-update))))))))
 
 (dolist (handler '(("session.step.started" . opencode--event-step-started)
                    ("session.step.ended" . opencode--event-step-ended)
@@ -1600,30 +2086,269 @@ delivered: that is where the transcript places them."
 
 ;;;; Reconnection
 
-(defun opencode--resync-buffer ()
-  "Reconcile this buffer with the server after the stream reopened."
+;; Every open buffer catches up once the stream reopens: it withholds
+;; its events, fetches its session and its newest messages, a page at a
+;; time from the newest, until the one it is in sync with, and writes
+;; those after it again (see `opencode--synced').  A buffer that missed
+;; nothing writes nothing.  One whose message is gone, as after a
+;; revert, renders its transcript whole.  Shown buffers go first, a
+;; few at a time, each written a slice at a time (see
+;; `opencode-replay-slice'), so that no buffer holds Emacs long.
+
+(defcustom opencode-resync-requests 4
+  "Number of session buffers catching up with the service at once, at most.
+After a reconnection, every open session buffer fetches what it missed
+and writes it, the buffers shown in a window first."
+  :type 'natnum
+  :group 'opencode)
+
+(defconst opencode--resync-pages '(5 25 100 200)
+  "Sizes of the pages of newest messages fetched to find where a buffer is in sync.
+Most buffers missed nothing or a turn, which the small first page finds.")
+
+(defvar opencode--resync-epoch 0
+  "Count of the reconnections that had open buffers catch up.
+A catch-up begun before the latest one is abandoned.")
+
+(defvar opencode--resync-queue nil
+  "Session buffers waiting to catch up, in order.")
+
+(defvar opencode--resync-running nil
+  "Session buffers catching up.")
+
+(defvar opencode--resync-active nil
+  "(EPOCH . DATA): the running sessions as asked once for reconnection EPOCH.
+DATA is the `/api/session/active' data, or `:unknown' when that failed.")
+
+(defun opencode--fetch-newer (id anchor callback else)
+  "Call CALLBACK with the messages of session ID after message ANCHOR, oldest first.
+CALLBACK receives `:missing' instead when ANCHOR is nil or the session
+no longer has it.  Pages are fetched from the newest one, growing as
+`opencode--resync-pages' says, until one holds ANCHOR.  When the first
+page lacks it, the service is asked whether it still has it at all,
+rather than paging back through a transcript a revert cut.  ELSE
+receives the `opencode-error' of a failed request."
+  (if (null anchor)
+      (funcall callback :missing)
+    (cl-labels ((page (cursor sizes newer checked)
+                  (opencode-request
+                   'get (format "/api/session/%s/message" id)
+                   ;; A cursor carries the order of the first page.
+                   :query `((limit . ,(car sizes))
+                            ,@(if cursor `((cursor . ,cursor)) '((order . "desc"))))
+                   :else else
+                   :then (lambda (response)
+                           (let* ((data (opencode-request-data response))
+                                  (next (alist-get 'next (alist-get 'cursor response)))
+                                  (tail (seq-take-while
+                                         (lambda (message) (not (equal (alist-get 'id message) anchor)))
+                                         data))
+                                  (newer (nconc newer tail))
+                                  (sizes (or (cdr sizes) sizes)))
+                             (cond
+                              ((< (length tail) (length data)) (funcall callback (nreverse newer)))
+                              ((not (and data next)) (funcall callback :missing))
+                              (checked (page next sizes newer t))
+                              (t (check next sizes newer)))))))
+                (check (cursor sizes newer)
+                  (opencode-request
+                   'get (format "/api/session/%s/message/%s" id anchor)
+                   :then (lambda (_) (page cursor sizes newer t))
+                   :else (lambda (error)
+                           (if (eql (opencode-error-status error) 404)
+                               (funcall callback :missing)
+                             (funcall else error))))))
+      (page nil opencode--resync-pages nil nil))))
+
+(defun opencode--resync-turn (epoch callback)
+  "Call CALLBACK with non-nil when this buffer's session runs a turn.
+The answer asked once for reconnection EPOCH serves, else it is asked
+now.  CALLBACK receives `:unknown' when the request fails."
+  (let ((id opencode-session-id))
+    (cl-flet ((answer (data)
+                (funcall callback (if (eq data :unknown) :unknown (assq (intern id) data)))))
+      (if (eql (car opencode--resync-active) epoch)
+          (answer (cdr opencode--resync-active))
+        (opencode-request 'get "/api/session/active" :directory nil
+                          :then (lambda (response) (answer (opencode-request-data response)))
+                          :else (lambda (_) (answer :unknown)))))))
+
+(defun opencode--cut-to-synced ()
+  "Delete what is written after the point where this buffer is in sync.
+The input stays.  Messages written there are written again from the
+service's, from the state the transcript had at that point."
+  (let ((start (marker-position opencode-synced-end))
+        (process (get-buffer-process (current-buffer)))
+        (response (plist-get opencode--synced :response))
+        (inhibit-read-only t))
+    (cl-incf opencode--render-generation)
+    (opencode-without-undo
+      (opencode-keeping-followers
+        (let ((end (opencode-pmark)))
+          (when (and (markerp opencode--prompt-start) (marker-buffer opencode--prompt-start)
+                     (>= opencode--prompt-start start))
+            (set-marker opencode--prompt-start nil)
+            (setq opencode--prompt-start nil))
+          (dolist (overlay (overlays-in start end))
+            (when (and (>= (overlay-start overlay) start) (<= (overlay-end overlay) end))
+              (delete-overlay overlay)))
+          (delete-region start end)
+          (set-marker (process-mark process) start))))
+    (when (hash-table-p opencode--blocks)
+      (let ((gone nil))
+        (maphash (lambda (key overlay) (unless (overlay-buffer overlay) (push key gone))) opencode--blocks)
+        (dolist (key gone) (remhash key opencode--blocks))))
+    (clrhash opencode--text-blocks)
+    (when (hash-table-p opencode--reasoning-native) (clrhash opencode--reasoning-native))
+    (when (hash-table-p opencode--awaited-parts) (clrhash opencode--awaited-parts))
+    (opencode--sent-inputs-erased start)
+    (when (markerp opencode--table-scan-marker)
+      (set-marker opencode--table-scan-marker nil)
+      (setq opencode--table-scan-marker nil))
+    (dolist (id opencode--open-messages)
+      (remhash id opencode--messages))
+    (when (markerp opencode-last-response-start)
+      (set-marker opencode-last-response-start nil))
+    (setq opencode--open-messages nil
+          opencode--open-shells nil
+          opencode--open-compaction nil
+          opencode--current-assistant nil
+          opencode--newest-message (plist-get opencode--synced :id)
+          opencode--last-block-kind (plist-get opencode--synced :kind)
+          opencode--turn-errors (copy-sequence (plist-get opencode--synced :errors))
+          opencode-last-response-start (and (markerp response) (marker-buffer response)
+                                            (copy-marker response)))))
+
+(defun opencode--resync-buffer (&optional then)
+  "Catch this buffer up with the service after the stream reopened, then call THEN.
+Its events are withheld meanwhile.  Its session info is adopted, and
+the messages after the one it is in sync with are written again from
+there; when that one is gone, the whole transcript is.  A catch-up
+begun before another reconnection gives up, without calling THEN."
   (let ((buffer (current-buffer))
-        (known (alist-get 'updated (alist-get 'time opencode-session-info)))
+        (id opencode-session-id)
+        (epoch opencode--resync-epoch)
         (location-generation opencode--location-generation)
-        (was-busy (eq opencode-session-status 'busy)))
-    (opencode-session-fetch
-     opencode-session-id
-     (lambda (info)
-       (when (buffer-live-p buffer)
-         (with-current-buffer buffer
-           (let ((changed (not (equal known (alist-get 'updated (alist-get 'time info))))))
+        (anchor (plist-get opencode--synced :id)))
+    (opencode--hold)
+    (cl-labels ((current-p ()
+                  (and (buffer-live-p buffer) (= epoch opencode--resync-epoch)))
+                (finish ()
+                  (when then (funcall then)))
+                (settle (active rendered)
+                  (opencode--show-status
+                   (opencode--status-after-fetch
+                    (if (eq active :unknown) (eq opencode-session-status 'busy) active)))
+                  (if rendered
+                      (run-hooks 'opencode-session-replayed-hook)
+                    (run-hook-with-args 'opencode-session-resync-functions opencode-session-info))
+                  (opencode--release)
+                  (finish))
+                (fail (error)
+                  (when (current-p)
+                    (with-current-buffer buffer
+                      (opencode--release)
+                      ;; The next reconnection tries again.
+                      (let ((inhibit-message t))
+                        (message "OpenCode: %s could not catch up: %s"
+                                 (buffer-name) (opencode-error-describe error))))
+                    (finish)))
+                (catch-up (newer active)
+                  (if (and (null newer) (null opencode--open-messages))
+                      (settle active nil)
+                    (opencode--cut-to-synced)
+                    (opencode-replay-messages newer (lambda () (settle active t))))))
+      (opencode-session-fetch
+       id
+       (lambda (info)
+         (when (current-p)
+           (with-current-buffer buffer
              (opencode--adopt-info info location-generation)
-             (if (or changed was-busy)
-                 (opencode-session-reload)
-               (run-hook-with-args 'opencode-session-resync-functions opencode-session-info)))))))))
+             (opencode--fetch-newer
+              id anchor
+              (lambda (newer)
+                (when (current-p)
+                  (with-current-buffer buffer
+                    (if (eq newer :missing)
+                        (opencode--render-again #'finish)
+                      (opencode--resync-turn
+                       epoch (lambda (active)
+                               (when (current-p)
+                                 (with-current-buffer buffer
+                                   (catch-up newer active)))))))))
+              #'fail))))
+       nil #'fail))))
+
+(defun opencode--resync-pump ()
+  "Start the queued catch-ups while fewer than `opencode-resync-requests' run."
+  (while (and opencode--resync-queue
+              (< (length opencode--resync-running) (max 1 opencode-resync-requests)))
+    (let ((buffer (pop opencode--resync-queue))
+          (epoch opencode--resync-epoch))
+      (when (buffer-live-p buffer)
+        (push buffer opencode--resync-running)
+        (with-current-buffer buffer
+          (opencode--resync-buffer
+           (lambda ()
+             (when (= epoch opencode--resync-epoch)
+               (setq opencode--resync-running (delq buffer opencode--resync-running))
+               (opencode--resync-pump)))))))))
+
+(defun opencode--resync-enqueue (buffer)
+  "Have session BUFFER catch up, after those queued."
+  (with-current-buffer buffer
+    (opencode--hold))
+  (unless (or (memq buffer opencode--resync-queue) (memq buffer opencode--resync-running))
+    (setq opencode--resync-queue (append opencode--resync-queue (list buffer))))
+  (opencode--resync-pump))
+
+(defun opencode--resync-forget (buffer)
+  "Forget killed BUFFER's catch-up, letting a queued one start."
+  (setq opencode--resync-queue (delq buffer opencode--resync-queue))
+  (when (memq buffer opencode--resync-running)
+    (setq opencode--resync-running (delq buffer opencode--resync-running))
+    (opencode--resync-pump)))
 
 (defun opencode--resync-all ()
-  "Reconcile every open session buffer with the reconnected server."
-  (maphash (lambda (_id buffer)
-             (when (buffer-live-p buffer)
-               (with-current-buffer buffer
-                 (opencode--resync-buffer))))
-           opencode-session-buffers))
+  "Have every open session buffer catch up with the reconnected service.
+Catch-ups of an earlier reconnection are abandoned and begun again.
+Buffers shown in a window go first; a buffer loading its transcript
+catches up once it is loaded, as it may have been fetched before."
+  (cl-incf opencode--resync-epoch)
+  ;; A catch-up loading a whole transcript finishes loading, then
+  ;; catches up again; any other stops writing.
+  (dolist (buffer opencode--resync-running)
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (unless opencode--loading
+          (cl-incf opencode--render-generation)))))
+  (setq opencode--resync-running nil
+        opencode--resync-queue nil
+        opencode--resync-active nil)
+  (let ((epoch opencode--resync-epoch)
+        (shown nil)
+        (hidden nil))
+    (maphash (lambda (_id buffer)
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (opencode--hold)
+                   (cond (opencode--loading (setq opencode--resync-wanted t))
+                         ((get-buffer-window buffer t) (push buffer shown))
+                         (t (push buffer hidden))))))
+             opencode-session-buffers)
+    (setq opencode--resync-queue (nconc (nreverse shown) (nreverse hidden)))
+    (when opencode--resync-queue
+      ;; Asked once for every buffer; the withheld events correct it.
+      (opencode-request
+       'get "/api/session/active" :directory nil :buffer nil
+       :then (lambda (response)
+               (when (= epoch opencode--resync-epoch)
+                 (setq opencode--resync-active (cons epoch (opencode-request-data response)))
+                 (opencode--resync-pump)))
+       :else (lambda (_)
+               (when (= epoch opencode--resync-epoch)
+                 (setq opencode--resync-active (cons epoch :unknown))
+                 (opencode--resync-pump)))))))
 
 (defvar opencode--stream-seen nil
   "Non-nil once a stream opened in this Emacs; later openings resynchronize.")
@@ -1718,23 +2443,32 @@ Return nil when no input of this buffer waits for ID."
       (seq-some (lambda (overlay) (and (opencode-block-data overlay) (opencode--block-message overlay)))
                 (overlays-in start end))))
 
-(defun opencode--sent-inputs-erased ()
-  "Note that the transcript was erased with the inputs waiting for their ID.
-A prompt stays known, marked lost, so it is rendered once delivered;
-a command's prompt is rendered anyway.  Rendered again, the transcript
-is in the conversation's order, so delivery points are forgotten."
-  (when (hash-table-p opencode--delivery-points)
-    (maphash (lambda (_id point) (set-marker (car point) nil)) opencode--delivery-points)
-    (clrhash opencode--delivery-points))
-  (let ((commands nil))
-    (maphash (lambda (key entry)
-               (if (plist-get entry :command)
-                   (push key commands)
-                 (dolist (marker (list (plist-get entry :start) (plist-get entry :end)))
-                   (when (markerp marker) (set-marker marker nil)))
-                 (puthash key (list :lost t) (opencode--sent-input-table))))
-             (opencode--sent-input-table))
-    (mapc #'opencode--release-sent-input commands)))
+(defun opencode--sent-inputs-erased (&optional from)
+  "Note that the transcript was erased from FROM with inputs waiting for their ID.
+FROM nil means the whole transcript.  A prompt stays known, marked
+lost, so it is rendered once delivered; a command's prompt is rendered
+anyway.  Rendered again, the transcript is in the conversation's order,
+so delivery points there are forgotten."
+  (cl-flet ((erased-p (marker)
+              (and (markerp marker) (or (null from) (>= marker from)))))
+    (when (hash-table-p opencode--delivery-points)
+      (let ((gone nil))
+        (maphash (lambda (id point)
+                   (when (erased-p (car point))
+                     (set-marker (car point) nil)
+                     (push id gone)))
+                 opencode--delivery-points)
+        (dolist (id gone) (remhash id opencode--delivery-points))))
+    (let ((commands nil))
+      (maphash (lambda (key entry)
+                 (when (erased-p (plist-get entry :start))
+                   (if (plist-get entry :command)
+                       (push key commands)
+                     (dolist (marker (list (plist-get entry :start) (plist-get entry :end)))
+                       (when (markerp marker) (set-marker marker nil)))
+                     (puthash key (list :lost t) (opencode--sent-input-table)))))
+               (opencode--sent-input-table))
+      (mapc #'opencode--release-sent-input commands))))
 
 ;;;; Sending
 
