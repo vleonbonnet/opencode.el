@@ -20,59 +20,6 @@
 
 (require 'opencode-test-helpers)
 
-(defvar opencode-test-transcript nil
-  "Messages the transcript route serves, oldest first.")
-
-(defun opencode-test-transcript-routes ()
-  "Return the default routes, serving `opencode-test-transcript' as every transcript.
-A message of it is found by its ID, as the service finds one; any other
-is not."
-  (append
-   (list (list 'get "\\`/api/session/ses_[A-Za-z0-9]+/message\\'"
-               (lambda (request) (opencode-test-message-page opencode-test-transcript request)))
-         (list 'get "\\`/api/session/ses_[A-Za-z0-9]+/message/\\(msg_[A-Za-z0-9_]+\\)\\'"
-               (lambda (request)
-                 (if-let* ((message (seq-find (lambda (message)
-                                                (equal (alist-get 'id message) (plist-get request :match)))
-                                              opencode-test-transcript)))
-                     `((data . ,message))
-                   `(:error 404 ,(format "Message not found: %s" (plist-get request :match))
-                            "MessageNotFoundError")))))
-   (opencode-test-default-routes)))
-
-(defmacro opencode-test-with-transcript (messages &rest body)
-  "Run BODY with the transcript route serving MESSAGES, after a first stream."
-  (declare (indent 1) (debug t))
-  `(opencode-test-with-server
-     (let ((opencode-test-transcript ,messages)
-           (opencode-test-routes (opencode-test-transcript-routes))
-           (opencode--stream-seen t))
-       ,@body)))
-
-(defun opencode-test-reconnect ()
-  "Dispatch `server.connected', as a reopened stream does."
-  (opencode-test-dispatch '(((type . "server.connected") (data)))))
-
-(defun opencode-test-session ()
-  "Return the ID of the session these tests open: the text scenario's."
-  (opencode-test-scenario "text"))
-
-(defun opencode-test-prompt (id text)
-  "Return user message ID with TEXT."
-  `((id . ,id) (type . "user") (text . ,text) (time (created . 1))))
-
-(defun opencode-test-step (id &rest content)
-  "Return the finished assistant message ID with CONTENT."
-  `((id . ,id) (type . "assistant") (time (created . 1) (completed . 2)) (content . ,content)))
-
-(defun opencode-test-running-step (id &rest content)
-  "Return the assistant message ID with CONTENT, its step still running."
-  `((id . ,id) (type . "assistant") (time (created . 1)) (content . ,content)))
-
-(defun opencode-test-idle (id)
-  "Return the end of a turn that succeeded, message ID."
-  `((id . ,id) (type . "idle") (outcome . "succeeded") (time (created . 3))))
-
 (defun opencode-test-tool-part (id status &optional output)
   "Return the content of shell call ID in STATUS, with OUTPUT."
   `((type . "tool") (id . ,id) (name . "shell")

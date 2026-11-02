@@ -11,7 +11,7 @@
 | =opencode-http.el=        | =opencode-request=: authentication, location header, JSON, retries, error reporting                                                                       |
 | =opencode-events.el=      | The one SSE stream: frame scanning, queued dispatch, heartbeat watchdog, reconnection                                                                     |
 | =opencode-state.el=       | Session registry: every session's live state and status, bootstrap, the server-side read marker, context sizes, prompt-cache expiries                     |
-| =opencode-render.el=      | Output and prompt management, fontification that survives Markdown, tables, prompt-only undo                                                              |
+| =opencode-render.el=      | Output and prompt management, fontification that survives Markdown, the transcript's parsers, tables, prompt-only undo                                    |
 | =opencode-links.el=       | File, Org and Markdown links in the transcript                                                                                                            |
 | =opencode-blocks.el=      | Collapsible reasoning, tool and notice blocks, their summaries, fitting to the window                                                                     |
 | =opencode-session.el=     | Session buffers: opening, replay, catching up after a reconnection, live events, sending, attachments, agent and model, navigation; actions by session ID |
@@ -200,6 +200,30 @@ Batch Emacs has windows but never redisplays them, so the tests check window poi
 Markdown is fontified by =markdown-ts-mode= as text streams in. Regions that must keep their own faces (verbatim output, tool summaries, buttons) are marked with properties the Markdown fontifier skips, and buttons are made after fontification from registered buttonizers. Font-lock also owns =display=, removing it at every fontification, so a renderer laying text out with it, as a table renderer pads a cell holding an emoji wider than two columns with a space a few pixels wide, records it with =opencode-keep-display= and every fontification puts it back. Half-typed Markdown never turns the transcript red: the parser's error feature is off.
 
 Links are buttons made from output, never by font-lock, so that they are only ever in the transcript: =RET= on one follows it, while =RET= in the input sends it. markdown-ts also links URLs written out, at redisplay, in the input too, and opens them as mail; session buffers drop that, and the buttons it makes of the Markdown links typed in the input. A URL written out has no closing delimiter, so it becomes a button once a character that cannot continue it follows, or once the block writing it ends: a streamed URL is never a button of half its length. A link of another kind holding it, such as an Org link whose description arrives later, takes its place. URLs are links in code spans and blocks too, the link face added over the code's; in summaries they are not, as a summary is cut to fit and its keys toggle its block. Verbatim text loses the buttons Markdown makes in it at every fontification, so a durable button keeps its category, which gives it its keys, with its other properties, and the link face is a kind added to =verbatim= rather than one replacing it.
+
+* Parsers that go with their text
+
+markdown-ts parses each inline region, a paragraph, a list item or a heading's text, with a tree-sitter parser of its own: treesit.el keeps it in an overlay over the region (=treesit-parser=, =treesit-parser-local-p=), finds it again there when fontification updates the region's ranges, and deletes it only when such an update finds the overlay stale. Every change of the buffer's text edits every parser the buffer holds, and redisplay updates the ranges of every changed region, so a parser costs as long as it lives. Session buffers deleted the overlays holding parsers without deleting the parsers: reloading erased the buffer with =remove-overlays=, catching up deleted the overlays of the running step it wrote again, and lifting the prompt split, with =remove-overlays=, the overlay of an answer that had grown over the prompt and the input typed after it, leaving two overlays holding one parser, which two regions then shared. Each lost parser lived as long as the buffer, and its region was given another at its next fontification. A user's session buffer held 3221 parsers, 2793 of them without an overlay, and more every few minutes; creating parsers took 5.5% of the main thread, and querying their ranges allocated 53 MB in 250 s.
+
+So the parsers go with their text. =opencode-delete-overlays=, which reloading, catching up and lifting the prompt use instead, deletes only the overlays lying within its region, never splitting one, and the parsers they hold. Text deleted any other way, a block collapsed or rewritten, a summary replaced, a table aligned, a fallback line or the input deleted, has its parsers deleted by change hooks: the parsers whose overlays lie within the text a change replaces are noted before it and deleted after it, when it changed the text rather than only its properties, which leave =buffer-chars-modified-tick= alone. A buffer that turns its change hooks off, as deleting an attachment's label does, calls =opencode-delete-parsers= itself. Killing a buffer frees its parsers with it.
+
+Buffers set up by earlier versions keep their orphans until pruned: a parser no overlay holds, or only an empty one, is deleted, and so is an overlay holding a parser deleted already or one another overlay holds too. Each deletion walks the buffer's whole parser list, so a buffer prunes them by itself a slice of 30 ms at a time, from timers: the first time this version fontifies it, and whenever it reloads or catches up. =opencode-session-prune-parsers= prunes at once.
+
+Measured in batch with byte-compiled code, on a buffer of 500 turns of six parts, 3000 inline regions all fontified, reloaded three times; each edit types a character in the input, reparses as redisplay does, and fontifies the last 3000 characters:
+
+| Parsers after                       | Before | Fixed |
+|-------------------------------------+--------+-------|
+| Opening                             |   3002 |  3002 |
+| One reload                          |   6003 |  3002 |
+| Three reloads                       |  12005 |  3002 |
+
+| Per edit, after three reloads | Before   | Fixed    |
+|-------------------------------+----------+----------|
+| Inserting                     | 5.6 ms   | 0.085 ms |
+| And reparsing                 | 12.9 ms  | 7.2 ms   |
+| And fontifying                | 24.5 ms  | 12.3 ms  |
+
+Updated in place, the buffer reloaded three times by the earlier version, holding 9000 orphans, pruned them in 16 slices of about 30 ms, the first of which collected garbage, over 1.1 s, and its edits then cost what a fresh buffer's do; deleting them at once had held Emacs for 0.49 s. A buffer like the user's, 2520 orphans of 2940 parsers, prunes in 23 ms.
 
 * Requests that wait
 

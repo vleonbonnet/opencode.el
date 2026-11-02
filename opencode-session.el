@@ -1213,8 +1213,10 @@ The session's events are withheld meanwhile, then applied."
   (cl-incf opencode--render-generation)
   (let ((inhibit-read-only t)
         (buffer-undo-list t))
-    (remove-overlays)
+    (opencode-delete-overlays (point-min) (point-max))
     (erase-buffer))
+  ;; Parsers an earlier version of this package left behind.
+  (opencode-prune-parsers-later)
   ;; The prompt's records point into the text erased.
   (when (listp buffer-undo-list)
     (setq buffer-undo-list nil))
@@ -1260,6 +1262,26 @@ transcript or in the input stay there, others at their line, as
        (opencode-with-session-buffer (alist-get 'id info)
          (opencode--adopt-info info location-generation)
          (opencode--render-again))))))
+
+(defun opencode-session-prune-parsers (&optional all)
+  "Delete the tree-sitter parsers of this session buffer that parse no text.
+With ALL, interactively a prefix argument, or outside a session buffer,
+prune every session buffer.  Return how many parsers were deleted.
+Earlier versions of this package left such parsers behind, which every
+change of the buffer kept editing; a session buffer prunes them by
+itself when first fontified, and again whenever it catches up or
+reloads."
+  (interactive "P")
+  (let ((count 0))
+    (dolist (buffer (if (and opencode-session-id (not all))
+                        (list (current-buffer))
+                      (hash-table-values opencode-session-buffers)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (cl-incf count (opencode-prune-parsers)))))
+    (when (called-interactively-p 'interactive)
+      (message "OpenCode: deleted %d parser%s" count (if (= count 1) "" "s")))
+    count))
 
 (defun opencode--render-user-prompt (text &optional message-id note)
   "Render a user prompt with TEXT for MESSAGE-ID, followed by NOTE when given.
@@ -2189,11 +2211,11 @@ service's, from the state the transcript had at that point."
                      (>= opencode--prompt-start start))
             (set-marker opencode--prompt-start nil)
             (setq opencode--prompt-start nil))
-          (dolist (overlay (overlays-in start end))
-            (when (and (>= (overlay-start overlay) start) (<= (overlay-end overlay) end))
-              (delete-overlay overlay)))
+          (opencode-delete-overlays start end)
           (delete-region start end)
           (set-marker (process-mark process) start))))
+    ;; Orphans left by earlier versions of this package go too.
+    (opencode-prune-parsers-later)
     (when (hash-table-p opencode--blocks)
       (let ((gone nil))
         (maphash (lambda (key overlay) (unless (overlay-buffer overlay) (push key gone))) opencode--blocks)
@@ -2715,6 +2737,8 @@ which like other messages between prompts never start a cut."
           (end (overlay-end overlay)))
       (setq opencode--attachments (delq attachment opencode--attachments))
       (delete-overlay overlay)
+      ;; The change hooks that would delete them are off.
+      (opencode-delete-parsers start end)
       (let ((inhibit-modification-hooks t))
         (delete-region start end)))))
 

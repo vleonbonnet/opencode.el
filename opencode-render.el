@@ -397,7 +397,7 @@ Output written while a session is idle belongs before its prompt."
   (when (opencode-prompt-shown-p)
     (let ((start (marker-position opencode--prompt-start))
           (inhibit-read-only t))
-      (remove-overlays start (opencode-pmark))
+      (opencode-delete-overlays start (opencode-pmark))
       (delete-region start (opencode-pmark))
       (set-marker (process-mark (get-buffer-process (current-buffer))) start)
       (set-marker opencode--prompt-start nil)
@@ -608,6 +608,134 @@ becomes a button."
                             (line-beginning-position)))
                         pmark t)))
 
+;;;; Tree-sitter parsers
+
+;; markdown-ts parses each inline region, a paragraph or a list item,
+;; with a parser of its own, which treesit.el keeps in an overlay over
+;; the region.  Every change of the buffer edits every parser it holds,
+;; and treesit.el deletes one only when updating the ranges of its
+;; region finds its overlay stale: a parser whose overlay was deleted,
+;; or whose text was deleted where no update looks, lived as long as
+;; the buffer, and its region got another one.  So text and overlays of
+;; the transcript go with the parsers they hold.
+
+(defvar-local opencode--parsers-checked nil
+  "Non-nil once this buffer's changes are watched and its orphan parsers pruned.")
+
+(defvar-local opencode--doomed-parsers nil
+  "Parser overlays within the text the change in progress replaces, or nil.
+A cons of `buffer-chars-modified-tick' before the change and the overlays.")
+
+(defun opencode--parser-overlays (start end)
+  "Return the overlays of tree-sitter parsers lying within START..END."
+  (seq-filter (lambda (overlay)
+                (and (overlay-get overlay 'treesit-parser)
+                     (<= start (overlay-start overlay))
+                     (<= (overlay-end overlay) end)))
+              (overlays-in start end)))
+
+(defun opencode--delete-parser-overlay (overlay)
+  "Delete OVERLAY with the local tree-sitter parser it holds.
+The other parsers' overlays only mark their ranges."
+  (when (overlay-get overlay 'treesit-parser-local-p)
+    ;; Split by `remove-overlays', two overlays may hold one parser.
+    (ignore-error treesit-parser-deleted
+      (treesit-parser-delete (overlay-get overlay 'treesit-parser))))
+  (delete-overlay overlay))
+
+(defun opencode-delete-parsers (start end)
+  "Delete the tree-sitter parsers of the text from START to END.
+Those are the local parsers whose overlays lie within that text, which
+are deleted too.  Call it before deleting the text, or any overlay."
+  (mapc #'opencode--delete-parser-overlay (opencode--parser-overlays start end)))
+
+(defun opencode-delete-overlays (start end)
+  "Delete the overlays lying within START..END, with the parsers they hold.
+Unlike `remove-overlays', leave those reaching outside alone: splitting
+the overlay of a parser makes two overlays hold it."
+  (opencode-delete-parsers start end)
+  (dolist (overlay (overlays-in start end))
+    (when (and (<= start (overlay-start overlay)) (<= (overlay-end overlay) end))
+      (delete-overlay overlay))))
+
+(defvar opencode--prune-slice 0.03
+  "Seconds orphan parsers are deleted at a time when a buffer prunes them by itself.
+Each deletion walks the buffer's whole parser list: deleting 9000
+orphans of 12000 parsers at once held Emacs for half a second.")
+
+(defun opencode--orphan-parsers ()
+  "Return the local parsers of this buffer that parse no text.
+Those are parsers whose overlay is gone or empty, as earlier versions of
+this package left them.  Overlays holding a parser deleted already, or
+one another overlay holds too, are deleted on the way."
+  (let ((live (make-hash-table :test #'eq))
+        (held (make-hash-table :test #'eq)))
+    (dolist (parser (treesit-parser-list nil nil t))
+      (puthash parser t live))
+    (dolist (overlay (overlays-in (point-min) (point-max)))
+      (when-let* ((parser (overlay-get overlay 'treesit-parser))
+                  ((overlay-get overlay 'treesit-parser-local-p)))
+        (if (and (gethash parser live)
+                 (not (gethash parser held))
+                 (< (overlay-start overlay) (overlay-end overlay)))
+            (puthash parser t held)
+          (delete-overlay overlay))))
+    (seq-remove (lambda (parser) (gethash parser held))
+                (treesit-parser-list nil nil 'embedded))))
+
+(defun opencode-prune-parsers ()
+  "Delete the local parsers of this buffer that parse no text; return how many.
+See `opencode--orphan-parsers' for which those are."
+  (let ((orphans (opencode--orphan-parsers)))
+    (mapc #'treesit-parser-delete orphans)
+    (length orphans)))
+
+(defun opencode--prune-parsers-slice (buffer)
+  "Delete BUFFER's orphan parsers for `opencode--prune-slice' seconds.
+The rest are deleted from a timer, a slice at a time."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let ((orphans (opencode--orphan-parsers))
+            (deadline (+ (float-time) opencode--prune-slice)))
+        (while (progn (when orphans (treesit-parser-delete (pop orphans)))
+                      (and orphans (< (float-time) deadline))))
+        (when orphans
+          (run-at-time 0 nil #'opencode--prune-parsers-slice buffer))))))
+
+(defun opencode-prune-parsers-later ()
+  "Delete this buffer's orphan parsers from a timer, a slice at a time, if any.
+Fontification and catching up call it, which must not hold Emacs for
+as long as thousands of deletions take."
+  (when (opencode--orphan-parsers)
+    (run-at-time 0 nil #'opencode--prune-parsers-slice (current-buffer))))
+
+(defun opencode--parsers-before-change (beg end)
+  "Note the parser overlays within BEG..END, which the coming change may delete."
+  (setq opencode--doomed-parsers
+        (and (< beg end)
+             (when-let* ((overlays (opencode--parser-overlays beg end)))
+               (cons (buffer-chars-modified-tick) overlays)))))
+
+(defun opencode--parsers-after-change (&rest _)
+  "Delete the parsers noted before a change of text, whose text is gone."
+  (when-let* ((doomed opencode--doomed-parsers))
+    (setq opencode--doomed-parsers nil)
+    ;; A change of text properties leaves the tick alone.
+    (unless (= (car doomed) (buffer-chars-modified-tick))
+      (mapc #'opencode--delete-parser-overlay (cdr doomed)))))
+
+(defun opencode--check-parsers ()
+  "Watch this buffer's changes and prune its orphan parsers, the first time.
+A buffer set up by an earlier version of this package, which only
+watches them once it runs this, may hold thousands."
+  (unless opencode--parsers-checked
+    (setq opencode--parsers-checked t)
+    (add-hook 'before-change-functions #'opencode--parsers-before-change nil t)
+    (add-hook 'after-change-functions #'opencode--parsers-after-change nil t)
+    (when (treesit-parser-list nil nil 'embedded)
+      ;; Not from fontification, which is part of redisplay.
+      (run-at-time 0 nil #'opencode--prune-parsers-slice (current-buffer)))))
+
 ;;;; Fontification
 
 (defun opencode--fontify-code-block (mode beg end)
@@ -669,6 +797,7 @@ instead of sending the input."
 
 (defun opencode-fontify-markdown (start end &optional loudly)
   "Fontify START..END as Markdown, LOUDLY, then reassert session properties."
+  (opencode--check-parsers)
   (let ((collect (symbol-function 'markdown-ts--fontify-non-ts-collect-faces)))
     (cl-letf (((symbol-function 'markdown-ts--fontify-non-ts-collect-faces)
                (lambda (mode beg finish)
@@ -692,6 +821,7 @@ instead of sending the input."
               markdown-ts-enable-code-block-context-mode nil
               markdown-ts-enable-table-mode nil)
   (markdown-ts-mode--initialize)
+  (opencode--check-parsers)
   (setq-local font-lock-defaults
               '(nil nil nil nil
                     (font-lock-fontify-syntactically-function . opencode-fontify-markdown)))
