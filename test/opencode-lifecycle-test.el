@@ -11,9 +11,9 @@
 
 ;; Whatever stops the service, a request starts it again and goes
 ;; through, and the event stream comes back as soon as the service does,
-;; so that replies render; every request's curl buffer is killed once it
-;; is over.  These tests talk to `opencode-test-with-service' through
-;; curl, with the CLI stood for by `opencode-test-with-cli'.
+;; so that replies render; every request's buffer is killed once it is
+;; over.  These tests talk to `opencode-test-with-service' over sockets,
+;; with the CLI stood for by `opencode-test-with-cli'.
 
 ;;; Code:
 
@@ -28,11 +28,6 @@
   (let ((header (cdr (assoc "authorization" (plist-get request :headers)))))
     (cadr (split-string (base64-decode-string (string-remove-prefix "Basic " header)) ":"))))
 
-(defun opencode-test-requests-on (path)
-  "Return the requests the fake service received on PATH, oldest first."
-  (reverse (seq-filter (lambda (request) (equal (car (split-string (plist-get request :path) "?")) path))
-                       (opencode-test-service-requests opencode-test-service))))
-
 (defun opencode-test-count-connections ()
   "Count every `server.connected' event; return a function reading the count."
   (let ((count 0))
@@ -42,15 +37,15 @@
 ;;;; Request buffers
 
 (ert-deftest opencode-test-request-buffers-killed ()
-  "Every request's curl buffer is killed once it is over, and its callbacks run once.
+  "Every request's buffer is killed once it is over, and its callbacks run once.
 That holds for answers, errors, unreadable answers, refused
-connections, timeouts and curl processes killed by a signal, which
-`plz' alone ignores on macOS, where it calls neither callback."
+connections, timeouts and connections deleted from outside; only the
+few connections kept for later requests keep theirs."
   (opencode-test-with-service
     (setf (opencode-test-service-routes opencode-test-service)
           (list (opencode-test-agent-route)
-                (cons "/api/garbled" (lambda (_) '(200 . "{not json")))
-                (cons "/api/slow" (lambda (_) '(hang)))))
+                (cons "/api/model" (lambda (_) '(200 . "{not json")))
+                (cons "/api/session/active" (lambda (_) '(hang)))))
     (let ((before (length (opencode-test-request-buffers)))
           (outcomes nil))
       (cl-flet ((send (path &rest arguments)
@@ -61,28 +56,27 @@ connections, timeouts and curl processes killed by a signal, which
                 (outcome (path) (seq-filter (lambda (entry) (equal (car entry) path)) outcomes)))
         (opencode-request-sync 'get "/api/agent" :timeout 10)
         (send "/api/agent")
-        (send "/api/missing")
-        (send "/api/garbled")
-        (send "/api/slow" :timeout 1)
+        (send "/api/session/ses_missing")
+        (send "/api/model")
+        (send "/api/session/active" :timeout 1)
         (opencode-test-wait-for (lambda () (= (length outcomes) 4)) 15)
         (should (equal (outcome "/api/agent") '(("/api/agent" . then))))
-        (should (equal (mapcar #'cadr (outcome "/api/missing")) '(else)))
-        (should (string-match-p "unreadable response" (nth 2 (car (outcome "/api/garbled")))))
-        (should (equal (mapcar #'cadr (outcome "/api/slow")) '(else)))
-        ;; A request whose curl process is killed, as cancelling it would.
-        (send "/api/slow" :timeout 30)
-        (let ((curl (opencode-test-wait-for
-                     (lambda ()
-                       (and (opencode-test-service-held opencode-test-service)
-                            (= (length (opencode-test-service-held opencode-test-service)) 2)
-                            (seq-find (lambda (process)
-                                        (and (process-live-p process)
-                                             (string-prefix-p "plz-request-curl" (process-name process))
-                                             (not (string-match-p "stderr" (process-name process)))))
-                                      (process-list)))))))
-          (delete-process curl))
-        (opencode-test-wait-for (lambda () (= (length (outcome "/api/slow")) 2)))
-        (should (string-match-p "without a response" (nth 2 (car (outcome "/api/slow")))))
+        (should (equal (mapcar #'cadr (outcome "/api/session/ses_missing")) '(else)))
+        (should (string-match-p "unreadable response" (nth 2 (car (outcome "/api/model")))))
+        (should (equal (mapcar #'cadr (outcome "/api/session/active")) '(else)))
+        ;; A request whose connection is deleted from outside.
+        (send "/api/session/active" :timeout 30)
+        (let ((connection (opencode-test-wait-for
+                           (lambda ()
+                             (and (opencode-test-service-held opencode-test-service)
+                                  (= (length (opencode-test-service-held opencode-test-service)) 2)
+                                  (seq-find (lambda (process)
+                                              (and (process-live-p process)
+                                                   (process-get process 'opencode-transport-exchange)))
+                                            (process-list)))))))
+          (delete-process connection))
+        (opencode-test-wait-for (lambda () (= (length (outcome "/api/session/active")) 2)))
+        (should (string-match-p "without an answer" (nth 2 (car (outcome "/api/session/active")))))
         ;; A refused connection is retried once on the registered service.
         (setq opencode-service-connection
               (plist-put (copy-sequence opencode-service-connection) :url "http://127.0.0.1:1"))
@@ -91,10 +85,11 @@ connections, timeouts and curl processes killed by a signal, which
         (should (equal (outcome "/api/agent") '(("/api/agent" . then) ("/api/agent" . then))))
         (accept-process-output nil 0.2)
         (should (= (length outcomes) 6))
-        (opencode-test-wait-for (lambda () (= (length (opencode-test-request-buffers)) before)))))))
+        (opencode-test-wait-for (lambda () (= (length (opencode-test-request-buffers)) before)))
+        (should (<= (opencode-transport-idle-count) opencode-transport-idle-connections))))))
 
 (ert-deftest opencode-test-stream-buffers-killed ()
-  "The event stream's curl buffers are killed however each stream ends."
+  "The event stream's buffers are killed however each stream ends."
   (opencode-test-with-service
     (let ((before (length (opencode-test-request-buffers)))
           (connections (opencode-test-count-connections)))
@@ -109,7 +104,7 @@ connections, timeouts and curl processes killed by a signal, which
             opencode-events--backoff 0.1)
       (opencode-events--watch)
       (opencode-test-wait-for (lambda () (= (funcall connections) 3)))
-      ;; The open stream's, for its output and its errors.
+      ;; The open stream's, for its connection and its frames.
       (opencode-test-wait-for (lambda () (= (length (opencode-test-request-buffers)) (+ 2 before))))
       (opencode-disconnect)
       (opencode-test-wait-for (lambda () (= (length (opencode-test-request-buffers)) before))))))
@@ -117,18 +112,17 @@ connections, timeouts and curl processes killed by a signal, which
 ;;;; Event stream
 
 (ert-deftest opencode-test-stream-killed-reconnects ()
-  "A stream whose curl process dies of a signal reopens.
-`plz' reports no outcome for most signals, so nothing else would."
+  "A stream whose connection is deleted or whose buffer is killed from outside reopens."
   (opencode-test-with-service
     (let ((connections (opencode-test-count-connections)))
       (opencode-events-connect)
       (opencode-test-wait-for (lambda () (= (funcall connections) 1)))
       (setq opencode-events--backoff 0.1)
-      (signal-process opencode-events--process 'SIGTERM)
+      (delete-process (opencode-transport-exchange-connection opencode-events--stream))
       (opencode-test-wait-for (lambda () (= (funcall connections) 2)))
       (setq opencode-events--backoff 0.1)
-      ;; Killing its buffer kills the process too.
-      (kill-buffer (process-buffer opencode-events--process))
+      ;; Killing its buffer deletes the connection too.
+      (kill-buffer (process-buffer (opencode-transport-exchange-connection opencode-events--stream)))
       (opencode-test-wait-for (lambda () (= (funcall connections) 3)))
       (should (opencode-events-connected-p)))))
 
@@ -154,7 +148,7 @@ does, at once."
   (opencode-test-with-service
     (setf (opencode-test-service-routes opencode-test-service) (list (opencode-test-agent-route)))
     (let ((opencode-session-buffers (make-hash-table :test #'equal))
-          (buffer (generate-new-buffer " *opencode-test-session*"))
+          (buffer (opencode-test-session-stand-in "ses_test"))
           (opencode-state--wanted t))
       (unwind-protect
           (progn
@@ -474,7 +468,7 @@ The stream then reopens for the session registry's clients."
 (ert-deftest opencode-test-reply-renders-after-restart ()
   "A prompt typed after a restart reaches the restarted service, and its reply renders.
 The stream had ended before the restart without being reopened, as when
-its curl process died unnoticed."
+its connection died unnoticed."
   (opencode-test-with-lifecycle-session buffer
     (opencode-test-lose-streams)
     (opencode-test-with-cli

@@ -307,14 +307,21 @@ Those that no window shows stay open, hidden."
                (gethash "server.connected" opencode-events--handlers))
          opencode-events--handlers)
 
+(defun bench-stream ()
+  "Return the event stream: an exchange, or the curl process of older sources."
+  (or (bound-and-true-p opencode-events--stream) (bound-and-true-p opencode-events--process)))
+
 (defun bench-busy-reasons ()
   "Return what is busy: requests running, the registry, the list, or buffers catching up."
   (delq nil
         (list (and (seq-some (lambda (process)
                                (and (process-live-p process)
-                                    (eq (process-type process) 'real)
-                                    (not (eq process opencode-events--process))
-                                    (string-prefix-p "plz-request-curl" (process-name process))))
+                                    (if-let* ((exchange (process-get process 'opencode-transport-exchange)))
+                                        (not (eq exchange (bench-stream)))
+                                      ;; Sources from before requests had their own sockets.
+                                      (and (eq (process-type process) 'real)
+                                           (not (eq process (bench-stream)))
+                                           (string-prefix-p "plz-request-curl" (process-name process))))))
                              (process-list))
                    'requests)
               (and (not (opencode-state-ready-p)) 'registry)
@@ -367,7 +374,8 @@ With BENCH_PROFILE, a CPU profile of each measure is written next to the results
 (defun bench-reconnect (then)
   "Drop the stream as a lost connection does, and call THEN once it reopened after its backoff.
 While it is down, agents work: the service adds turns to sessions."
-  (delete-process opencode-events--process)
+  (let ((stream (bench-stream)))
+    (delete-process (if (processp stream) stream (opencode-transport-exchange-connection stream))))
   (opencode-request-sync 'post "/api/bench/activity" :directory nil :timeout 10)
   (setq bench-counts nil
         bench-last-tick nil)

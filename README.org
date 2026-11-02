@@ -8,7 +8,7 @@ This package started as [[https://codeberg.org/sczi/opencode.el][sczi's opencode
 * Requirements
 
 - Emacs 31.1 with the =markdown= and =markdown-inline= tree-sitter grammars (=M-x markdown-ts-mode-install-parsers=, or set =opencode-ensure-grammar-function=).
-- [[https://github.com/alphapapa/plz.el][plz]] and [[https://github.com/magit/transient][transient]], and =curl= on the =PATH=.
+- [[https://github.com/magit/transient][transient]].
 - OpenCode 2. The prompt-cache guard, stale-thinking consent and prompt-cache expiries need routes only [[https://github.com/vleonbonnet/opencode][my fork]] has; with stock OpenCode the guard switches itself off and no expiry is known.
 
 * Installation

@@ -367,7 +367,7 @@ The message of a failure is fetched only while the failure is unseen."
 (ert-deftest opencode-test-state-adopts-earlier-connection ()
   "A registry loaded after the stream connected bootstraps on `opencode-state-ensure'."
   (opencode-test-with-state-server (list :sessions (list (opencode-test-state-info "ses_a")))
-    (let ((opencode-events--process 'test-stream))
+    (let ((opencode-events--stream 'test-stream))
       (opencode-test-state-connect)
       (should (opencode-state-ready-p))
       ;; Forget the connection, as a registry loaded after it never saw it.
@@ -385,7 +385,7 @@ The message of a failure is fetched only while the failure is unseen."
 (ert-deftest opencode-test-state-waits-for-greeting ()
   "An open stream not yet greeted by `server.connected' is not adopted early."
   (opencode-test-with-state-server (list :sessions (list (opencode-test-state-info "ses_a")))
-    (let ((opencode-events--process 'test-stream)
+    (let ((opencode-events--stream 'test-stream)
           (ready nil))
       (opencode-state-ensure (lambda () (setq ready t)))
       (should-not ready)
@@ -401,7 +401,7 @@ The message of a failure is fetched only while the failure is unseen."
     (should-not opencode-test-requests)
     (opencode-test-state-connect)
     (should (eq (opencode-state-status "ses_a") 'idle))
-    (let ((opencode-events--process 'another-stream))
+    (let ((opencode-events--stream 'another-stream))
       (should-not (opencode-state-ready-p))
       (opencode-test-dispatch (list (opencode-test-state-event "session.execution.started" "ses_a" 10))))
     (should (eq (opencode-state-status "ses_a") 'idle))
@@ -1192,7 +1192,7 @@ PROMPT-TOKENS is as for `opencode-test-state-expiry'."
         ;; Nothing live, no timer.
         (should-not opencode-state--cache-timer)
         ;; Events of another stream are left alone.
-        (let ((opencode-events--process 'another-stream))
+        (let ((opencode-events--stream 'another-stream))
           (opencode-test-dispatch (list (opencode-test-state-cache-event
                                          "ses_c" (opencode-test-state-expiry 60 300 10)))))
         (should-not (opencode-state-cache "ses_c"))

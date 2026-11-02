@@ -1,11 +1,11 @@
 # Build and test opencode.el in a separate batch Emacs.
 #
-# DEPS is a directory holding the dependency packages (plz, transient),
+# DEPS is a directory holding the dependency packages (transient and its own),
 # one subdirectory each, such as elpaca's builds directory.
 
 EMACS ?= emacs
 DEPS ?= $(HOME)/.emacs.d/elpaca/builds
-DEP_PATH = $(foreach dep,plz transient cond-let compat llama,-L $(abspath $(DEPS))/$(dep))
+DEP_PATH = $(foreach dep,transient cond-let compat llama,-L $(abspath $(DEPS))/$(dep))
 LOAD_PATH = -L . -L test $(DEP_PATH)
 # A graphical Emacs may start in another directory, such as the Mac
 # port's in the home directory, and prints only to its *Messages*.

@@ -9,7 +9,7 @@
 
 ;;; Commentary:
 
-;; These tests talk HTTP through curl to `opencode-test-with-service',
+;; These tests talk HTTP over sockets to `opencode-test-with-service',
 ;; never to a real OpenCode service.
 
 ;;; Code:
@@ -70,37 +70,36 @@ separate locations."
       (should (equal (opencode-normalize-directory "//other/share/x/") "//other/share/x/")))))
 
 (ert-deftest opencode-test-request-output-redraws-nothing ()
-  "Request output is inserted without the default process filter.
+  "Request output is read without the default process filter.
 That filter has every mode line of every frame redrawn after each chunk,
 which froze Emacs for seconds over the requests of a reconnection."
   (opencode-test-with-service
     (setf (opencode-test-service-routes opencode-test-service)
           (list (cons "/api/agent" (lambda (_) '(200 . ((data . [((id . "build") (name . "Build"))])))))))
-    (let ((processes nil)
+    (let ((connections nil)
           (result nil))
-      (cl-letf* ((plz (symbol-function 'plz))
-                 ((symbol-function 'plz)
+      (cl-letf* ((make-network-process (symbol-function 'make-network-process))
+                 ((symbol-function 'make-network-process)
                   (lambda (&rest arguments)
-                    (let ((process (apply plz arguments)))
-                      (push process processes)
-                      process))))
+                    (let ((connection (apply make-network-process arguments)))
+                      (push connection connections)
+                      connection))))
         (opencode-request 'get "/api/agent" :buffer nil :directory opencode-test-workspace
                           :then (lambda (response) (setq result (opencode-request-data response))))
         (opencode-test-wait-for (lambda () result)))
-      ;; The service's lookup, then the request.
-      (should (cdr processes))
-      (dolist (process processes)
-        (should (eq (process-filter process) #'opencode--plz-insert)))
+      (should connections)
+      (dolist (connection connections)
+        (should (eq (process-filter connection) #'opencode-transport--filter)))
       (should (equal result '(((id . "build") (name . "Build"))))))))
 
 (ert-deftest opencode-test-request-errors ()
   "Failed requests carry the status and the server's message."
   (opencode-test-with-service
     (let ((error nil))
-      (opencode-request 'get "/api/missing" :buffer nil :else (lambda (value) (setq error value)))
+      (opencode-request 'get "/api/session/ses_missing" :buffer nil :else (lambda (value) (setq error value)))
       (opencode-test-wait-for (lambda () error))
       (should (eql (opencode-error-status error) 404))
-      (should (equal (opencode-error-describe error) "GET /api/missing failed (HTTP 404): Not found")))))
+      (should (equal (opencode-error-describe error) "GET /api/session/ses_missing failed (HTTP 404): Not found")))))
 
 (ert-deftest opencode-test-service-starting ()
   "A service answering 503 while it boots is waited for."
@@ -291,7 +290,7 @@ Any request starts a service by itself, and open buffers must not go stale."
     (setf (opencode-test-service-routes opencode-test-service)
           (list (cons "/api/agent" (lambda (_) '(200 . ((data . [])))))))
     (let ((opencode-session-buffers (make-hash-table :test #'equal))
-          (buffer (generate-new-buffer " *opencode-test-session*")))
+          (buffer (opencode-test-session-stand-in "ses_test")))
       (unwind-protect
           (progn
             (opencode-events-connect)
@@ -317,7 +316,7 @@ Any request starts a service by itself, and open buffers must not go stale."
     (setf (opencode-test-service-routes opencode-test-service)
           (list (cons "/api/agent" (lambda (_) '(200 . ((data . [])))))))
     (let ((opencode-session-buffers (make-hash-table :test #'equal))
-          (buffer (generate-new-buffer " *opencode-test-session*")))
+          (buffer (opencode-test-session-stand-in "ses_test")))
       (unwind-protect
           (progn
             (puthash "ses_test" buffer opencode-session-buffers)

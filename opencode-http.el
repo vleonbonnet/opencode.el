@@ -25,8 +25,9 @@
 ;; through the `x-opencode-directory' header, encodes and decodes JSON
 ;; with the native parser, and runs its callbacks in the buffer that
 ;; issued the request.  A 401 after a service restart rereads the
-;; registration and retries once; so does a refused connection, after
-;; ensuring a service runs again.
+;; registration and retries once; so does a refused connection, or one
+;; closed without an answer, after ensuring a service runs again.
+;; Requests travel over `opencode-transport-request'.
 ;;
 ;; Decoded JSON uses alists with symbol keys, lists for arrays, and nil
 ;; for both null and false.  Request bodies are encoded by
@@ -36,7 +37,7 @@
 
 (require 'opencode-common)
 (require 'opencode-service)
-(require 'plz)
+(require 'opencode-transport)
 (require 'url-util)
 
 (defcustom opencode-request-timeout 60
@@ -107,39 +108,33 @@ goes to `message'."
     (json-parse-buffer :object-type 'alist :array-type 'list
                        :null-object nil :false-object nil)))
 
-(defun opencode-request--error (method path plz-error)
-  "Return an `opencode-error' for METHOD on PATH from PLZ-ERROR."
-  (let* ((response (plz-error-response plz-error))
-         (status (and response (plz-response-status response)))
-         (body (and response (plz-response-body response)))
+(defun opencode-request--error (method path failure)
+  "Return an `opencode-error' for METHOD on PATH from transport FAILURE."
+  (let* ((body (opencode-transport-failure-body failure))
          (json (and (stringp body) (not (string-empty-p body))
                     (ignore-errors
                       (json-parse-string body :object-type 'alist :array-type 'list
                                          :null-object nil :false-object nil)))))
     (opencode-error--make
-     :status status :method method :path path
+     :status (opencode-transport-failure-status failure) :method method :path path
      :tag (and (consp json) (alist-get '_tag json))
      :message (or (and (consp json) (alist-get 'message json))
                   (and (stringp body) (not (string-empty-p body)) (string-trim body))
-                  (plz-error-message plz-error)
-                  (when-let* ((curl (plz-error-curl-error plz-error)))
-                    (format "curl error %s: %s" (car curl) (cdr curl)))))))
+                  (opencode-transport-failure-message failure)))))
 
-(defun opencode-request--retryable (plz-error connection)
-  "Return a retry reason for PLZ-ERROR seen on CONNECTION, or nil.
-`password' when the registration changed after a 401, `refused' when the
-connection was refused."
-  (let ((response (plz-error-response plz-error))
-        (curl (plz-error-curl-error plz-error)))
-    (cond
-     ((and response (eql (plz-response-status response) 401))
-      (let ((registered (opencode-service-read-registration)))
-        (and registered
-             (not (equal (plist-get registered :password)
-                         (plist-get connection :password)))
-             'password)))
-     ((and curl (memql (car curl) '(7 52 56)))
-      'refused))))
+(defun opencode-request--retryable (failure connection)
+  "Return a retry reason for transport FAILURE seen on CONNECTION, or nil.
+`password' when the registration changed after a 401, `refused' when no
+connection could be made or it closed without an answer."
+  (pcase (opencode-transport-failure-reason failure)
+    ('http
+     (when (eql (opencode-transport-failure-status failure) 401)
+       (let ((registered (opencode-service-read-registration)))
+         (and registered
+              (not (equal (plist-get registered :password)
+                          (plist-get connection :password)))
+              'password))))
+    ((or 'refused 'closed) 'refused)))
 
 (cl-defun opencode-request (method path &key query body (directory default-directory)
                                    (then #'ignore) else timeout (buffer (current-buffer))
@@ -172,34 +167,35 @@ RETRIED is internal."
                (url (opencode-request--url connection path query))
                (payload (and body (json-serialize body :null-object :null :false-object :false))))
           (opencode-request--log "%s %s%s" method url (if payload (concat " " payload) ""))
-          (opencode-plz method url
-            :headers (delq nil
-                           (list (cons "Authorization" (opencode-service-authorization connection))
-                                 (cons "Accept" "application/json")
-                                 (and payload (cons "Content-Type" "application/json"))
-                                 (and directory (opencode-request-directory-header directory))))
-            :body (and payload (encode-coding-string payload 'utf-8))
-            :body-type 'binary
-            :as #'opencode-request--parse
-            :timeout (or timeout opencode-request-timeout)
-            :noquery t
-            :then (lambda (result)
-                    (opencode-request--log "OK %s %s" method path)
-                    (deliver then result))
-            :else (lambda (plz-error)
-                    (let ((reason (and (not retried)
-                                       (opencode-request--retryable plz-error connection))))
-                      (if reason
-                          (progn
-                            (setq opencode-service-connection nil)
-                            (opencode-request method path :query query :body body
-                                              :directory directory :then then :else else
-                                              :timeout timeout :buffer buffer :retried t))
-                        (let ((error (opencode-request--error method path plz-error)))
-                          (opencode-request--log "ERROR %s" (opencode-error-describe error))
-                          (if else
-                              (deliver else error)
-                            (opencode-report-error (opencode-error-describe error)))))))))))))
+          (opencode-transport-request
+           method url
+           :headers (delq nil
+                          (list (cons "Authorization" (opencode-service-authorization connection))
+                                (cons "Accept" "application/json")
+                                (and payload (cons "Content-Type" "application/json"))
+                                (and directory (opencode-request-directory-header directory))))
+           :body (and payload (encode-coding-string payload 'utf-8))
+           :as #'opencode-request--parse
+           :timeout (or timeout opencode-request-timeout)
+           ;; A kept connection already had its chance to fail.
+           :fresh retried
+           :then (lambda (result)
+                   (opencode-request--log "OK %s %s" method path)
+                   (deliver then result))
+           :else (lambda (failure)
+                   (let ((reason (and (not retried)
+                                      (opencode-request--retryable failure connection))))
+                     (if reason
+                         (progn
+                           (setq opencode-service-connection nil)
+                           (opencode-request method path :query query :body body
+                                             :directory directory :then then :else else
+                                             :timeout timeout :buffer buffer :retried t))
+                       (let ((error (opencode-request--error method path failure)))
+                         (opencode-request--log "ERROR %s" (opencode-error-describe error))
+                         (if else
+                             (deliver else error)
+                           (opencode-report-error (opencode-error-describe error)))))))))))))
 
 (defun opencode-request-sync (method path &rest arguments)
   "Send METHOD on PATH synchronously and return the decoded response.

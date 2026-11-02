@@ -39,13 +39,13 @@
 ;; finish rather than find the service going away or start another one
 ;; beside the CLI's, and then look for a service again, starting one.
 ;;
-;; Every asynchronous request goes through `opencode-plz', which settles
-;; it whatever ends its curl process.
+;; Every request goes through `opencode-transport-request', over a
+;; socket Emacs opens itself: no request starts a process.
 
 ;;; Code:
 
 (require 'opencode-common)
-(require 'plz)
+(require 'opencode-transport)
 
 (defcustom opencode-command "opencode"
   "Executable of the OpenCode CLI."
@@ -141,88 +141,6 @@ While it runs, the waiters wait for it rather than look for a service.")
        (equal (plist-get connection :pid) (plist-get other :pid))
        (equal (plist-get connection :id) (plist-get other :id))))
 
-;;;; Requests that always settle
-
-(defun opencode--plz-insert (process output)
-  "Insert OUTPUT of curl PROCESS at its mark, as the default process filter does.
-The default filter has every mode line of every frame redrawn after each
-chunk it inserts, which costs tens of milliseconds with many frames,
-for a request buffer that no window shows."
-  (when-let* ((buffer (process-buffer process))
-              ((buffer-live-p buffer)))
-    (with-current-buffer buffer
-      (let ((inhibit-read-only t)
-            (mark (process-mark process)))
-        (save-restriction
-          (widen)
-          ;; Before markers, as the default filter: a point at the end follows.
-          (save-excursion
-            (goto-char (or (marker-position mark) (point-max)))
-            (insert-before-markers output)
-            (set-marker mark (point))))))))
-
-(defun opencode-plz (method url &rest arguments)
-  "Request METHOD of URL asynchronously with `plz' ARGUMENTS; return the process.
-ARGUMENTS are `plz' keywords, functions :then and :else among them.
-Exactly one of THEN and ELSE runs, and the process buffer is killed
-once the request is over, whatever ends it.  Without :filter, the
-output is inserted by `opencode--plz-insert'.
-
-`plz' settles a request only on the curl exits it recognizes, and some
-systems describe a signal with its number, such as \"killed: 9\" on
-macOS: a curl process that Emacs deletes, whose buffer is killed or
-that is signaled from outside then ends without THEN or ELSE, and
-leaves its buffer behind.  So does an :as function that signals.  ELSE
-receives a `plz-error' saying why instead."
-  (declare (indent defun))
-  (let* ((then (plist-get arguments :then))
-         (else (plist-get arguments :else))
-         (as (or (plist-get arguments :as) 'string))
-         (unreadable (make-symbol "unreadable"))
-         (settled nil)
-         (arguments (cl-loop for (key value) on arguments by #'cddr
-                             unless (memq key '(:then :else :as)) append (list key value)))
-         (arguments (if (plist-member arguments :filter)
-                        arguments
-                      (append arguments (list :filter #'opencode--plz-insert)))))
-    (cl-flet ((settle (function value)
-                (unless settled
-                  (setq settled t)
-                  (funcall function value))))
-      (let* ((process
-              (apply #'plz method url
-                     ;; These symbols name results, though they are functions too.
-                     :as (if (and (functionp as) (not (memq as '(binary string buffer response file))))
-                             (lambda ()
-                               (condition-case err (funcall as) (error (cons unreadable err))))
-                           as)
-                     :then (lambda (value)
-                             (if (eq (car-safe value) unreadable)
-                                 (settle else (make-plz-error
-                                               :message (format "unreadable response: %s"
-                                                                (error-message-string (cdr value)))))
-                               (settle then value)))
-                     :else (lambda (error) (settle else error))
-                     arguments))
-             (buffer (process-buffer process)))
-        (add-function
-         :after (process-sentinel process)
-         (lambda (process status)
-           (unless (process-live-p process)
-             ;; `plz' answers from a timer due now when it recognizes STATUS:
-             ;; this one is due later, so it runs after it.
-             (run-at-time
-              0.01 nil
-              (lambda ()
-                (unless settled
-                  (settle else (make-plz-error
-                                :message (format "curl ended without a response (%s)"
-                                                 (string-trim (format "%s" status)))))
-                  (when (buffer-live-p buffer)
-                    (let (kill-buffer-query-functions)
-                      (kill-buffer buffer)))))))))
-        process))))
-
 ;;;; Finding a ready service
 
 (defun opencode-service--probe (connection callback)
@@ -230,21 +148,21 @@ receives a `plz-error' saying why instead."
 The outcome is `ready' when the registered process answers, `starting'
 while it boots, and nil when nothing usable answers."
   (condition-case nil
-      (opencode-plz 'get (concat (plist-get connection :url) "/api/info")
-        :headers `(("Authorization" . ,(opencode-service-authorization connection)))
-        :as (lambda () (json-parse-buffer :object-type 'alist :null-object nil
-                                          :false-object nil))
-        :connect-timeout 2 :timeout 5 :noquery t
-        :then (lambda (info)
-                (funcall callback
-                         (if (or (null (plist-get connection :pid))
-                                 (equal (alist-get 'pid info) (plist-get connection :pid)))
-                             'ready
-                           nil)))
-        :else (lambda (error)
-                (funcall callback
-                         (when-let* ((response (plz-error-response error)))
-                           (and (eql (plz-response-status response) 503) 'starting)))))
+      (opencode-transport-request
+       'get (concat (plist-get connection :url) "/api/info")
+       :headers `(("Authorization" . ,(opencode-service-authorization connection)))
+       :as (lambda () (json-parse-buffer :object-type 'alist :null-object nil
+                                         :false-object nil))
+       :connect-timeout 2 :timeout 5
+       :then (lambda (info)
+               (funcall callback
+                        (if (or (null (plist-get connection :pid))
+                                (equal (alist-get 'pid info) (plist-get connection :pid)))
+                            'ready
+                          nil)))
+       :else (lambda (failure)
+               (funcall callback
+                        (and (eql (opencode-transport-failure-status failure) 503) 'starting))))
     (error (funcall callback nil))))
 
 (defun opencode-service--finish (lookup connection error)
@@ -294,13 +212,11 @@ Nothing happens once LOOKUP is no longer the latest lookup."
   (setq opencode-service--import-checked (opencode-service--import-key connection))
   (opencode-service--finish lookup connection nil))
 
-(defun opencode-service--plz-error-text (error)
-  "Return a short description of plz ERROR."
-  (let ((response (plz-error-response error)))
-    (cond (response (format "HTTP %d" (plz-response-status response)))
-          ((plz-error-curl-error error)
-           (format "curl error %d" (car (plz-error-curl-error error))))
-          (t (or (plz-error-message error) "no answer")))))
+(defun opencode-service--failure-text (failure)
+  "Return a short description of request FAILURE."
+  (if-let* ((status (opencode-transport-failure-status failure)))
+      (format "HTTP %d" status)
+    (opencode-transport-failure-describe failure)))
 
 (defun opencode-service--await-import (lookup connection &optional progress deadline)
   "Settle LOOKUP's waiters with CONNECTION once its service imported the earlier sessions.
@@ -313,46 +229,46 @@ after which the import counts as stalled unless it progresses."
    (t
     (let ((deadline (or deadline (+ (float-time) opencode-service-import-stall-timeout))))
       (condition-case err
-          (opencode-plz 'get (concat (plist-get connection :url) "/api/experimental/migration/v1")
-            :headers `(("Authorization" . ,(opencode-service-authorization connection)))
-            :as (lambda () (json-parse-buffer :object-type 'alist :null-object nil
-                                              :false-object nil))
-            :connect-timeout 2 :timeout 5 :noquery t
-            :then
-            (lambda (status)
-              (pcase (alist-get 'status status)
-                ("completed"
-                 (when progress (message "OpenCode service: earlier sessions imported"))
-                 (opencode-service--import-done lookup connection))
-                ("error"
-                 (display-warning
-                  'opencode (format "The OpenCode service could not import the earlier sessions: %s"
-                                    (alist-get 'error status)))
-                 (opencode-service--import-done lookup connection))
-                (_
-                 (let ((current (opencode-service--import-progress status)))
-                   (unless (equal current progress)
-                     (message "OpenCode service: %s…" current)
-                     (setq deadline (+ (float-time) opencode-service-import-stall-timeout)))
-                   (if (> (float-time) deadline)
-                       (progn
-                         (display-warning
-                          'opencode
-                          (format "The OpenCode service's import of earlier sessions made no progress for %s s; sessions it has yet to import look deleted"
-                                  opencode-service-import-stall-timeout))
-                         (opencode-service--import-done lookup connection))
-                     (run-at-time opencode-service--import-interval nil
-                                  #'opencode-service--await-import
-                                  lookup connection current deadline))))))
-            :else
-            (lambda (error)
-              (if (eql 404 (when-let* ((response (plz-error-response error)))
-                             (plz-response-status response)))
-                  ;; A service without the import route has nothing to import.
-                  (opencode-service--import-done lookup connection)
-                (opencode-service--finish
-                 lookup nil (format "Cannot read the OpenCode service's import of earlier sessions (%s)"
-                                    (opencode-service--plz-error-text error))))))
+          (opencode-transport-request
+           'get (concat (plist-get connection :url) "/api/experimental/migration/v1")
+           :headers `(("Authorization" . ,(opencode-service-authorization connection)))
+           :as (lambda () (json-parse-buffer :object-type 'alist :null-object nil
+                                             :false-object nil))
+           :connect-timeout 2 :timeout 5
+           :then
+           (lambda (status)
+             (pcase (alist-get 'status status)
+               ("completed"
+                (when progress (message "OpenCode service: earlier sessions imported"))
+                (opencode-service--import-done lookup connection))
+               ("error"
+                (display-warning
+                 'opencode (format "The OpenCode service could not import the earlier sessions: %s"
+                                   (alist-get 'error status)))
+                (opencode-service--import-done lookup connection))
+               (_
+                (let ((current (opencode-service--import-progress status)))
+                  (unless (equal current progress)
+                    (message "OpenCode service: %s…" current)
+                    (setq deadline (+ (float-time) opencode-service-import-stall-timeout)))
+                  (if (> (float-time) deadline)
+                      (progn
+                        (display-warning
+                         'opencode
+                         (format "The OpenCode service's import of earlier sessions made no progress for %s s; sessions it has yet to import look deleted"
+                                 opencode-service-import-stall-timeout))
+                        (opencode-service--import-done lookup connection))
+                    (run-at-time opencode-service--import-interval nil
+                                 #'opencode-service--await-import
+                                 lookup connection current deadline))))))
+           :else
+           (lambda (failure)
+             (if (eql 404 (opencode-transport-failure-status failure))
+                 ;; A service without the import route has nothing to import.
+                 (opencode-service--import-done lookup connection)
+               (opencode-service--finish
+                lookup nil (format "Cannot read the OpenCode service's import of earlier sessions (%s)"
+                                   (opencode-service--failure-text failure))))))
         (error (opencode-service--finish
                 lookup nil (format "Cannot read the OpenCode service's import of earlier sessions (%s)"
                                    (error-message-string err)))))))))
@@ -512,11 +428,12 @@ answers in tens of milliseconds, which this waits for."
   "Return the number of sessions running a turn, or nil when the service is unreachable."
   (when-let* ((connection (or opencode-service-connection (opencode-service-read-registration))))
     (condition-case nil
-        (let ((response (plz 'get (concat (plist-get connection :url) "/api/session/active")
-                          :headers `(("Authorization" . ,(opencode-service-authorization connection)))
-                          :as (lambda () (json-parse-buffer :object-type 'alist :null-object nil
-                                                            :false-object nil))
-                          :connect-timeout 2 :timeout 5 :noquery t)))
+        (let ((response (opencode-transport-request-sync
+                         'get (concat (plist-get connection :url) "/api/session/active")
+                         :headers `(("Authorization" . ,(opencode-service-authorization connection)))
+                         :as (lambda () (json-parse-buffer :object-type 'alist :null-object nil
+                                                           :false-object nil))
+                         :connect-timeout 2 :timeout 5)))
           (length (alist-get 'data response)))
       (error nil))))
 
