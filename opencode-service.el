@@ -98,7 +98,7 @@ which may have found the service going away, settles nothing.")
 While it runs, the waiters wait for it rather than look for a service.")
 
 (defvar opencode-service--installed-version nil
-  "Cons (MTIME . VERSION) of the last `opencode --version' result.")
+  "Cons ((EXECUTABLE . MTIME) . VERSION) of the last `opencode --version' result.")
 
 (defvar opencode-service--import-checked nil
   "Cons (ID . PID) of the service whose import Emacs no longer waits for.")
@@ -451,22 +451,48 @@ Neither of its functions runs then, and when nothing else waits, a
 service stopped meanwhile is not started again for it."
   (setq opencode-service--waiters (delq handle opencode-service--waiters)))
 
+(defconst opencode-service--version-line
+  (rx bos (* blank)
+      (? (any alnum) (* (any alnum "_.-")) (+ blank))
+      (? "v")
+      (group (+ digit) "." (* (not blank)))
+      (* blank) eos)
+  "Regexp matching a line of `opencode --version' that is the version.
+Such a line is the version, after an optional program name and \"v\";
+group 1 is the version, as the service registers it.")
+
+(defun opencode-service--parse-version (output)
+  "Return the version that OUTPUT of `opencode --version' prints, or nil.
+OpenCode 2 prints \"opencode v2.1.4\", the name being that of the build,
+and OpenCode 1 \"2.1.4\"; the version may carry prerelease and build
+suffixes, and is in bold on a terminal.  The first line that is a
+version wins, so that lines such as warnings before or after it are
+skipped."
+  (seq-some (lambda (line)
+              (when (string-match opencode-service--version-line line)
+                (match-string 1 line)))
+            (split-string (replace-regexp-in-string "\e\\[[0-9;]*m" "" output)
+                          "[\r\n]+" t)))
+
 (defun opencode-service-installed-version ()
   "Return the version of the installed CLI, or nil when unknown.
-The result is cached per executable modification time."
+A build without a version, which calls itself \"local\", is unknown.
+The result is cached per executable and modification time.  The CLI
+answers in tens of milliseconds, which this waits for."
   (when-let* ((executable (executable-find opencode-command))
-              (mtime (file-attribute-modification-time (file-attributes executable))))
-    (if (equal (car opencode-service--installed-version) mtime)
+              (mtime (file-attribute-modification-time (file-attributes executable)))
+              (key (cons executable mtime)))
+    (if (equal (car opencode-service--installed-version) key)
         (cdr opencode-service--installed-version)
       (let ((version
              (with-temp-buffer
+               ;; Only standard output holds the version; warnings go to standard error.
                (when (eql 0 (ignore-errors
-                              (let ((process-environment (opencode-service--process-environment)))
-                                (call-process executable nil t nil "--version"))))
-                 (goto-char (point-max))
-                 (when (re-search-backward "v?\\([0-9][^ \t\n]*\\)" nil t)
-                   (match-string 1))))))
-        (setq opencode-service--installed-version (cons mtime version))
+                              (let ((process-environment (opencode-service--process-environment))
+                                    (default-directory (expand-file-name "~/")))
+                                (call-process executable nil '(t nil) nil "--version"))))
+                 (opencode-service--parse-version (buffer-string))))))
+        (setq opencode-service--installed-version (cons key version))
         version))))
 
 (defun opencode-service-stale-p (&optional connection)
