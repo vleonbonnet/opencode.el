@@ -637,6 +637,66 @@ the first page did not hold is neither running nor waiting."
       (should (opencode-state-get "ses_arch"))
       (should-not (opencode-state-get "ses_later")))))
 
+(ert-deftest opencode-test-state-holds-parents ()
+  "The registry holds the sessions above those it holds, archived ones included.
+The service archives a session without its subagents, which it lists
+unarchived: the parent is fetched once the listing ends, and its own
+parent after it; one deleted is let go.  A rebuild keeps the parent
+until it is fetched again, rather than drop it and fetch it anew."
+  (let ((opencode-state--page-size 3))
+    (opencode-test-with-state-server
+        (list :sessions (append (list (opencode-test-state-info "ses_top" :updated 3 :archived 10)
+                                      (opencode-test-state-info "ses_mid" :updated 4 :archived 11
+                                                                :parent "ses_top")
+                                      (opencode-test-state-info "ses_sub" :updated 5 :parent "ses_mid")
+                                      (opencode-test-state-info "ses_lost" :updated 6 :parent "ses_gone"))
+                                (opencode-test-state-numbered 4)))
+      (opencode-test-state-recording
+        (opencode-test-state-connect)
+        (should (opencode-state-loaded-p))
+        (should (plist-get (opencode-state-get "ses_mid") :archived))
+        (should (plist-get (opencode-state-get "ses_top") :archived))
+        (should-not (opencode-state-get "ses_gone"))
+        ;; The parents of those listed, then their own.
+        (should (equal (seq-filter (lambda (path) (member path '("/api/session/ses_mid" "/api/session/ses_top"
+                                                                 "/api/session/ses_gone")))
+                                   (opencode-test-state-session-requests))
+                       (append (sort (list "/api/session/ses_gone" "/api/session/ses_mid") #'string<)
+                               '("/api/session/ses_top"))))
+        ;; Archived, they are listed as such only.
+        (should-not (member "ses_mid" (opencode-test-state-ids)))
+        (should (member "ses_mid" (opencode-test-state-ids t)))
+        (should (equal (mapcar (lambda (entry) (plist-get entry :id)) (opencode-state-descendants "ses_top"))
+                       '("ses_mid" "ses_sub")))
+        ;; Clients heard of them.
+        (should (member "ses_mid" opencode-test-state-updates))
+        (should (member "ses_top" opencode-test-state-updates)))
+      ;; A rebuild keeps them, and fetches them again; nothing more.
+      (plist-put opencode-test-state-server :defer-pages t)
+      (opencode-test-state-recording
+        (setq opencode-test-requests nil)
+        (opencode-test-state-connect)
+        (while (opencode-test-release))
+        (should (plist-get (opencode-state-get "ses_top") :archived))
+        (should (plist-get (opencode-state-get "ses_mid") :archived))
+        (should-not (seq-find (lambda (change) (member (car change) '("ses_top" "ses_mid")))
+                              opencode-test-state-changes))
+        (should (equal (sort (seq-filter (lambda (path) (member path '("/api/session/ses_mid" "/api/session/ses_top"
+                                                                       "/api/session/ses_gone")))
+                                         (opencode-test-state-session-requests))
+                             #'string<)
+                       '("/api/session/ses_gone" "/api/session/ses_mid" "/api/session/ses_top"))))
+      ;; Its subagent deleted, a parent stays until the next rebuild lets it go.
+      (plist-put opencode-test-state-server :sessions
+                 (seq-remove (lambda (info) (member (alist-get 'id info) '("ses_sub" "ses_lost")))
+                             (plist-get opencode-test-state-server :sessions)))
+      (opencode-test-dispatch (list (opencode-test-state-event "session.deleted" "ses_sub" 900)))
+      (should (opencode-state-get "ses_mid"))
+      (opencode-test-state-connect)
+      (while (opencode-test-release))
+      (should-not (opencode-state-get "ses_mid"))
+      (should-not (opencode-state-get "ses_top")))))
+
 (ert-deftest opencode-test-state-rebuild-keeps-entries ()
   "A rebuild keeps the previous entries until the listing ends, then drops those gone."
   (let ((opencode-state--page-size 3))
