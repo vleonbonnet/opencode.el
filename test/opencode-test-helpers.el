@@ -436,5 +436,84 @@ session registry starts empty and follows events once a test dispatches
     (search-forward text)
     (match-beginning 0)))
 
+;;;; Transcripts
+
+(defvar opencode-test-transcript nil
+  "Messages the transcript route serves, oldest first.")
+
+(defun opencode-test-transcript-routes ()
+  "Return the default routes, serving `opencode-test-transcript' as every transcript.
+A message of it is found by its ID, as the service finds one; any other
+is not."
+  (append
+   (list (list 'get "\\`/api/session/ses_[A-Za-z0-9]+/message\\'"
+               (lambda (request) (opencode-test-message-page opencode-test-transcript request)))
+         (list 'get "\\`/api/session/ses_[A-Za-z0-9]+/message/\\(msg_[A-Za-z0-9_]+\\)\\'"
+               (lambda (request)
+                 (if-let* ((message (seq-find (lambda (message)
+                                                (equal (alist-get 'id message) (plist-get request :match)))
+                                              opencode-test-transcript)))
+                     `((data . ,message))
+                   `(:error 404 ,(format "Message not found: %s" (plist-get request :match))
+                            "MessageNotFoundError")))))
+   (opencode-test-default-routes)))
+
+(defmacro opencode-test-with-transcript (messages &rest body)
+  "Run BODY with the transcript route serving MESSAGES, after a first stream."
+  (declare (indent 1) (debug t))
+  `(opencode-test-with-server
+     (let ((opencode-test-transcript ,messages)
+           (opencode-test-routes (opencode-test-transcript-routes))
+           (opencode--stream-seen t))
+       ,@body)))
+
+(defun opencode-test-reconnect ()
+  "Dispatch `server.connected', as a reopened stream does."
+  (opencode-test-dispatch '(((type . "server.connected") (data)))))
+
+(defun opencode-test-session ()
+  "Return the ID of the session transcript tests open: the text scenario's."
+  (opencode-test-scenario "text"))
+
+(defun opencode-test-prompt (id text)
+  "Return user message ID with TEXT."
+  `((id . ,id) (type . "user") (text . ,text) (time (created . 1))))
+
+(defun opencode-test-step (id &rest content)
+  "Return the finished assistant message ID with CONTENT."
+  `((id . ,id) (type . "assistant") (time (created . 1) (completed . 2)) (content . ,content)))
+
+(defun opencode-test-running-step (id &rest content)
+  "Return the assistant message ID with CONTENT, its step still running."
+  `((id . ,id) (type . "assistant") (time (created . 1)) (content . ,content)))
+
+(defun opencode-test-idle (id)
+  "Return the end of a turn that succeeded, message ID."
+  `((id . ,id) (type . "idle") (outcome . "succeeded") (time (created . 3))))
+
+(defun opencode-test-long-transcript (turns)
+  "Return a transcript of TURNS turns, oldest first, as the service projects it.
+Each turn has a prompt, reasoning, a file read, a shell command with its
+output, an answer in Markdown and the turn's end: six parts."
+  (let ((messages nil))
+    (dotimes (turn turns)
+      (push `((id . ,(format "msg_%06du" turn)) (type . "user") (text . ,(format "Look at part %d" turn))
+              (time (created . ,turn)))
+            messages)
+      (push `((id . ,(format "msg_%06da" turn)) (type . "assistant") (time (created . ,turn) (completed . ,turn))
+              (content ((type . "reasoning") (text . ,(format "**Reading** the code of part %d first." turn)))
+                       ((type . "tool") (id . ,(format "call_%06dr" turn)) (name . "read")
+                        (state (status . "completed") (input (path . "README.md"))
+                               (content ((type . "text") (text . "README.md\n")))))
+                       ((type . "tool") (id . ,(format "call_%06ds" turn)) (name . "shell")
+                        (state (status . "completed") (input (command . "make check"))
+                               (content ((type . "text") (text . ,(make-string 400 ?x))))))
+                       ((type . "text")
+                        (text . ,(format "Part %d:\n\n- uses `notes.txt`\n- see https://example.com/%d\n\nDone." turn turn)))))
+            messages)
+      (push `((id . ,(format "msg_%06di" turn)) (type . "idle") (outcome . "succeeded") (time (created . ,turn)))
+            messages))
+    (nreverse messages)))
+
 (provide 'opencode-test-helpers)
 ;;; opencode-test-helpers.el ends here

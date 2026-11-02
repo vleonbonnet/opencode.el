@@ -107,30 +107,6 @@
 
 ;;;; Writing long transcripts
 
-(defun opencode-test-long-transcript (turns)
-  "Return a transcript of TURNS turns, oldest first, as the service projects it.
-Each turn has a prompt, reasoning, a file read, a shell command with its
-output, an answer in Markdown and the turn's end: six parts."
-  (let ((messages nil))
-    (dotimes (turn turns)
-      (push `((id . ,(format "msg_%06du" turn)) (type . "user") (text . ,(format "Look at part %d" turn))
-              (time (created . ,turn)))
-            messages)
-      (push `((id . ,(format "msg_%06da" turn)) (type . "assistant") (time (created . ,turn) (completed . ,turn))
-              (content ((type . "reasoning") (text . ,(format "**Reading** the code of part %d first." turn)))
-                       ((type . "tool") (id . ,(format "call_%06dr" turn)) (name . "read")
-                        (state (status . "completed") (input (path . "README.md"))
-                               (content ((type . "text") (text . "README.md\n")))))
-                       ((type . "tool") (id . ,(format "call_%06ds" turn)) (name . "shell")
-                        (state (status . "completed") (input (command . "make check"))
-                               (content ((type . "text") (text . ,(make-string 400 ?x))))))
-                       ((type . "text")
-                        (text . ,(format "Part %d:\n\n- uses `notes.txt`\n- see https://example.com/%d\n\nDone." turn turn)))))
-            messages)
-      (push `((id . ,(format "msg_%06di" turn)) (type . "idle") (outcome . "succeeded") (time (created . ,turn)))
-            messages))
-    (nreverse messages)))
-
 (defun opencode-test-replay-seconds (messages)
   "Return the fewest seconds of three that writing MESSAGES whole takes.
 Garbage is collected rarely meanwhile, as in a configuration with a
