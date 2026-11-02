@@ -2055,6 +2055,33 @@ The event fetches the session; its page, arriving later, leaves it."
                      (patch "/api/session/ses_a" ((archived . :false)))
                      (post "/api/session/ses_a/interrupt" nil))))))
 
+(ert-deftest opencode-test-archive-tells-its-outcome ()
+  "Archiving and restoring call back once the service answered, as it answered.
+Until then neither is called, so that a caller acts on the outcome only."
+  (opencode-test-with-server
+    (let* ((outcomes nil)
+           (then (lambda (info) (push (list 'then (alist-get 'id info)) outcomes)))
+           (else (lambda (error) (push (list 'else (opencode-error-status error)) outcomes)))
+           (opencode-test-routes
+            (append (list (list 'patch "\\`/api/session/ses_refused\\'"
+                                (lambda (_) '(:error 409 "Session is busy")))
+                          (list 'patch "\\`/api/session/\\(ses_[a-z]+\\)\\'"
+                                (lambda (request)
+                                  (cons :defer (lambda () `((id . ,(plist-get request :match))))))))
+                    opencode-test-routes)))
+      (opencode-session-archive "ses_held" nil then else)
+      (opencode-session-archive "ses_held" t then else)
+      (should-not outcomes)
+      (should (opencode-test-release))
+      (should (equal outcomes '((then "ses_held"))))
+      (should (opencode-test-release))
+      (should (equal outcomes '((then "ses_held") (then "ses_held"))))
+      (setq outcomes nil)
+      (opencode-session-archive "ses_refused" nil then else)
+      (should (equal outcomes '((else 409))))
+      ;; Without callbacks, a refusal is reported, as before.
+      (should-error (opencode-session-archive "ses_refused")))))
+
 (ert-deftest opencode-test-state-last-reply ()
   "The last reply is the newest assistant text, cut to the length asked."
   (opencode-test-with-state-server

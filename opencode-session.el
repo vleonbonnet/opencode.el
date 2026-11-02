@@ -3139,13 +3139,20 @@ of the current project."
   (interactive)
   (opencode-session-interrupt (alist-get 'id (opencode--session-here "Interrupt session: " t))))
 
-(defun opencode-session-archive (id &optional restore)
+(defun opencode-session-archive (id &optional restore then else)
   "Archive session ID, or with RESTORE restore it from the archive.
 Archived sessions stay whole; pickers and `opencode-state-sessions'
-leave them out."
+leave them out.  THEN, when given, is called with the session's info as
+the service returns it once the service archived or restored it; ELSE
+with the `opencode-error' of a refusal, which is otherwise reported.
+Either is called once, in whatever buffer is current then, so that a
+caller can act on the outcome, such as close the session's buffer only
+once the archive took."
   (opencode-request 'patch (concat "/api/session/" id)
                     :directory (opencode-state--directory id) :buffer nil
-                    :body `((archived . ,(if restore :false t)))))
+                    :body `((archived . ,(if restore :false t)))
+                    :then (or then #'ignore)
+                    :else else))
 
 (defun opencode--reply-text (message)
   "Return the text of assistant MESSAGE, or nil when it has none."
