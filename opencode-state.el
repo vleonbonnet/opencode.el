@@ -38,8 +38,12 @@
 ;; reported to clients at once.  Until the listing ends, a rebuild keeps
 ;; the entries of the previous stream not listed yet; it then drops the
 ;; ones the service no longer lists, except sessions whose buffer is
-;; open, which are fetched, archived or not.  A session buffer opening
-;; fetches its session too when the registry does not hold it.
+;; open, which are fetched, archived or not.  So are the sessions above
+;; those it holds, at any depth: the service archives a session without
+;; its subagents, which it lists unarchived, so that clients tell the
+;; parent of such a subagent archived rather than unknown.  A session
+;; buffer opening fetches its session too when the registry does not
+;; hold it.
 ;;
 ;; Unread is the service's, shared by every client: a session is unread
 ;; when its last idle transition is newer than the watermark
@@ -332,8 +336,8 @@ loaded the session), :idle, :viewed, :archived, :created, :updated and
 :started.  Times are float seconds since the epoch.  Read the context
 size with `opencode-state-context', which fetches it when not known.
 The registry holds every unarchived session, every session whose buffer
-is open, and every other one an event concerned; lookups are constant
-time."
+is open, every other one an event concerned, and the sessions above
+those, archived ones included; lookups are constant time."
   (gethash id opencode-state--sessions))
 
 (defun opencode-state-sessions (&optional archived)
@@ -795,7 +799,11 @@ so that a turn ending in between shows as ended."
   "Fetch sessions IDS, which the registry does not hold current, and follow them.
 EVENT, of the one session of IDS that called for it, and the events of
 each session received meanwhile are applied once its entry is in.  A
-session the service does not have is dropped quietly."
+session the service does not have is dropped quietly.  Once every
+unarchived session was listed, the parents of the sessions fetched are
+fetched in turn, when the registry lacks them (see
+`opencode-state--parents-wanted'); until then, the end of the listing
+fetches them."
   (dolist (id ids)
     (puthash id (cons 'fetching (and event (list event))) opencode-state--fetching))
   (let ((generation opencode-state--generation)
@@ -804,23 +812,29 @@ session the service does not have is dropped quietly."
      ids
      (lambda (results)
        (when (= generation opencode-state--generation)
-         (opencode-state--batched
-          (lambda ()
-            (pcase-dolist (`(,id . ,result) results)
-              ;; Unless deleted meanwhile.
-              (when (eq (gethash id opencode-state--fetching) (alist-get id fetching nil nil #'equal))
-                (let ((events (reverse (cdr (gethash id opencode-state--fetching)))))
-                  (remhash id opencode-state--fetching)
-                  (cond
-                   ((opencode-error-p result)
-                    (message "OpenCode: cannot follow session %s: %s" id (opencode-error-describe result)))
-                   ((null result)
-                    (puthash id 'deleted opencode-state--current)
-                    (opencode-state--store id nil))
-                   (t
-                    (opencode-state--put result)
-                    (dolist (event events)
-                      (opencode-state--dispatch id event t))))))))))))))
+         (let ((parents nil))
+           (opencode-state--batched
+            (lambda ()
+              (pcase-dolist (`(,id . ,result) results)
+                ;; Unless deleted meanwhile.
+                (when (eq (gethash id opencode-state--fetching) (alist-get id fetching nil nil #'equal))
+                  (let ((events (reverse (cdr (gethash id opencode-state--fetching)))))
+                    (remhash id opencode-state--fetching)
+                    (cond
+                     ((opencode-error-p result)
+                      (message "OpenCode: cannot follow session %s: %s" id (opencode-error-describe result)))
+                     ((null result)
+                      (puthash id 'deleted opencode-state--current)
+                      (opencode-state--store id nil))
+                     (t
+                      (opencode-state--put result)
+                      (dolist (event events)
+                        (opencode-state--dispatch id event t))
+                      (when-let* ((parent (plist-get (opencode-state-get id) :parent-id)))
+                        (push parent parents)))))))))
+           (when-let* (((and opencode-state--loaded (not opencode-state--listing)))
+                       (wanted (seq-filter #'opencode-state--parent-wanted-p (delete-dups parents))))
+             (opencode-state--fetch wanted))))))))
 
 ;;;; Events
 
@@ -1116,13 +1130,15 @@ first page; :count, the number of sessions listed so far."
   "End the listing of bootstrap GENERATION.
 Entries still not current are of sessions the service no longer lists
 unarchived: they are dropped, except those whose buffer is open, which
-are fetched, as are the sessions of open buffers the registry lacks."
+are fetched, as are the sessions of open buffers the registry lacks.
+So are the sessions above those it keeps, at any depth (see
+`opencode-state--parents-wanted')."
   (when (= generation opencode-state--generation)
-    (let ((stale nil)
+    (let ((stale (make-hash-table :test #'equal))
           (wanted nil))
       (maphash (lambda (id _entry)
                  (unless (or (gethash id opencode-state--current) (gethash id opencode-state--fetching))
-                   (if (opencode-state--retained-p id) (push id wanted) (push id stale))))
+                   (if (opencode-state--retained-p id) (push id wanted) (puthash id t stale))))
                opencode-state--sessions)
       (maphash (lambda (id buffer)
                  (when (and (buffer-live-p buffer)
@@ -1130,14 +1146,40 @@ are fetched, as are the sessions of open buffers the registry lacks."
                             (not (gethash id opencode-state--current)))
                    (push id wanted)))
                opencode-session-buffers)
+      (setq wanted (delete-dups (append (opencode-state--parents-wanted stale) wanted)))
       (setq opencode-state--listing nil
             opencode-state--loaded t)
       (opencode-state--batched
        (lambda ()
-         (dolist (id stale)
-           (opencode-state--store id nil))))
+         (maphash (lambda (id _) (opencode-state--store id nil)) stale)))
       (when-let* ((ids (seq-remove (lambda (id) (gethash id opencode-state--fetching)) wanted)))
         (opencode-state--fetch ids)))))
+
+(defun opencode-state--parent-wanted-p (id)
+  "Return non-nil when the registry is to fetch session ID, a parent.
+It holds no current entry of it, nor fetches it, nor knows it deleted."
+  (not (or (gethash id opencode-state--current) (gethash id opencode-state--fetching))))
+
+(defun opencode-state--parents-wanted (stale)
+  "Return the IDs of the sessions above those the registry keeps, to fetch.
+The service archives a session without its subagents, which it lists
+unarchived while it lists their parent no more: the registry holds the
+sessions above those it holds, at any depth, so that clients tell a
+subagent's parent archived, and draw trees whole.  STALE is a hash table
+of the IDs of the entries to drop: a parent among them is removed from
+it, kept until fetched again."
+  (let ((queue nil)
+        (wanted (make-hash-table :test #'equal)))
+    (maphash (lambda (id _entry) (unless (gethash id stale) (push id queue))) opencode-state--sessions)
+    (while queue
+      (when-let* ((parent (plist-get (gethash (pop queue) opencode-state--sessions) :parent-id))
+                  ((not (gethash parent wanted)))
+                  ((opencode-state--parent-wanted-p parent)))
+        (puthash parent t wanted)
+        (when (gethash parent stale)
+          (remhash parent stale)
+          (push parent queue))))
+    (hash-table-keys wanted)))
 
 (defun opencode-state--buffer-changed (id)
   "Have the registry hold session ID once its buffer opened.
