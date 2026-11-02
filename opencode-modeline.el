@@ -40,6 +40,9 @@
 ;; shrinks first, down to `opencode-mode-line-title-min-width' columns;
 ;; then details are dropped one step at a time, the model's "Claude "
 ;; prefix, the provider, the variant, the model and last the context.
+;; The mode line is computed at every redisplay of its window, so each
+;; window keeps its last fit, and fits again only when what it shows,
+;; its width, the font or the rest of the mode line changed.
 ;;
 ;; The agent, model, variant, provider and context are drawn by the
 ;; displays of opencode-display.el, which other packages' session lists
@@ -95,18 +98,30 @@ Compacting replaced the context that crossed it."
 
 ;;;; Segments
 
+(defvar-local opencode--mode-line-status nil
+  "(KEY . ICON) of the status icon last made.")
+
 (defun opencode-mode-line-status ()
-  "Return the status icon of this session."
-  (cond ((opencode-pending-request-p)
-         (propertize (opencode-pending-prompt-icon) 'help-echo "Waiting for your answer"))
-        ((eq opencode-session-status 'busy)
-         (propertize "\U000F051F" ; nf-md-timer_sand
-                     'face 'opencode-tool-running-margin
-                     'help-echo (if-let* ((retry opencode-session-retry))
-                                    (format "Retry #%s: %s" (alist-get 'attempt retry)
-                                            (alist-get 'message (alist-get 'error retry)))
-                                  "Busy")))
-        (t (propertize "\U000F05E0" 'face 'success 'help-echo "Idle")))) ; nf-md-check_circle
+  "Return the status icon of this session.
+The icon is made again only when what it shows changed, as the mode
+line is redrawn on every streamed chunk."
+  (let* ((pending (and (opencode-pending-request-p) t))
+         (key (list pending opencode-session-status opencode-session-retry)))
+    (if (equal key (car opencode--mode-line-status))
+        (cdr opencode--mode-line-status)
+      (let ((icon (cond (pending
+                         (propertize (opencode-pending-prompt-icon) 'help-echo "Waiting for your answer"))
+                        ((eq opencode-session-status 'busy)
+                         (propertize "\U000F051F" ; nf-md-timer_sand
+                                     'face 'opencode-tool-running-margin
+                                     'help-echo (if-let* ((retry opencode-session-retry))
+                                                    (format "Retry #%s: %s" (alist-get 'attempt retry)
+                                                            (alist-get 'message (alist-get 'error retry)))
+                                                  "Busy")))
+                        (t (propertize "\U000F05E0" 'face 'success 'help-echo "Idle"))))) ; nf-md-check_circle
+        ;; A copy, so a value later changed in place does not match it.
+        (setq opencode--mode-line-status (cons (copy-tree key) icon))
+        icon))))
 
 (defun opencode-mode-line-title (&optional name)
   "Return the session title in buffer NAME, without the OpenCode wrapper.
@@ -178,9 +193,13 @@ catalogs it left stale (see `opencode-catalog-ensure')."
 (defvar opencode--mode-line-width-cache (make-hash-table :test #'equal)
   "Pixel widths of rendered mode-line strings, keyed by text and properties.")
 
+(defvar opencode--mode-line-flushes 0
+  "Count of `opencode-mode-line-flush' calls, which outdate every fitted mode line.")
+
 (defun opencode-mode-line-flush ()
   "Forget the measured widths of mode-line text, after fonts changed."
   (clrhash opencode--mode-line-width-cache)
+  (cl-incf opencode--mode-line-flushes)
   (opencode--update-mode-lines))
 
 (defun opencode-mode-line-escape (string)
@@ -258,39 +277,87 @@ The model and its variant form one group; groups are two spaces apart."
               'mouse-face 'mode-line-highlight
               'local-map mode-line-buffer-identification-keymap))
 
-(defun opencode-mode-line ()
-  "Return the session status, title and details fitted to the selected window."
-  (let* ((status (opencode-mode-line-status))
-         (title (opencode-mode-line-title))
-         (segments (opencode-mode-line-segments))
+(defvar-local opencode--mode-line-candidates nil
+  "(KEY . CANDIDATES) of the details last measured, as `opencode-mode-line-fit' takes them.")
+
+(defun opencode--mode-line-candidates (segments)
+  "Return the details of SEGMENTS at every level with their pixel widths.
+They are measured again only when SEGMENTS or the mode-line font changed."
+  (let ((key (list segments (window-font-width nil 'mode-line) opencode--mode-line-flushes)))
+    (if (equal key (car opencode--mode-line-candidates))
+        (cdr opencode--mode-line-candidates)
+      (let ((candidates
+             (delete-dups
+              (mapcar (lambda (level)
+                        (let ((details (concat "  " (opencode-mode-line-details segments level) " ")))
+                          (cons details (opencode-mode-line-pixel-width details))))
+                      opencode-mode-line-levels))))
+        (setq opencode--mode-line-candidates (cons key candidates))
+        candidates))))
+
+(defun opencode--mode-line-moody-p ()
+  "Return non-nil when session titles are drawn in moody tabs."
+  (and (fboundp 'moody-tab)
+       (memq 'moody-mode-line-buffer-identification (default-value 'mode-line-format))
+       t))
+
+(defvar-local opencode--mode-line-fitted nil
+  "Weak table of the windows showing this buffer to (KEY . FITTED).
+FITTED is what `opencode--mode-line-fit-window' last returned there.")
+
+(defun opencode--mode-line-fit-window (status segments)
+  "Return (TITLE . DETAILS) fitted to the selected window, both escaped.
+TITLE holds STATUS, the status icon, and the session title, cut to fit;
+DETAILS those of SEGMENTS that fit.  They are fitted again only when
+what they depend on changed: the session's status, details and title,
+the window's width, the font, and the rest of the mode line, which is
+formatted every time, since anything may change it."
+  (let* ((rest (format-mode-line (remove opencode-mode-line-element (opencode-mode-line-format)) t))
          (char-width (window-font-width nil 'mode-line))
-         (rest (format-mode-line (remove opencode-mode-line-element (opencode-mode-line-format)) t))
-         (tab (format-mode-line (opencode-mode-line-tab (concat status " ")) t))
-         (available (- (window-pixel-width)
-                       (window-right-divider-width)
-                       (window-scroll-bar-width)
-                       (opencode-mode-line-pixel-width rest)
-                       (opencode-mode-line-pixel-width tab)
-                       char-width))
-         (candidates
-          (delete-dups
-           (mapcar (lambda (level)
-                     (let ((details (concat "  " (opencode-mode-line-details segments level) " ")))
-                       (cons details (opencode-mode-line-pixel-width details))))
-                   opencode-mode-line-levels)))
-         (fit (opencode-mode-line-fit (string-width title) candidates available char-width
-                                      opencode-mode-line-title-min-width)))
-    (list (opencode-mode-line-tab
-           (opencode-mode-line-escape
-            (concat status " "
-                    (opencode--mode-line-title-string
-                     (truncate-string-to-width title (cdr fit) nil nil "…")))))
-          (opencode-mode-line-escape (car fit)))))
+         (key (list status segments (buffer-name) rest char-width (window-pixel-width)
+                    (window-right-divider-width) (window-scroll-bar-width) (window-mode-line-height)
+                    (opencode--mode-line-moody-p) opencode-mode-line-title-min-width
+                    opencode--mode-line-flushes))
+         (table (or opencode--mode-line-fitted
+                    (setq opencode--mode-line-fitted (make-hash-table :test #'eq :weakness 'key))))
+         (cached (gethash (selected-window) table)))
+    ;; Faces and images in the rest change its width, not only its text.
+    (if (and cached (equal-including-properties key (car cached)))
+        (cdr cached)
+      (let* ((title (opencode-mode-line-title))
+             (tab (format-mode-line (opencode-mode-line-tab (concat status " ")) t))
+             (available (- (window-pixel-width)
+                           (window-right-divider-width)
+                           (window-scroll-bar-width)
+                           (opencode-mode-line-pixel-width rest)
+                           (opencode-mode-line-pixel-width tab)
+                           char-width))
+             (fit (opencode-mode-line-fit (string-width title) (opencode--mode-line-candidates segments)
+                                          available char-width opencode-mode-line-title-min-width))
+             (fitted (cons (opencode-mode-line-escape
+                            (concat status " "
+                                    (opencode--mode-line-title-string
+                                     (truncate-string-to-width title (cdr fit) nil nil "…"))))
+                           (opencode-mode-line-escape (car fit)))))
+        (puthash (selected-window) (cons key fitted) table)
+        fitted))))
+
+(defun opencode-mode-line ()
+  "Return the session status, title and details fitted to the selected window.
+The tab is made at every call, as moody draws the selected window's
+differently."
+  (let ((fitted (opencode--mode-line-fit-window (opencode-mode-line-status)
+                                                (opencode-mode-line-segments))))
+    (list (opencode-mode-line-tab (car fitted))
+          (cdr fitted))))
 
 ;;;; Format
 
 (defvar opencode--mode-line-format-warned nil
   "Non-nil once the default mode line lacked the expected anchors.")
+
+(defvar opencode--mode-line-format nil
+  "(DEFAULT MODES . FORMAT): the adapted format last made, and copies of its sources.")
 
 (defun opencode-mode-line-format ()
   "Return the default mode-line format adapted to session buffers.
@@ -298,9 +365,23 @@ Everything up to the buffer identification is kept but the modified and
 remote flags; the identification and the slots before `mode-line-modes'
 give way to `opencode-mode-line-element', and `mode-line-modes' loses
 the major mode name and `mode-line-process'.  When the default lacks
-those anchors it is used unchanged."
-  (let* ((default (default-value 'mode-line-format))
-         (id (seq-position default nil
+those anchors it is used unchanged.  It is called twice per redisplay
+of a session mode line, so it is made again only when the default
+format or `mode-line-modes' changed."
+  (let ((default (default-value 'mode-line-format))
+        (cache opencode--mode-line-format))
+    (if (and cache
+             (equal-including-properties default (car cache))
+             (equal-including-properties mode-line-modes (cadr cache)))
+        (cddr cache)
+      (let ((format (opencode--mode-line-adapt default)))
+        ;; Copies, so that a format later changed in place does not match.
+        (setq opencode--mode-line-format (cons (copy-tree default) (cons (copy-tree mode-line-modes) format)))
+        format))))
+
+(defun opencode--mode-line-adapt (default)
+  "Return DEFAULT, the default mode-line format, adapted as `opencode-mode-line-format' says."
+  (let* ((id (seq-position default nil
                            (lambda (element _)
                              (memq element '(moody-mode-line-buffer-identification
                                              mode-line-buffer-identification)))))

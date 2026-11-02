@@ -268,6 +268,122 @@ Its usage is the compaction request's, which read the conversation it replaced."
               (should (= (length delayed-warnings-list) 1))))
         (setq-default mode-line-format saved)))))
 
+(ert-deftest opencode-test-mode-line-fitted-once ()
+  "A mode line is fitted again only when what it shows, or its room, changed.
+It is redrawn on every streamed chunk, in every window showing the session."
+  (opencode-test-with-server
+    (opencode-test-with-held-timers
+      (let* ((renamed nil)
+             (opencode-test-routes
+              (cons (list 'get "\\`/api/agent\\'"
+                          (lambda (_)
+                            (let ((agents (opencode-test-fixture "agent.json")))
+                              (if renamed
+                                  `((data . ,(mapcar (lambda (agent)
+                                                       (if (equal (alist-get 'id agent) "plan")
+                                                           (cons '(name . "Planner") agent)
+                                                         agent))
+                                                     (alist-get 'data agents))))
+                                agents))))
+                    opencode-test-routes)))
+        (with-current-buffer (opencode-test-open (opencode-test-scenario "switch"))
+          (opencode-test-fetch-catalogs)
+          (opencode-test-run-timers)
+          (save-window-excursion
+            (delete-other-windows)
+            (set-window-buffer (selected-window) (current-buffer))
+            (let ((fits 0)
+                  (computed 0))
+              (cl-letf* ((fit (symbol-function 'opencode-mode-line-fit))
+                         ((symbol-function 'opencode-mode-line-fit)
+                          (lambda (&rest arguments) (cl-incf fits) (apply fit arguments)))
+                         (compute (symbol-function 'opencode--mode-line-compute-segments))
+                         ((symbol-function 'opencode--mode-line-compute-segments)
+                          (lambda () (cl-incf computed) (funcall compute))))
+                (cl-flet ((fits (expected)
+                            (setq fits 0)
+                            (opencode-mode-line)
+                            (should (= fits expected)))
+                          (title () (substring-no-properties (cadr (car (opencode-mode-line)))))
+                          (details () (substring-no-properties (cadr (opencode-mode-line)))))
+                  (fits 1)
+                  (fits 0)
+                  (should (eq (cadr (opencode-mode-line)) (cadr (opencode-mode-line))))
+                  (setq opencode-session-status 'busy)
+                  (fits 1)
+                  (should (string-prefix-p "\U000F051F" (title)))
+                  (fits 0)
+                  (setq opencode-pending-permissions (list (list :id "per_test")))
+                  (fits 1)
+                  (should (string-prefix-p "\U000F02D7" (title)))
+                  (setq opencode-pending-permissions nil)
+                  (fits 1)
+                  (setq opencode-session-agent "plan")
+                  (fits 1)
+                  (should (string-prefix-p "  Plan  " (details)))
+                  (rename-buffer "*OpenCode: renamed*" t)
+                  (fits 1)
+                  (should (string-suffix-p " renamed" (title)))
+                  (fits 0)
+                  (opencode-mode-line-flush)
+                  (fits 1)
+                  ;; Another location's catalog leaves the details alone.
+                  (setq computed 0)
+                  (opencode-catalog-fetch 'agent #'ignore (make-temp-file "opencode-location-" t))
+                  (fits 0)
+                  (should (zerop computed))
+                  ;; Its own location's catalog changing renews them.
+                  (setq renamed t)
+                  (opencode-test-dispatch
+                   `(((type . "agent.updated")
+                      (location (directory . ,(directory-file-name opencode-test-workspace))) (data))))
+                  (opencode-test-run-timers)
+                  (fits 1)
+                  (should (= computed 1))
+                  (should (string-prefix-p "  Planner  " (details)))
+                  ;; A narrower window has less room.
+                  (split-window-right)
+                  (fits 1)
+                  (fits 0))))))))))
+
+(ert-deftest opencode-test-mode-line-format-follows-default ()
+  "The adapted format follows the default one, even when changed in place."
+  (let ((mode-line-modes '("%[(" (:propertize ("" mode-name)) ("" mode-line-process) " ok" ")%]"))
+        (default (list "%e" 'mode-front-space 'mode-line-buffer-identification "   "
+                       'mode-line-modes 'mode-line-misc-info 'mode-line-end-spaces))
+        (saved (default-value 'mode-line-format)))
+    (setq-default mode-line-format default)
+    (unwind-protect
+        (progn
+          (should (memq 'mode-line-misc-info (opencode-mode-line-format)))
+          (should (eq (opencode-mode-line-format) (opencode-mode-line-format)))
+          (delq 'mode-line-misc-info default)
+          (should-not (memq 'mode-line-misc-info (opencode-mode-line-format)))
+          (setcar (last mode-line-modes) "]")
+          (should (equal (car (last (nth 3 (opencode-mode-line-format)))) "]")))
+      (setq-default mode-line-format saved))))
+
+(ert-deftest opencode-test-mode-line-follows-the-rest ()
+  "Whatever widens the rest of the mode line leaves the session details less room.
+Batch Emacs formats every mode line as an empty string."
+  :tags '(gui)
+  (skip-unless (display-graphic-p))
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open (opencode-test-scenario "switch"))
+      (opencode-test-fetch-catalogs)
+      (save-window-excursion
+        (delete-other-windows)
+        (set-window-buffer (selected-window) (current-buffer))
+        ;; Other tests may leave global modes with lighters behind.
+        (let* ((minor-mode-alist nil)
+               (mode-line-misc-info nil)
+               (before (cadr (opencode-mode-line))))
+          (should (string-match-p "GPT-6 Sol low" before))
+          (setq mode-line-misc-info (list (make-string (/ (window-width) 2) ?x)))
+          (should (< (length (cadr (opencode-mode-line))) (length before)))
+          (setq mode-line-misc-info nil)
+          (should (equal (cadr (opencode-mode-line)) before)))))))
+
 (ert-deftest opencode-test-mode-line-renders ()
   "A session buffer's mode line renders its title and agent.
 Batch Emacs formats every mode line as an empty string."
