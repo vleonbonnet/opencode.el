@@ -34,8 +34,10 @@
 ;; locations not found, and the calls of `opencode-mode-line' with their
 ;; cost.  It then checks that every open buffer shows what a buffer
 ;; rendering its whole transcript afresh shows, and measures a steady
-;; redisplay, unforced and with every mode line forced.  Results go to
-;; $BENCH_OUT as an alist.
+;; redisplay, unforced and with every mode line forced, and what the
+;; animated status icon of a running turn costs per tick, in one shown
+;; session buffer, then in all of them.  Results go to $BENCH_OUT as an
+;; alist.
 
 ;;; Code:
 
@@ -444,6 +446,11 @@ The value is an alist: the count, and the IDs of those that differ."
                     (/ (* 1e6 (- (float-time) start)) runs))))
         `((whole . ,(time #'opencode-mode-line))
           (status . ,(time #'opencode-mode-line-status))
+          (status-animated . ,(let ((opencode-session-status 'busy))
+                                (time #'opencode-mode-line-status)))
+          (whole-animated . ,(let ((opencode-session-status 'busy))
+                               (prog1 (time #'opencode-mode-line)
+                                 (opencode--mode-line-stop-animation))))
           (pending . ,(time #'opencode-pending-request-p))
           (rest-width . ,(let ((rest (format-mode-line (remove opencode-mode-line-element (opencode-mode-line-format)) t)))
                            (time (lambda () (opencode-mode-line-pixel-width rest)))))
@@ -453,6 +460,73 @@ The value is an alist: the count, and the IDs of those that differ."
                            (format-mode-line (remove opencode-mode-line-element (opencode-mode-line-format)) t))))
           (tab . ,(time (lambda () (format-mode-line (opencode-mode-line-tab "x ") t))))
           (whole-line . ,(time (lambda () (format-mode-line mode-line-format nil window)))))))))
+
+(defun bench-animation (count)
+  "Return what animating the icons of COUNT shown session buffers costs per tick.
+Their sessions are made to run a turn, so that their mode lines animate.
+The value is an alist: the windows and frames showing them; per tick,
+the seconds of the tick itself, of the redisplay it causes, and the
+calls of `opencode-mode-line' with their seconds, measured over 40
+ticks each followed by a redisplay; then the ticks of the timer over 3
+seconds left alone, the longest gap of a 10 ms timer and the mode-line
+calls meanwhile.  Their sessions are idle again after."
+  (let* ((buffers (seq-take (seq-filter (lambda (buffer)
+                                          (and (buffer-live-p buffer) (get-buffer-window buffer 'visible)))
+                                        bench-buffers)
+                            count))
+         (windows (seq-mapcat (lambda (buffer) (get-buffer-window-list buffer nil 'visible)) buffers))
+         (runs 40)
+         (ticks 0)
+         (tick-seconds 0)
+         (redisplay-seconds 0))
+    (opencode--mode-line-stop-animation)
+    (dolist (buffer buffers)
+      (with-current-buffer buffer
+        (setq opencode-session-status 'busy)
+        (force-mode-line-update)))
+    (redisplay t)
+    (setq bench-counts nil)
+    (dotimes (_ runs)
+      (let ((start (float-time)))
+        (opencode--mode-line-tick)
+        (cl-incf tick-seconds (- (float-time) start)))
+      (let ((start (float-time)))
+        (redisplay t)
+        (cl-incf redisplay-seconds (- (float-time) start))))
+    (let ((calls (or (alist-get 'mode-line-calls bench-counts) 0))
+          (seconds (or (alist-get 'mode-line-seconds bench-counts) 0))
+          (live nil))
+      ;; Then the timer alone, as the user has it, with input pending
+      ;; nowhere: how often it ticked and what it held the main thread.
+      (setq bench-counts nil
+            bench-last-tick nil)
+      (let ((count-ticks (lambda (&rest _) (cl-incf ticks)))
+            (gap-timer (run-at-time 0 0.01 #'bench-tick))
+            (deadline (+ (float-time) 3)))
+        (advice-add 'opencode--mode-line-tick :before count-ticks)
+        (unwind-protect
+            (while (< (float-time) deadline)
+              (sit-for 0.05))
+          (advice-remove 'opencode--mode-line-tick count-ticks)
+          (cancel-timer gap-timer))
+        (setq live `((ticks . ,ticks)
+                     (max-gap-seconds . ,(alist-get 'max-gap bench-counts))
+                     (mode-line-calls . ,(or (alist-get 'mode-line-calls bench-counts) 0))
+                     (mode-line-seconds . ,(or (alist-get 'mode-line-seconds bench-counts) 0)))))
+      (dolist (buffer buffers)
+        (with-current-buffer buffer
+          (setq opencode-session-status 'idle)
+          (force-mode-line-update)))
+      (redisplay t)
+      `((buffers . ,(length buffers))
+        (windows . ,(length windows))
+        (frames . ,(length (delete-dups (mapcar #'window-frame windows))))
+        (tick-seconds . ,(/ tick-seconds runs))
+        (redisplay-seconds . ,(/ redisplay-seconds runs))
+        (mode-line-calls . ,(/ calls (float runs)))
+        (mode-line-seconds . ,(/ seconds runs))
+        (mode-line-seconds-per-call . ,(if (zerop calls) 0 (/ seconds calls)))
+        (live-3s ,@live)))))
 
 (defun bench-run ()
   "Run the benchmark and write its results."
@@ -469,6 +543,8 @@ The value is an alist: the count, and the IDs of those that differ."
                     (push `(redisplay-unforced ,@(bench-redisplay nil)) bench-results)
                     (push `(redisplay-forced ,@(bench-redisplay t)) bench-results)
                     (push `(mode-line-parts-us ,@(bench-parts)) bench-results)
+                    (push `(animation-one ,@(bench-animation 1)) bench-results)
+                    (push `(animation-all ,@(bench-animation most-positive-fixnum)) bench-results)
                     (push `(windows . ,(length (seq-mapcat (lambda (frame) (window-list frame 'never))
                                                            (frame-list))))
                           bench-results)

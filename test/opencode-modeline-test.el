@@ -49,7 +49,7 @@
       (opencode-test-fetch-catalogs)
       (should (equal mode-line-format '((:eval (opencode-mode-line-format)))))
       (pcase-let ((`((" " ,title " ") ,details) (opencode-mode-line)))
-        (should (equal (substring-no-properties title) "\U000F05E0 switch"))
+        (should (equal (substring-no-properties title) "\uf10c switch"))
         (should (string-match-p "\\`  Build  GPT-6 Sol low  \uec81  .* [0-9]+%% \\'"
                                 (substring-no-properties details)))))))
 
@@ -62,7 +62,7 @@
         (should (equal (alist-get 'agent segments) "Build"))
         (should (equal (alist-get 'model segments) "GPT-6 Sol"))
         (should (equal (alist-get 'variant segments) "low"))
-        (should (eq (get-text-property 0 'face (alist-get 'variant segments)) 'success))
+        (should (eq (get-text-property 0 'face (alist-get 'variant segments)) 'opencode-setting-chosen))
         (should (equal (alist-get 'provider segments) "\uec81"))
         (should (equal (get-text-property 0 'help-echo (alist-get 'provider segments))
                        "Provider: OpenAI (openai)"))
@@ -74,12 +74,12 @@
       (let ((opencode-default-variant-function (lambda (_provider _model) (quote medium))))
         (let ((variant (alist-get 'variant (opencode-mode-line-segments))))
           (should (equal variant "medium"))
-          (should (eq (get-text-property 0 'face variant) 'shadow))))
+          (should (eq (get-text-property 0 'face variant) 'opencode-setting-inherited))))
       ;; By default, the variant sending the effort a request without one sends.
       (let ((opencode-session-model '((id . "gpt-5.5") (providerID . "openai"))))
         (let ((variant (alist-get 'variant (opencode-mode-line-segments))))
           (should (equal variant "medium"))
-          (should (eq (get-text-property 0 'face variant) 'shadow))
+          (should (eq (get-text-property 0 'face variant) 'opencode-setting-inherited))
           (should (equal (get-text-property 0 'help-echo variant) "Variant: medium (default)")))
         (let ((opencode-default-variant-function nil))
           (should (equal (get-text-property 0 'help-echo (alist-get 'variant (opencode-mode-line-segments)))
@@ -114,7 +114,9 @@
       (setq opencode-session-tokens 280000)
       (should (equal (opencode-long-context-tier model '((cost))) '(over 272000 "2×")))
       (should (equal (opencode-long-context-description '(over 272000 "2×"))
-                     "Context over 272k: requests cost 2×")))
+                     "Past 272k tokens: requests cost 2×"))
+      (should (equal (opencode-long-context-description '(near 272000 "2×") 250000 t)
+                     "Estimated near 272k tokens, past which requests cost 2×")))
     (should (equal (opencode-long-context-threshold '((id . "big") (providerID . "acme")) priced)
                    '(200000 . "2×")))))
 
@@ -168,7 +170,7 @@ Its usage is the compaction request's, which read the conversation it replaced."
           (should opencode-session-tokens-estimated)
           (should (equal (context) "\U000F0A9E ~1%"))
           (should (equal (get-text-property 0 'help-echo (context))
-                         (concat "Context: ~4k/400k tokens\n"
+                         (concat "Context: ~4.2k of 400k tokens (1%)\n"
                                  "Estimated by the service after compaction; the next step measures it")))
           (opencode-test-dispatch (list (opencode-test-step-ended id 4900)))
           (should (equal (context) "\U000F0A9E 1%"))
@@ -237,8 +239,8 @@ Its usage is the compaction request's, which read the conversation it replaced."
             (should-not opencode--long-context-notified)
             (let ((context (alist-get 'context (opencode-mode-line-segments))))
               (should (equal context "\U000F0AA3 ~72% 2×"))
-              (should (eq (get-text-property 0 'face context) 'error))
-              (should (string-suffix-p "\nContext estimated over 272k: requests may cost 2×"
+              (should (eq (get-text-property 0 'face context) 'opencode-context-over))
+              (should (string-suffix-p "\nEstimated past 272k tokens: requests cost 2×"
                                        (get-text-property 0 'help-echo context))))
             ;; Reopened on the estimate, the next step past the tier still reports it.
             (opencode--long-context-replayed)
@@ -311,7 +313,14 @@ It is redrawn on every streamed chunk, in every window showing the session."
                   (should (eq (cadr (opencode-mode-line)) (cadr (opencode-mode-line))))
                   (setq opencode-session-status 'busy)
                   (fits 1)
-                  (should (string-prefix-p "\U000F051F" (title)))
+                  ;; A running turn's icon is a frame of its animation, and
+                  ;; the next frame fits nothing again.
+                  (let ((frames (alist-get 'working opencode-session-status-animations)))
+                    (cl-letf (((symbol-function 'opencode-session-status-frame-index) (lambda (&rest _) 0)))
+                      (should (string-prefix-p (nth 0 frames) (title))))
+                    (cl-letf (((symbol-function 'opencode-session-status-frame-index) (lambda (&rest _) 3)))
+                      (fits 0)
+                      (should (string-prefix-p (nth 3 frames) (title)))))
                   (fits 0)
                   (setq opencode-pending-permissions (list (list :id "per_test")))
                   (fits 1)
@@ -396,6 +405,174 @@ Batch Emacs formats every mode line as an empty string."
       (let ((text (format-mode-line mode-line-format nil nil (current-buffer))))
         (should (string-match-p "switch" text))
         (should (string-match-p "Build" text))))))
+
+(ert-deftest opencode-test-mode-line-status-shares-the-look ()
+  "The mode line's icon is the session's status as every display of sessions shows it.
+Subagents in the middle of a turn and the archive follow it, as in lists."
+  (opencode-test-with-server
+    (opencode-test-with-held-timers
+      (let ((id (opencode-test-scenario "switch")))
+        (with-current-buffer (opencode-test-open id)
+          (cl-flet ((icons () (substring-no-properties (plist-get (opencode--mode-line-status) :still)))
+                    (face () (get-text-property 0 'face (plist-get (opencode--mode-line-status) :still)))
+                    (help () (get-text-property 0 'help-echo (plist-get (opencode--mode-line-status) :still))))
+            (should (equal (icons) "\uf10c"))
+            (should (eq (face) 'opencode-session-status-idle))
+            ;; Its own request, then only a subagent's.
+            (setq opencode-pending-permissions (list (list :id "per_test")))
+            (should (equal (icons) "\U000F02D7"))
+            (should (eq (face) 'opencode-session-status-waiting))
+            (should (equal (help) "Waiting for your answer"))
+            (setq opencode-pending-permissions nil
+                  opencode--pending-children (list "ses_child"))
+            (should (equal (icons) (concat "\uf10c " (opencode-subagent-glyph 'waiting))))
+            (setq opencode--pending-children nil)
+            ;; What the registry tells: a turn ended unseen, subagents at
+            ;; any depth at work, the archive.
+            (let ((entry (opencode-state--info-entry opencode-session-info)))
+              (opencode-state--store id (plist-put (plist-put (copy-sequence entry) :idle 2.0) :viewed 1.0))
+              (should (equal (icons) "\U000F05E0"))
+              (should (eq (face) 'opencode-session-status-done))
+              (opencode-state--store "ses_child" (opencode-state--make-entry :id "ses_child" :parent-id id
+                                                                             :running t))
+              (should (equal (icons) (concat "\U000F05E0 " (opencode-subagent-glyph 'working))))
+              (opencode-state--store "ses_grandchild"
+                                     (opencode-state--make-entry
+                                      :id "ses_grandchild" :parent-id "ses_child" :running t
+                                      :requests '((:kind question :id "frm_test" :time 1.0))))
+              (should (equal (icons) (concat "\U000F05E0 " (opencode-subagent-glyph 'waiting)
+                                             " " (opencode-subagent-glyph 'working))))
+              (opencode-state--store "ses_child" nil)
+              (opencode-state--store "ses_grandchild" nil)
+              (opencode-state--store id (plist-put (copy-sequence (opencode-state-get id)) :archived 3.0))
+              (should (equal (icons) (concat "\U000F05E0 " opencode-archived-icon))))
+            ;; A turn waiting to retry turns the clock, its tooltip telling why.
+            (setq opencode-session-status 'busy
+                  opencode-session-retry '((attempt . 2) (error (message . "rate limited"))))
+            (let ((status (opencode--mode-line-status)))
+              (should (equal (substring-no-properties (plist-get status :still) 0 1) "\uf021"))
+              (should (equal (mapcar (lambda (frame) (substring-no-properties frame 0 1)) (plist-get status :frames))
+                             (alist-get 'retrying opencode-session-status-animations)))
+              (should (equal (get-text-property 0 'help-echo (car (plist-get status :frames)))
+                             "Retry #2: rate limited")))))))))
+
+(ert-deftest opencode-test-mode-line-animates ()
+  "A running turn's icon turns from one timer, while a window of a visible frame shows it.
+A tick updates the mode lines of the buffers animated, and only those."
+  (opencode-test-with-server
+    (opencode-test-with-held-timers
+      (let ((one (opencode-test-open (opencode-test-scenario "switch")))
+            (two (opencode-test-open (opencode-test-scenario "text")))
+            (other (get-buffer-create " *opencode-test-other*"))
+            (forced nil))
+        (unwind-protect
+            (cl-letf (((symbol-function 'force-mode-line-update)
+                       (lambda (&optional all) (push (if all 'all (current-buffer)) forced))))
+              (save-window-excursion
+                (delete-other-windows)
+                (set-window-buffer (selected-window) one)
+                (set-window-buffer (split-window) two)
+                (cl-flet ((draw (buffer)
+                            (with-selected-window (get-buffer-window buffer)
+                              (opencode-mode-line)))
+                          (ticks ()
+                            (seq-filter (lambda (timer) (eq (timer--function timer) #'opencode--mode-line-tick))
+                                        opencode-test-timers)))
+                  ;; Idle, nothing animates.
+                  (draw one)
+                  (should-not (ticks))
+                  (should-not opencode--mode-line-animation-timer)
+                  (dolist (buffer (list one two))
+                    (with-current-buffer buffer
+                      (setq opencode-session-status 'busy))
+                    (draw buffer))
+                  (should (= (length (ticks)) 1))
+                  (should (seq-set-equal-p opencode--mode-line-animated (list one two)))
+                  (setq forced nil)
+                  (opencode--mode-line-tick)
+                  (should (seq-set-equal-p forced (list one two)))
+                  ;; Hidden, a buffer is dropped until drawn again.
+                  (set-window-buffer (get-buffer-window two) other)
+                  (setq forced nil)
+                  (opencode--mode-line-tick)
+                  (should (equal forced (list one)))
+                  (should (equal opencode--mode-line-animated (list one)))
+                  ;; Drawn still once its turn ended, the last one stops the timer.
+                  (with-current-buffer one
+                    (setq opencode-session-status 'idle))
+                  (draw one)
+                  (setq forced nil)
+                  (opencode--mode-line-tick)
+                  (should-not forced)
+                  (should-not opencode--mode-line-animated)
+                  (should-not opencode--mode-line-animation-timer)
+                  (opencode--mode-line-tick)
+                  ;; Without animations, a running turn's icon stays still.
+                  (let ((opencode-session-status-animation-interval nil))
+                    (with-current-buffer one
+                      (setq opencode-session-status 'busy))
+                    (setq opencode-test-timers nil)
+                    (should (equal (substring-no-properties (cadr (car (draw one))) 0 1) "\U000F051F"))
+                    (should-not (ticks)))
+                  ;; A pace changed while it ticks: the mode lines start anew at it.
+                  (draw one)
+                  (should opencode--mode-line-animation-timer)
+                  (let ((opencode-session-status-animation-interval 0.5))
+                    (setq forced nil)
+                    (opencode--mode-line-tick)
+                    (should (equal forced (list one)))
+                    (should-not opencode--mode-line-animation-timer)))))
+          (kill-buffer other))))))
+
+(ert-deftest opencode-test-mode-line-follows-the-registry ()
+  "A registry change updates the mode lines whose icons it changes, and only those."
+  (opencode-test-with-server
+    (opencode-test-with-held-timers
+      (let* ((id (opencode-test-scenario "switch"))
+             (one (opencode-test-open id))
+             (two (opencode-test-open (opencode-test-scenario "text")))
+             (forced nil))
+        (cl-letf (((symbol-function 'force-mode-line-update)
+                   (lambda (&optional all) (push (if all 'all (current-buffer)) forced))))
+          (save-window-excursion
+            (delete-other-windows)
+            (set-window-buffer (selected-window) one)
+            (set-window-buffer (split-window) two)
+            (dolist (buffer (list one two))
+              (with-selected-window (get-buffer-window buffer)
+                (opencode-mode-line)))
+            (opencode-test-run-timers)
+            (setq forced nil)
+            (opencode-state--store "ses_child" (opencode-state--make-entry :id "ses_child" :parent-id id
+                                                                           :running t))
+            (opencode-state--store "ses_unrelated" (opencode-state--make-entry :id "ses_unrelated"
+                                                                               :running t))
+            ;; One check for any number of changes in a tick.
+            (should (= (opencode-test-run-timers) 1))
+            (should (equal forced (list one)))
+            (setq forced nil)
+            (opencode-state--store "ses_unrelated" nil)
+            (opencode-test-run-timers)
+            (should-not forced)))))))
+
+(ert-deftest opencode-test-mode-line-frames-keep-room ()
+  "Every frame of an animated icon takes the room of its still string, to the pixel.
+Batch Emacs measures characters, not pixels."
+  :tags '(gui)
+  (skip-unless (display-graphic-p))
+  (opencode-test-with-server
+    (opencode-test-with-held-timers
+      (with-current-buffer (opencode-test-open (opencode-test-scenario "switch"))
+        (dolist (kind '(working retrying))
+          (setq opencode-session-status 'busy
+                opencode-session-retry (and (eq kind 'retrying) '((attempt . 1)))
+                opencode--mode-line-status nil)
+          (let* ((status (opencode--mode-line-status))
+                 (still (opencode--mode-line-measure (plist-get status :still))))
+            (should (= (length (plist-get status :frames))
+                       (length (alist-get kind opencode-session-status-animations))))
+            (dolist (frame (plist-get status :frames))
+              (should (= (opencode--mode-line-measure frame) still)))))))))
 
 (provide 'opencode-modeline-test)
 ;;; opencode-modeline-test.el ends here

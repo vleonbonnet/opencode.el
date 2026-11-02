@@ -118,6 +118,16 @@ with nil instead: clients then read the registry again."
 (defvar opencode-state--sessions (make-hash-table :test #'equal)
   "Session IDs mapped to their registry entries.")
 
+(defvar opencode-state--children (make-hash-table :test #'equal)
+  "Session IDs mapped to the IDs of their subagents the registry holds.
+Kept as entries are stored, so that a session's subagents are found
+without going through every entry, at every redisplay of a mode line.")
+
+(defvar opencode-state--revision 0
+  "Count of the changes of registry entries.
+Values derived from several entries, such as what a session's
+subagents do, are kept until it changes.")
+
 (defvar opencode-state--stream 'none
   "Event stream process whose `server.connected' the registry last handled.
 Events are applied only while they come from this stream.")
@@ -358,6 +368,26 @@ children."
             (setq queue (append queue (gethash child children)))))))
     (nreverse descendants)))
 
+(defun opencode-state-subagent-statuses (id)
+  "Return the statuses of the subagents of session ID in the middle of a turn.
+Subagents at any depth count, those the registry holds; the value lists
+each of `waiting', `working' and `retrying' at most once, nil when no
+subagent is in the middle of a turn.  It costs the subagents of ID, not
+every entry."
+  (let ((seen (make-hash-table :test #'equal))
+        (queue (gethash id opencode-state--children))
+        (statuses nil))
+    (puthash id t seen)
+    (while queue
+      (let ((child (pop queue)))
+        (unless (gethash child seen)
+          (puthash child t seen)
+          (let ((status (opencode-state-status child)))
+            (when (memq status '(waiting working retrying))
+              (cl-pushnew status statuses)))
+          (setq queue (append (gethash child opencode-state--children) queue)))))
+    statuses))
+
 (defun opencode-state--entry (entry-or-id)
   "Return ENTRY-OR-ID's entry: itself, or the entry of that session ID."
   (if (stringp entry-or-id) (opencode-state-get entry-or-id) entry-or-id))
@@ -463,6 +493,17 @@ when only one changed, else with nil.  A batch within a batch joins it."
   "Make ENTRY the entry of session ID, nil removing it, and run the hooks on a change."
   (let ((old (gethash id opencode-state--sessions)))
     (unless (equal old entry)
+      (cl-incf opencode-state--revision)
+      (let ((old-parent (plist-get old :parent-id))
+            (parent (plist-get entry :parent-id)))
+        (unless (and old entry (equal old-parent parent))
+          (when old-parent
+            (let ((siblings (delete id (gethash old-parent opencode-state--children))))
+              (if siblings
+                  (puthash old-parent siblings opencode-state--children)
+                (remhash old-parent opencode-state--children))))
+          (when (and entry parent)
+            (push id (gethash parent opencode-state--children)))))
       (if entry
           (puthash id entry opencode-state--sessions)
         (remhash id opencode-state--sessions)

@@ -1,5 +1,6 @@
 #!/bin/sh
-# Measure a reconnection of the event stream in a GUI Emacs.
+# Measure a reconnection of the event stream in a GUI Emacs, and the
+# animated status icons of mode lines (BENCH_RECONNECTS=0 for those alone).
 #
 # Usage: dev/bench/run.sh SOURCES OUT
 #

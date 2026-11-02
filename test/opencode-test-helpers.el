@@ -271,6 +271,7 @@ They are real timer objects, which `timerp' recognizes, never scheduled."
   "Run BODY with an empty session registry of its own, never bootstrapped."
   (declare (indent 0) (debug t))
   `(let ((opencode-state--sessions (make-hash-table :test #'equal))
+         (opencode-state--children (make-hash-table :test #'equal))
          (opencode-state--stream 'none)
          (opencode-events--greeted nil)
          (opencode-state--ready nil)
@@ -350,6 +351,9 @@ session registry starts empty and follows events once a test dispatches
              (opencode-alerted-sessions nil)
              (opencode-test-notifications nil)
              (opencode-test-dismissed-notifications nil)
+             (opencode--mode-line-animated nil)
+             (opencode--mode-line-animation-timer nil)
+             (opencode--mode-line-registry-timer nil)
              (opencode-notification-messages-filter nil)
              (opencode-notification-os-filter t)
              (opencode-notify-os-function (lambda (notification)
@@ -363,6 +367,9 @@ session registry starts empty and follows events once a test dispatches
                    ((symbol-function 'pop-to-buffer) (lambda (&rest _) (ert-fail "Unexpected pop-to-buffer")))
                    ((symbol-function 'switch-to-buffer) (lambda (&rest _) (ert-fail "Unexpected switch"))))
            (unwind-protect (progn ,@body)
+             (dolist (timer (list opencode--mode-line-animation-timer opencode--mode-line-registry-timer))
+               (when (timerp timer)
+                 (cancel-timer timer)))
              (maphash (lambda (_id buffer) (when (buffer-live-p buffer) (kill-buffer buffer)))
                       opencode-session-buffers)))))))
 

@@ -47,6 +47,7 @@
 (require 'diff)
 (require 'diff-mode)
 (require 'opencode-common)
+(require 'opencode-look)
 (require 'opencode-render)
 
 (defcustom opencode-tool-summary-max-width 500
@@ -267,8 +268,9 @@ permission to expand it."
       full)))
 
 (defun opencode-pending-prompt-icon ()
-  "Return the question mark of a block waiting on the user."
-  (propertize "\U000F02D7" 'face 'opencode-attention 'font-lock-face 'opencode-attention)) ; nf-md-help_circle
+  "Return the icon of a block waiting on the user: that of the waiting status.
+See `opencode-session-status-icons'."
+  (opencode-session-status-glyph 'waiting))
 
 (defun opencode-tool-error-info (error)
   "Return (KIND . SOURCE) describing tool ERROR, an alist with `type' and `message'."

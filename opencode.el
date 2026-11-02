@@ -7,7 +7,7 @@
 ;;         Valentin Leon <valentin@leon.click>
 ;; Maintainer: Valentin Leon <valentin@leon.click>
 ;; Keywords: tools, llm, opencode
-;; Version: 2.0.0
+;; Version: 2.1.0
 ;; Package-Requires: ((emacs "31.1") (plz "0.9") (transient "0.7"))
 ;; URL: https://github.com/vleonbonnet/opencode.el
 
@@ -38,6 +38,7 @@
 ;;; Code:
 
 (require 'opencode-common)
+(require 'opencode-look)
 (require 'opencode-service)
 (require 'opencode-http)
 (require 'opencode-events)

@@ -248,37 +248,13 @@ sorted by its display sort function, then affixed."
 
 ;;;; Session pickers
 
-(ert-deftest opencode-test-session-status-icons ()
-  "Every status has a one-glyph icon in its own face, named by its tooltip."
-  (dolist (status '(waiting working retrying failed done idle))
-    (let ((icon (opencode-session-status-icon status)))
-      (should (= (length icon) 1))
-      (should (eq (get-text-property 0 'face icon)
-                  (intern (format "opencode-session-status-%s" status))))
-      (should (facep (get-text-property 0 'face icon)))
-      (should (equal (get-text-property 0 'help-echo icon) (symbol-name status)))))
-  (should (equal (opencode-session-status-icon nil) "-")))
-
-(ert-deftest opencode-test-session-status-icons-default ()
-  "The icons default to the Nerd Font ones drover uses, one column wide each."
-  (let ((default (eval (car (get 'opencode-session-status-icons 'standard-value)) t)))
-    (should (equal (mapcar (lambda (entry) (cons (car entry) (cadr entry))) default)
-                   '((waiting . "\U000F02D7")     ; nf-md-help_circle
-                     (working . "\U000F051F")     ; nf-md-timer_sand
-                     (retrying . "\uf021")        ; nf-fa-refresh
-                     (failed . "\uf057")          ; nf-fa-times_circle
-                     (done . "\U000F05E0")        ; nf-md-check_circle
-                     (idle . "\uf10c"))))         ; nf-fa-circle_o
-    (dolist (entry default)
-      (should (= (char-width (string-to-char (cadr entry))) 1))
-      (should (eq (caddr entry) (intern (format "opencode-session-status-%s" (car entry))))))))
-
 (ert-deftest opencode-test-read-session-annotations ()
   "A picker shows each session's status icon, title, project, branch and age, newest first."
   (let* ((root (file-name-as-directory (make-temp-file "opencode-picker-" t)))
          (repo (expand-file-name "repo/" root))
          (opencode--branches (make-hash-table :test #'equal))
-         (now (float-time)))
+         ;; Whole seconds, which the milliseconds of the service keep.
+         (now (ffloor (float-time))))
     (unwind-protect
         (opencode-test-with-server
           (opencode-test-make-head repo "ref: refs/heads/topic\n")
@@ -303,7 +279,7 @@ sorted by its display sort function, then affixed."
                                 :project-id "repo" :running t :updated (- now 10))
                        opencode-state--sessions)
               (opencode-test-picking (opencode-test-choose "Renamed")
-                ;; Ages under a minute show hundredths: the clock must not move under them.
+                ;; Ages under a minute show seconds: the clock must not move under them.
                 (should (eq (cl-letf* ((real (symbol-function 'float-time))
                                        ((symbol-function 'float-time)
                                         (lambda (&optional time) (if time (funcall real time) now))))
@@ -332,7 +308,7 @@ sorted by its display sort function, then affixed."
                                  (concat "\\` +" (regexp-quote project) " +" (regexp-quote branch)
                                          " +\\(.+\\)\\'")
                                  suffix))
-                        (should (equal (match-string 1 suffix) (opencode-format-time-ago age))))))
+                        (should (equal (match-string 1 suffix) (opencode-format-duration age))))))
                   ;; The columns line up, whatever the widths of titles and projects.
                   (cl-flet ((aligned (regexp)
                               (= 1 (length (seq-uniq
@@ -551,6 +527,34 @@ sorted by its display sort function, then affixed."
         (opencode-test-picking (lambda (_) (ert-fail "Asked"))
           (opencode-select-open-session))
         (should-not shown)))))
+
+(ert-deftest opencode-test-pickers-tell-place-and-archive ()
+  "A picked session's title tells where it is in Emacs, and an archived one shows the archive's icon."
+  (opencode-test-with-sessions
+    (let* ((id (opencode-test-scenario "text"))
+           (first (opencode-test-open id))
+           (second (opencode-test-open (opencode-test-scenario "reasoning")))
+           (entry (or (opencode-state-get id)
+                      (opencode-state--info-entry (buffer-local-value 'opencode-session-info first)))))
+      (opencode-state--store id (plist-put (copy-sequence entry) :archived 1.0))
+      (save-window-excursion
+        (delete-other-windows)
+        (set-window-buffer (selected-window) second)
+        (opencode-test-picking (opencode-test-choose "text")
+          (cl-letf (((symbol-function 'switch-to-buffer) #'ignore))
+            (opencode-select-open-session))
+          (let ((rows (plist-get (car opencode-test-offers) :rows)))
+            (should (eq (get-text-property 0 'face (car (assoc "reasoning" rows))) 'opencode-session-active))
+            (should (eq (get-text-property 0 'face (car (assoc "text" rows))) 'opencode-session-open))
+            (should (equal (substring-no-properties (cadr (assoc "text" rows)))
+                           (concat (opencode-session-status-icon 'done) " " opencode-archived-icon " ")))
+            (should-not (string-search opencode-archived-icon (cadr (assoc "reasoning" rows))))))
+        (set-window-buffer (split-window) first)
+        (opencode-test-picking (opencode-test-choose "text")
+          (cl-letf (((symbol-function 'switch-to-buffer) #'ignore))
+            (opencode-select-open-session))
+          (should (eq (get-text-property 0 'face (car (assoc "text" (plist-get (car opencode-test-offers) :rows))))
+                      'opencode-session-shown)))))))
 
 (ert-deftest opencode-test-select-idle-and-child-sessions ()
   "The idle and subagent pickers are annotated session pickers too."

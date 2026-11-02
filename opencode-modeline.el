@@ -23,16 +23,19 @@
 ;; Session buffers get their own `mode-line-format', derived from the
 ;; default one at each redisplay so later changes to the default (moody,
 ;; minions, a global status) reach them too.  The status icon comes first
-;; and is the only status shown, because it always stays visible: idle,
-;; busy, or a question mark when the session or one of its subagents
-;; waits on an answer.  The session title follows, inside a moody tab when
-;; moody is in use, without the `*OpenCode: ...*' wrapper the buffer name
-;; keeps for buffer completion.  Then come the agent (in its configured
-;; color, else a stable theme face), the model, the variant (green when
-;; selected, dim when inherited), the provider as an icon and the context
-;; use as a filling pie.  The mode name, `mode-line-process' and the
-;; modified and remote flags, always `**-' in a Comint buffer, are left
-;; out.
+;; and is the only status shown, because it always stays visible: the
+;; icon of the session's status as every display of sessions shows it
+;; (see opencode-look.el), animated while a turn runs, followed by the
+;; icons of subagents in the middle of a turn, waiting on an answer or
+;; working, and of the archive.  The session title follows, inside a
+;; moody tab when moody is in use, without the `*OpenCode: ...*' wrapper
+;; the buffer name keeps for buffer completion.  Then come the agent (in
+;; its configured color, else a stable theme face), the model, the
+;; variant (in `opencode-setting-chosen' when selected,
+;; `opencode-setting-inherited' when inherited), the provider as an icon
+;; and the context use as a filling pie.  The mode name,
+;; `mode-line-process' and the modified and remote flags, always `**-'
+;; in a Comint buffer, are left out.
 ;;
 ;; Session windows are often 76 to 120 columns wide, so the title and
 ;; details are fitted to what the rest of the mode line leaves, in pixels:
@@ -56,6 +59,7 @@
 (require 'opencode-blocks)
 (require 'opencode-common)
 (require 'opencode-display)
+(require 'opencode-look)
 (require 'opencode-requests)
 (require 'opencode-session)
 
@@ -98,30 +102,226 @@ Compacting replaced the context that crossed it."
 
 ;;;; Segments
 
-(defvar-local opencode--mode-line-status nil
-  "(KEY . ICON) of the status icon last made.")
+;;;; Status
 
-(defun opencode-mode-line-status ()
-  "Return the status icon of this session.
-The icon is made again only when what it shows changed, as the mode
-line is redrawn on every streamed chunk."
-  (let* ((pending (and (opencode-pending-request-p) t))
-         (key (list pending opencode-session-status opencode-session-retry)))
+;; The status icon is that of the session's status, as every display of
+;; sessions shows it (see opencode-look.el), followed by the icons of
+;; subagents in the middle of a turn and of the archive.  A working or
+;; retrying session's icon is animated: every frame takes the room of
+;; the widest, so that the fitted title and details stay as they are and
+;; only the icon changes.  One timer changes frames for every mode line
+;; that animates, by updating the mode lines of the buffers it shows,
+;; and only while a window of a visible frame shows them: a mode line
+;; drawn with an animated icon asks for it again, and nothing ticks once
+;; none is shown.
+
+(defvar opencode--mode-line-flushes)
+
+(defvar-local opencode--mode-line-registry nil
+  "(KEY . PART) of what the registry tells this session's mode line.
+See `opencode--mode-line-registry-part'.")
+
+(defun opencode--mode-line-registry-part ()
+  "Return what the registry tells of this session for its mode line.
+The value is (STATUS SUBAGENTS ARCHIVED): STATUS, `failed' or `done' when
+its last turn ended unseen, else nil; SUBAGENTS, the kinds of
+`opencode-subagent-icons' its subagents are in, `waiting' first; and
+ARCHIVED, non-nil when it is archived.  It is made again only when the
+registry changed."
+  (let ((key (cons opencode-session-id opencode-state--revision)))
+    (if (equal key (car opencode--mode-line-registry))
+        (cdr opencode--mode-line-registry)
+      (let* ((entry (and opencode-session-id (opencode-state-get opencode-session-id)))
+             (status (and entry (opencode-state-status entry)))
+             (subagents (and opencode-session-id (opencode-state-subagent-statuses opencode-session-id)))
+             (part (list (and (memq status '(failed done)) status)
+                         (delq nil (list (and (memq 'waiting subagents) 'waiting)
+                                         (and (or (memq 'working subagents) (memq 'retrying subagents))
+                                              'working)))
+                         (and entry (plist-get entry :archived) t))))
+        (setq opencode--mode-line-registry (cons key part))
+        part))))
+
+(defun opencode--mode-line-own-request-p ()
+  "Return non-nil when this session itself waits on a request of the user."
+  (seq-some (lambda (provider) (plist-get (funcall provider) :pending)) opencode-request-providers))
+
+(defun opencode--mode-line-help (kind)
+  "Return the tooltip of the status icon of this session, of status KIND."
+  (pcase kind
+    ('waiting "Waiting for your answer")
+    ('retrying (if-let* ((retry opencode-session-retry))
+                   (format "Retry #%s: %s" (alist-get 'attempt retry)
+                           (alist-get 'message (alist-get 'error retry)))
+                 "Retrying"))
+    ('working "Busy")
+    (_ (opencode-session-status-label kind))))
+
+(defun opencode--mode-line-pad (pixels)
+  "Return a space PIXELS wide, or \"\" when PIXELS is not positive."
+  (if (> pixels 0)
+      (propertize " " 'display `(space :width (,pixels)))
+    ""))
+
+(defun opencode--mode-line-measure (string)
+  "Return the width in pixels of STRING drawn in the mode line."
+  (let ((copy (copy-sequence string)))
+    (add-face-text-property 0 (length copy) 'mode-line t copy)
+    (opencode-mode-line-pixel-width copy)))
+
+(defvar-local opencode--mode-line-status nil
+  "(KEY . STATUS) of the status last made, see `opencode--mode-line-status-make'.")
+
+(defun opencode--mode-line-status-make (kind subagents archived)
+  "Return the status of this session's mode line, as a plist.
+KIND is its status, SUBAGENTS and ARCHIVED as `opencode--mode-line-registry-part'
+returns them.  :still is the status as a still string, its icon padded
+to the cell of every frame; :frames, the strings of the frames of an
+animated icon, each padded to that cell, or nil.  Each is followed by
+the icons of SUBAGENTS and ARCHIVED, and escaped for the mode line."
+  (let* ((help (opencode--mode-line-help kind))
+         (icon (propertize (opencode-session-status-glyph kind) 'help-echo help))
+         (frames (mapcar (lambda (frame) (propertize frame 'help-echo help))
+                         (opencode-session-status-frames kind)))
+         (widths (mapcar #'opencode--mode-line-measure (cons icon frames)))
+         (cell (apply #'max widths))
+         (tail (concat (mapconcat (lambda (kind)
+                                    (concat " " (propertize (opencode-subagent-glyph kind)
+                                                            'help-echo (if (eq kind 'waiting)
+                                                                           "Subagents wait for your answer"
+                                                                         "Subagents work"))))
+                                  subagents "")
+                       (and archived
+                            (concat " " (propertize (opencode-archived-glyph) 'help-echo "Archived"))))))
+    (cl-flet ((padded (string width)
+                (opencode-mode-line-escape
+                 (concat string (opencode--mode-line-pad (- cell width)) tail))))
+      (list :still (padded icon (car widths))
+            :frames (cl-mapcar #'padded frames (cdr widths))))))
+
+(defun opencode--mode-line-status ()
+  "Return the status of this session's mode line; see `opencode--mode-line-status-make'.
+It is made again only when what it shows changed, as the mode line is
+redrawn on every streamed chunk, and on every frame of an animation."
+  (pcase-let* ((`(,status ,subagents ,archived) (opencode--mode-line-registry-part))
+               ;; Its buffer knows a subagent's request before the registry.
+               (subagents (if (and opencode--pending-children (not (memq 'waiting subagents)))
+                              (cons 'waiting subagents)
+                            subagents))
+               (kind (cond ((opencode--mode-line-own-request-p) 'waiting)
+                           ((eq opencode-session-status 'busy)
+                            (if opencode-session-retry 'retrying 'working))
+                           (status)
+                           (t 'idle)))
+               (key (list kind subagents archived opencode-session-retry
+                          (window-font-width nil 'mode-line) opencode--mode-line-flushes
+                          opencode-session-status-icons opencode-session-status-animations
+                          opencode-session-status-animation-interval opencode-subagent-icons
+                          opencode-archived-icon)))
     (if (equal key (car opencode--mode-line-status))
         (cdr opencode--mode-line-status)
-      (let ((icon (cond (pending
-                         (propertize (opencode-pending-prompt-icon) 'help-echo "Waiting for your answer"))
-                        ((eq opencode-session-status 'busy)
-                         (propertize "\U000F051F" ; nf-md-timer_sand
-                                     'face 'opencode-tool-running-margin
-                                     'help-echo (if-let* ((retry opencode-session-retry))
-                                                    (format "Retry #%s: %s" (alist-get 'attempt retry)
-                                                            (alist-get 'message (alist-get 'error retry)))
-                                                  "Busy")))
-                        (t (propertize "\U000F05E0" 'face 'success 'help-echo "Idle"))))) ; nf-md-check_circle
+      (let ((made (opencode--mode-line-status-make kind subagents archived)))
         ;; A copy, so a value later changed in place does not match it.
-        (setq opencode--mode-line-status (cons (copy-tree key) icon))
-        icon))))
+        (setq opencode--mode-line-status (cons (copy-tree key) made))
+        made))))
+
+(defun opencode-mode-line-status ()
+  "Return the status icon of this session as its mode line shows it now.
+That is the icon of its status, see `opencode-session-status-icons', or
+the frame of its animation the clock tells, followed by the icons of
+its subagents in the middle of a turn and of the archive."
+  (let* ((status (opencode--mode-line-status))
+         (frames (plist-get status :frames)))
+    (if frames
+        (nth (opencode-session-status-frame-index (length frames)) frames)
+      (plist-get status :still))))
+
+(defvar-local opencode--mode-line-animating nil
+  "Non-nil while this buffer's mode line was last drawn with an animated icon.")
+
+(defvar opencode--mode-line-animated nil
+  "Session buffers whose mode line was drawn with an animated icon.")
+
+(defvar opencode--mode-line-animation-timer nil
+  "Timer showing the next frame of the animated icons of mode lines.")
+
+(defvar opencode--mode-line-animation-pace nil
+  "Seconds between the ticks of `opencode--mode-line-animation-timer'.")
+
+(defun opencode--mode-line-animate ()
+  "Have the mode line of this buffer show the next frame of its icon."
+  (unless (memq (current-buffer) opencode--mode-line-animated)
+    (push (current-buffer) opencode--mode-line-animated))
+  (unless (timerp opencode--mode-line-animation-timer)
+    (setq opencode--mode-line-animation-pace opencode-session-status-animation-interval
+          opencode--mode-line-animation-timer
+          (run-at-time (opencode-session-status-frame-delay)
+                       opencode-session-status-animation-interval
+                       #'opencode--mode-line-tick))))
+
+(defun opencode--mode-line-stop-animation ()
+  "Stop the timer of the animated icons of mode lines."
+  (when (timerp opencode--mode-line-animation-timer)
+    (cancel-timer opencode--mode-line-animation-timer))
+  (setq opencode--mode-line-animation-timer nil
+        opencode--mode-line-animated nil))
+
+(defun opencode--mode-line-tick ()
+  "Show the next frame in the mode lines that animate an icon and show.
+Only the mode lines of the buffers shown in a window of a visible frame
+are updated, with `force-mode-line-update' in each, never every mode
+line.  A buffer no longer shown, or no longer animated, is dropped: its
+mode line asks again once drawn animated.  The timer stops once none
+is left.  Animations turned off or set to another pace stop it too, and
+update the mode lines it animated, which then show still icons or start
+it anew at that pace."
+  (condition-case err
+      (if (not (eql opencode--mode-line-animation-pace opencode-session-status-animation-interval))
+          (let ((buffers opencode--mode-line-animated))
+            (opencode--mode-line-stop-animation)
+            (dolist (buffer buffers)
+              (when (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  (force-mode-line-update)))))
+        (let ((kept nil))
+          (dolist (buffer opencode--mode-line-animated)
+            (when (and (buffer-live-p buffer)
+                       (buffer-local-value 'opencode--mode-line-animating buffer)
+                       (get-buffer-window buffer 'visible))
+              (push buffer kept)
+              (with-current-buffer buffer
+                (force-mode-line-update))))
+          (if kept
+              (setq opencode--mode-line-animated kept)
+            (opencode--mode-line-stop-animation))))
+    (error
+     (opencode--mode-line-stop-animation)
+     (message "OpenCode: mode-line animation stopped: %s" (error-message-string err)))))
+
+(defvar opencode--mode-line-registry-timer nil
+  "Timer comparing the mode lines shown with what the registry tells.")
+
+(defun opencode--mode-line-registry-changed (&rest _)
+  "Update the mode lines whose part from the registry changed, after this tick.
+For `opencode-state-updated-functions': a turn ending unseen, a session
+viewed, a subagent starting or ending a turn, or a session archived
+show in the mode line, without the session buffer itself changing."
+  (unless (timerp opencode--mode-line-registry-timer)
+    (setq opencode--mode-line-registry-timer
+          (run-at-time 0 nil #'opencode--mode-line-registry-check))))
+
+(defun opencode--mode-line-registry-check ()
+  "Update the mode lines shown whose part from the registry changed."
+  (setq opencode--mode-line-registry-timer nil)
+  (maphash (lambda (_id buffer)
+             (when (and (buffer-live-p buffer) (get-buffer-window buffer t))
+               (with-current-buffer buffer
+                 (let ((drawn (cdr opencode--mode-line-registry)))
+                   (unless (equal drawn (opencode--mode-line-registry-part))
+                     (force-mode-line-update))))))
+           opencode-session-buffers))
+
+(add-hook 'opencode-state-updated-functions #'opencode--mode-line-registry-changed)
 
 (defun opencode-mode-line-title (&optional name)
   "Return the session title in buffer NAME, without the OpenCode wrapper.
@@ -167,7 +367,7 @@ catalogs it left stale (see `opencode-catalog-ensure')."
   (let ((key (list opencode-session-agent opencode-session-model opencode-session-tokens
                    opencode-session-tokens-estimated default-directory
                    (opencode-catalog-location-generation) opencode--catalog-epoch
-                   opencode-provider-icons opencode-mode-line-agent-faces opencode-default-variant-function
+                   opencode-provider-icons opencode-agent-faces opencode-default-variant-function
                    opencode-long-context-tiers opencode-long-context-near)))
     (if (equal key (car opencode--mode-line-segments))
         (cdr opencode--mode-line-segments)
@@ -307,11 +507,13 @@ FITTED is what `opencode--mode-line-fit-window' last returned there.")
 
 (defun opencode--mode-line-fit-window (status segments)
   "Return (TITLE . DETAILS) fitted to the selected window, both escaped.
-TITLE holds STATUS, the status icon, and the session title, cut to fit;
-DETAILS those of SEGMENTS that fit.  They are fitted again only when
-what they depend on changed: the session's status, details and title,
-the window's width, the font, and the rest of the mode line, which is
-formatted every time, since anything may change it."
+TITLE is the session title, cut to fit beside STATUS, the escaped status
+icon as a still string, after a space; DETAILS those of SEGMENTS that
+fit.  They are fitted again only when what they depend on changed: the
+session's status, details and title, the window's width, the font, and
+the rest of the mode line, which is formatted every time, since anything
+may change it.  An animated icon's frames take the room of its still
+string, so that a frame changing fits nothing again."
   (let* ((rest (format-mode-line (remove opencode-mode-line-element (opencode-mode-line-format)) t))
          (char-width (window-font-width nil 'mode-line))
          (key (list status segments (buffer-name) rest char-width (window-pixel-width)
@@ -335,7 +537,7 @@ formatted every time, since anything may change it."
              (fit (opencode-mode-line-fit (string-width title) (opencode--mode-line-candidates segments)
                                           available char-width opencode-mode-line-title-min-width))
              (fitted (cons (opencode-mode-line-escape
-                            (concat status " "
+                            (concat " "
                                     (opencode--mode-line-title-string
                                      (truncate-string-to-width title (cdr fit) nil nil "…"))))
                            (opencode-mode-line-escape (car fit)))))
@@ -345,10 +547,20 @@ formatted every time, since anything may change it."
 (defun opencode-mode-line ()
   "Return the session status, title and details fitted to the selected window.
 The tab is made at every call, as moody draws the selected window's
-differently."
-  (let ((fitted (opencode--mode-line-fit-window (opencode-mode-line-status)
-                                                (opencode-mode-line-segments))))
-    (list (opencode-mode-line-tab (car fitted))
+differently, and the status icon, which shows the frame of its
+animation the clock tells (see `opencode-session-status-animations')."
+  (let* ((status (opencode--mode-line-status))
+         (frames (plist-get status :frames))
+         (fitted (opencode--mode-line-fit-window (plist-get status :still)
+                                                 (opencode-mode-line-segments))))
+    (setq opencode--mode-line-animating (and frames t))
+    (when frames
+      (opencode--mode-line-animate))
+    (list (opencode-mode-line-tab
+           (concat (if frames
+                       (nth (opencode-session-status-frame-index (length frames)) frames)
+                     (plist-get status :still))
+                   (car fitted)))
           (cdr fitted))))
 
 ;;;; Format

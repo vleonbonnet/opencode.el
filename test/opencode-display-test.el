@@ -115,13 +115,13 @@ catalogs only when given its directory."
     (let ((workspace opencode-test-workspace))
       (let ((variant (opencode-variant-display opencode-test-sol workspace)))
         (should (equal variant "low"))
-        (should (eq (get-text-property 0 'face variant) 'success))
+        (should (eq (get-text-property 0 'face variant) 'opencode-setting-chosen))
         (should (equal (get-text-property 0 'help-echo variant) "Variant: low (selected)")))
       ;; Claude Opus 5.5 runs adaptive thinking at medium effort by default.
       (dolist (model (list opencode-test-claude (append opencode-test-claude '((variant . "default")))))
         (let ((variant (opencode-variant-display model workspace)))
           (should (equal variant "medium"))
-          (should (eq (get-text-property 0 'face variant) 'shadow))
+          (should (eq (get-text-property 0 'face variant) 'opencode-setting-inherited))
           (should (equal (get-text-property 0 'help-echo variant) "Variant: medium (default)"))))
       (let ((opencode-default-variant-function nil))
         (let ((variant (opencode-variant-display opencode-test-claude workspace)))
@@ -153,7 +153,7 @@ catalogs only when given its directory."
       (let ((context (opencode-context-display 100000 opencode-test-sol workspace)))
         (should (equal context "\U000F0A9F 25%"))
         (should-not (get-text-property 0 'face context))
-        (should (equal (get-text-property 0 'help-echo context) "Context: 100k/400k tokens")))
+        (should (equal (get-text-property 0 'help-echo context) "Context: 100k of 400k tokens (25%)")))
       ;; The pie fills by eighths and stays full past the model's size.
       (should (equal (opencode-context-display 0 opencode-test-sol workspace) "\U000F0A9E 0%"))
       (should (equal (opencode-context-display 50000 opencode-test-sol workspace) "\U000F0A9E 12%"))
@@ -165,14 +165,14 @@ catalogs only when given its directory."
             (context (opencode-context-display 190000 opencode-test-claude workspace)))
         (should (equal (plist-get usage :tier) '(near 200000 "2×")))
         (should (equal context "\U000F0A9F 19%"))
-        (should (eq (get-text-property 0 'face context) 'opencode-attention))
+        (should (eq (get-text-property 0 'face context) 'opencode-context-near))
         (should (equal (get-text-property 0 'help-echo context)
-                       "Context: 190k/1000k tokens\nContext 190k/200k: near the 2× tier")))
+                       "Context: 190k of 1M tokens (19%)\nNear 200k tokens, past which requests cost 2×")))
       (let ((context (opencode-context-display 250000 opencode-test-claude workspace)))
         (should (equal context "\U000F0A9F 25% 2×"))
-        (should (eq (get-text-property 0 'face context) 'error))
+        (should (eq (get-text-property 0 'face context) 'opencode-context-over))
         (should (equal (get-text-property 0 'help-echo context)
-                       "Context: 250k/1000k tokens\nContext over 200k: requests cost 2×")))
+                       "Context: 250k of 1M tokens (25%)\nPast 200k tokens: requests cost 2×")))
       (let ((opencode-long-context-tiers '(("\\`openai\\'" "\\`gpt-6-sol\\'" 272000 "1.5×"))))
         (should (equal (plist-get (opencode-context-usage 300000 opencode-test-sol workspace) :tier)
                        '(over 272000 "1.5×"))))
@@ -189,15 +189,16 @@ catalogs only when given its directory."
       (let ((context (opencode-context-display 100000 opencode-test-sol workspace t)))
         (should (equal context "\U000F0A9F ~25%"))
         (should (equal (get-text-property 0 'help-echo context)
-                       (concat "Context: ~100k/400k tokens\n"
+                       (concat "Context: ~100k of 400k tokens (25%)\n"
                                "Estimated by the service after compaction; the next step measures it"))))
       (let ((context (opencode-context-display 190000 opencode-test-claude workspace t)))
         (should (equal context "\U000F0A9F ~19%"))
-        (should (eq (get-text-property 0 'face context) 'opencode-attention))
-        (should (string-suffix-p "\nContext ~190k/200k: near the 2× tier" (get-text-property 0 'help-echo context))))
+        (should (eq (get-text-property 0 'face context) 'opencode-context-near))
+        (should (string-suffix-p "\nEstimated near 200k tokens, past which requests cost 2×"
+                                 (get-text-property 0 'help-echo context))))
       (let ((context (opencode-context-display 250000 opencode-test-claude workspace t)))
         (should (equal context "\U000F0A9F ~25% 2×"))
-        (should (string-suffix-p "\nContext estimated over 200k: requests may cost 2×"
+        (should (string-suffix-p "\nEstimated past 200k tokens: requests cost 2×"
                                  (get-text-property 0 'help-echo context)))))))
 
 (ert-deftest opencode-test-display-waits-for-catalogs ()
@@ -282,7 +283,7 @@ Its arrival runs `opencode-catalog-changed-functions'."
   (opencode-test-with-server
     (let ((opencode-test-routes (opencode-test-display-routes))
           (workspace opencode-test-workspace)
-          (opencode-mode-line-agent-faces '(font-lock-keyword-face font-lock-type-face
+          (opencode-agent-faces '(font-lock-keyword-face font-lock-type-face
                                             font-lock-constant-face font-lock-string-face)))
       (cl-letf (((symbol-function 'run-at-time) #'ignore))
         ;; Until the catalog arrives, nothing, and it is not waited for.
@@ -305,7 +306,7 @@ Its arrival runs `opencode-catalog-changed-functions'."
           (should (equal (opencode-agent-display "general" workspace) "General"))
           (should (equal (face "general") '(bold font-lock-keyword-face)))
           (should (equal (opencode-agent-display "ghost" workspace) "ghost"))
-          (let ((opencode-mode-line-agent-faces nil))
+          (let ((opencode-agent-faces nil))
             (should (equal (face "plan") '(bold nil))))
           (should-not (opencode-agent-display nil workspace)))))))
 
@@ -318,7 +319,7 @@ Its arrival runs `opencode-catalog-changed-functions'."
           (let ((agent (alist-get 'agent (opencode-mode-line-segments))))
             (should (equal agent "build"))
             (should (equal (get-text-property 0 'face agent)
-                           (list 'bold (car opencode-mode-line-agent-faces))))))
+                           (list 'bold (car opencode-agent-faces))))))
         (opencode-catalog-fetch 'agent #'ignore)
         (dolist (id '("build" "plan" "review"))
           (setq opencode-session-agent id)

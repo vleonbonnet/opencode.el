@@ -41,6 +41,7 @@
 (require 'map)
 (require 'opencode-common)
 (require 'opencode-http)
+(require 'opencode-look)
 (require 'opencode-session)
 (require 'opencode-state)
 (require 'url-util)
@@ -55,51 +56,6 @@
 (defcustom opencode-git-branch-ttl 30
   "Seconds `opencode-git-branch' caches the branch of a worktree."
   :type 'natnum
-  :group 'opencode)
-
-(defface opencode-session-status-waiting
-  '((t :inherit opencode-attention))
-  "Status of a session waiting on a permission request or a question."
-  :group 'opencode-faces)
-
-(defface opencode-session-status-working
-  '((t :inherit font-lock-keyword-face))
-  "Status of a session running a turn."
-  :group 'opencode-faces)
-
-(defface opencode-session-status-retrying
-  '((t :inherit opencode-session-status-working :slant italic))
-  "Status of a session whose turn waits to retry a failed request."
-  :group 'opencode-faces)
-
-(defface opencode-session-status-failed
-  '((t :inherit error))
-  "Status of a session whose turn failed unseen."
-  :group 'opencode-faces)
-
-(defface opencode-session-status-done
-  '((t :inherit success))
-  "Status of a session whose turn ended unseen."
-  :group 'opencode-faces)
-
-(defface opencode-session-status-idle
-  '((t :inherit shadow))
-  "Status of an idle session whose last turn was seen."
-  :group 'opencode-faces)
-
-(defcustom opencode-session-status-icons
-  '((waiting "\U000F02D7" opencode-session-status-waiting)   ; nf-md-help_circle
-    (working "\U000F051F" opencode-session-status-working)   ; nf-md-timer_sand
-    (retrying "\uf021" opencode-session-status-retrying)     ; nf-fa-refresh
-    (failed "\uf057" opencode-session-status-failed)         ; nf-fa-times_circle
-    (done "\U000F05E0" opencode-session-status-done)         ; nf-md-check_circle
-    (idle "\uf10c" opencode-session-status-idle))            ; nf-fa-circle_o
-  "Session statuses, as `opencode-state-status' names them, with their icon and face.
-Session pickers show the icon before the title, and name the status in
-its tooltip.  The default icons come from Nerd Fonts, which must be
-installed for them to show."
-  :type '(alist :key-type (symbol :tag "Status")
-                :value-type (list (string :tag "Icon") (face :tag "Face")))
   :group 'opencode)
 
 ;;;; Server data
@@ -189,13 +145,6 @@ Return nil outside Git.  HEAD is read directly, without running Git."
 
 ;;;; Session pickers
 
-(defun opencode-session-status-icon (status)
-  "Return the icon of STATUS, a session status symbol, in its face.
-Its tooltip names the status; an unknown status is \"-\"."
-  (if-let* ((display (alist-get status opencode-session-status-icons)))
-      (propertize (car display) 'face (cadr display) 'help-echo (symbol-name status))
-    "-"))
-
 (defun opencode--session-entry (info)
   "Return the registry entry of session INFO, else an entry made from INFO.
 The registry follows the service, so its title, directory and status
@@ -222,11 +171,16 @@ directory."
 (defun opencode--session-candidates (sessions)
   "Return the candidates of `opencode-annotated-completion' for SESSIONS.
 SESSIONS are session infos; each candidate's value is one of them.  Its
-prefix is the session's status icon, its name the title, or the ID of an
-untitled session, and its annotation the project, the branch and the
-time since the session last changed, in columns.  A column no session
-has a value for is left out.  The sort key puts the newest first."
-  (let* ((rows (mapcar (lambda (info)
+prefix is the session's status icon, then the archived icon for an
+archived session (see `opencode-session-status-icons' and
+`opencode-archived-icon'); its name the title, or the ID of an untitled
+session, in the face of where the session is (see
+`opencode-session-place'); its annotation the project, the branch and
+the time since the session last changed, in columns.  A column no
+session has a value for is left out.  The sort key puts the newest
+first."
+  (let* ((now (float-time))
+         (rows (mapcar (lambda (info)
                          (let* ((entry (opencode--session-entry info))
                                 (directory (plist-get entry :directory)))
                            (list info entry
@@ -238,15 +192,21 @@ has a value for is left out.  The sort key puts the newest first."
     (cl-flet ((column (text width)
                 (unless (zerop width) (concat (string-pad text width) "  "))))
       (mapcar (pcase-lambda (`(,info ,entry ,project ,branch))
-                (let ((title (plist-get entry :title))
-                      (updated (plist-get entry :updated)))
-                  (list (if (or (null title) (string-empty-p title)) (plist-get entry :id) title)
+                (let* ((id (plist-get entry :id))
+                       (title (plist-get entry :title))
+                       (title (if (or (null title) (string-empty-p title)) id title))
+                       (face (opencode-session-place-face (opencode-session-place id)))
+                       (updated (plist-get entry :updated)))
+                  (list (if face (propertize title 'face face) title)
                         info
                         (concat (column project project-width)
                                 (column branch branch-width)
-                                (opencode-format-time-ago (and updated (- (float-time) updated))))
+                                (if updated (opencode-format-age updated now) "-"))
                         (- (or updated 0))
-                        (concat (opencode-session-status-icon (opencode-state-status entry)) " "))))
+                        (concat (opencode-session-status-icon (opencode-state-status entry)) " "
+                                (and (plist-get entry :archived)
+                                     (concat (propertize (opencode-archived-glyph) 'help-echo "Archived")
+                                             " "))))))
               rows))))
 
 (defun opencode-read-session (prompt sessions &optional new-directory)
@@ -322,7 +282,7 @@ as `opencode' does."
                           (let ((active (or (map-nested-elt project '(time active))
                                             (map-nested-elt project '(time updated)))))
                             (list (abbreviate-file-name (alist-get 'canonical project)) project
-                                  (opencode-format-time-ago (opencode-time-ago active))
+                                  (if active (opencode-format-age (opencode-time-seconds active)) "-")
                                   (- (or active 0)))))
                         (seq-filter (lambda (project) (stringp (alist-get 'canonical project)))
                                     (opencode-wait #'opencode-fetch-projects))))))

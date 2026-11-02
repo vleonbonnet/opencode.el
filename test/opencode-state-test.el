@@ -2281,5 +2281,36 @@ Until then neither is called, so that a caller acts on the outcome only."
               (should-not (opencode-test-state-viewed))
               (should (eq (opencode-state-status id) 'done)))))))))
 
+(ert-deftest opencode-test-state-subagent-statuses ()
+  "A session's subagents at work are found through the subagents of each, as entries change."
+  (opencode-test-with-state
+    (let ((revision opencode-state--revision))
+      (cl-flet ((store (id &rest values)
+                  (opencode-state--store id (apply #'opencode-state--make-entry :id id values))))
+        (store "ses_parent" :title "Parent")
+        (should (> opencode-state--revision revision))
+        (should-not (opencode-state-subagent-statuses "ses_parent"))
+        (store "ses_child" :parent-id "ses_parent" :running t)
+        (should (equal (opencode-state-subagent-statuses "ses_parent") '(working)))
+        (store "ses_grandchild" :parent-id "ses_child" :running t
+               :requests '((:kind question :id "frm_test" :time 1.0)))
+        (should (seq-set-equal-p (opencode-state-subagent-statuses "ses_parent") '(working waiting)))
+        (should (equal (opencode-state-subagent-statuses "ses_child") '(waiting)))
+        ;; A subagent ending its turn, or moved under another session.
+        (store "ses_child" :parent-id "ses_parent")
+        (should (equal (opencode-state-subagent-statuses "ses_parent") '(waiting)))
+        (store "ses_grandchild" :parent-id "ses_other" :running t :retry '(:attempt 1))
+        (should-not (opencode-state-subagent-statuses "ses_parent"))
+        (should (equal (opencode-state-subagent-statuses "ses_other") '(retrying)))
+        ;; Gone, an entry leaves its parent's subagents.
+        (opencode-state--store "ses_grandchild" nil)
+        (should-not (opencode-state-subagent-statuses "ses_other"))
+        (should-not (gethash "ses_other" opencode-state--children))
+        (should (equal (gethash "ses_parent" opencode-state--children) '("ses_child")))
+        ;; An entry stored again unchanged changes nothing.
+        (let ((revision opencode-state--revision))
+          (opencode-state--store "ses_child" (opencode-state-get "ses_child"))
+          (should (= opencode-state--revision revision)))))))
+
 (provide 'opencode-state-test)
 ;;; opencode-state-test.el ends here
