@@ -429,11 +429,14 @@ Nothing is written when the transcript already ends with one."
         (setq opencode--prompt-start (copy-marker start))))))
 
 (defun opencode-highlight-input (&optional _process _string)
-  "Margin and mark the input just sent or replayed as prompt text."
+  "Margin and mark the input just sent or replayed as prompt text.
+Its links become buttons, as those of output do: sent, it is part of
+the transcript, where a click or RET follows them."
   (opencode-add-margin comint-last-input-start comint-last-input-end
                        'opencode-request-margin-highlight)
   (with-silent-modifications
-    (put-text-property comint-last-input-start comint-last-input-end 'opencode-prompt t)))
+    (put-text-property comint-last-input-start comint-last-input-end 'opencode-prompt t))
+  (opencode-buttonize comint-last-input-start comint-last-input-end t))
 
 (defun opencode-insert-block-with-margin (text face)
   "Write TEXT with a FACE margin; return the start of TEXT."

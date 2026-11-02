@@ -25,17 +25,6 @@
       (walk map []))
     (sort keys #'string<)))
 
-(defun opencode-test-press (buffer keys)
-  "Press KEYS in BUFFER, shown in the selected window.
-Return the error they signaled, or nil.  Running them through the
-command loop applies key remapping as typing them would."
-  (save-window-excursion
-    (set-window-buffer (selected-window) buffer)
-    (with-current-buffer buffer
-      (condition-case err
-          (progn (execute-kbd-macro (key-parse keys)) nil)
-        (error err)))))
-
 (defun opencode-test-input (buffer)
   "Return the input typed at BUFFER's prompt."
   (with-current-buffer buffer

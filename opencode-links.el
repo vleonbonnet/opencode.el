@@ -22,7 +22,8 @@
 
 ;;; Commentary:
 
-;; Four kinds of references in assistant output become buttons, each
+;; Four kinds of references in the transcript, the agent's output and the
+;; prompts sent alike, become buttons, each
 ;; once its closing delimiter arrives: backticked file references with an
 ;; optional line (`file.el:12'), bracketed Org links of any type
 ;; (`[[id:UUID][heading]]', opened by Org's own dispatcher, custom link

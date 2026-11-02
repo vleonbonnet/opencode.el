@@ -226,5 +226,110 @@ BINDINGS is a list (SESSION) of the variable bound to the session's ID."
         (goto-char (opencode-test-find text))
         (should (eq (key-binding (kbd "RET")) 'opencode-send-input))))))
 
+;;;; Links in sent prompts
+
+(defconst opencode-test-prompt-with-links
+  "Please investigate: https://mongodb.slack.com/archives/C0C8DPY6L78/p179209784790270 and [the doc](https://example.com/doc)."
+  "A prompt with a URL written out and a Markdown link.")
+
+(defconst opencode-test-prompt-links
+  '(("https://mongodb.slack.com/archives/C0C8DPY6L78/p179209784790270"
+     . "https://mongodb.slack.com/archives/C0C8DPY6L78/p179209784790270")
+    ("the doc" . "https://example.com/doc"))
+  "The links of `opencode-test-prompt-with-links', as `opencode-test-links' lists them.")
+
+(defun opencode-test-check-prompt-links (buffer)
+  "Check that the sent prompt of BUFFER has its links, which the keys reach and follow.
+Return the URLs followed."
+  (with-current-buffer buffer
+    (font-lock-ensure)
+    (let ((url (opencode-test-find "https://mongodb.slack.com"))
+          (doc (opencode-test-find "the doc"))
+          (browsed nil)
+          (prompts (length (opencode-test-requests-to 'post "/prompt"))))
+      (should (equal (opencode-test-links (point-min) (opencode-pmark)) opencode-test-prompt-links))
+      (should (get-text-property url 'opencode-prompt))
+      (should (memq 'link (ensure-list (get-text-property url 'face))))
+      (should (equal (get-text-property url 'help-echo)
+                     "Open https://mongodb.slack.com/archives/C0C8DPY6L78/p179209784790270"))
+      (should (mouse-on-link-p (1+ url)))
+      (cl-letf (((symbol-function 'browse-url) (lambda (target &rest _) (push target browsed)))
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _)
+                   (should (equal (mapcar #'car collection) (mapcar #'car opencode-test-prompt-links)))
+                   "the doc")))
+        ;; M-n and M-p go from link to link in the transcript.
+        (goto-char (point-min))
+        (should-not (opencode-test-press buffer "M-n"))
+        (should (= (point) url))
+        (should-not (opencode-test-press buffer "M-n"))
+        (should (= (point) doc))
+        (should-not (opencode-test-press buffer "M-p"))
+        (should (= (point) url))
+        ;; RET and C-c C-o follow the link at point, and send nothing.
+        (goto-char (+ url 10))
+        (should (eq (key-binding (kbd "RET")) 'push-button))
+        (should-not (opencode-test-press buffer "RET"))
+        (goto-char (1+ doc))
+        (should-not (opencode-test-press buffer "C-c C-o"))
+        ;; Elsewhere in the exchange, C-c C-o offers its links.
+        (goto-char (opencode-test-find "Please"))
+        (should-not (opencode-test-press buffer "C-c C-o")))
+      (should (= (length (opencode-test-requests-to 'post "/prompt")) prompts))
+      (should (equal (nreverse browsed)
+                     '("https://mongodb.slack.com/archives/C0C8DPY6L78/p179209784790270"
+                       "https://example.com/doc" "https://example.com/doc"))))))
+
+(ert-deftest opencode-test-sent-prompt-links ()
+  "The links of a prompt sent from the input are links, and the input's never are."
+  (opencode-test-with-server
+    (let ((buffer (opencode-test-open-empty (opencode-test-scenario "text"))))
+      (with-current-buffer buffer
+        (goto-char (point-max))
+        (insert opencode-test-prompt-with-links)
+        (should-not (opencode-test-press buffer "RET"))
+        (should (equal (alist-get 'text (car (opencode-test-requests-to 'post "/prompt")))
+                       opencode-test-prompt-with-links))
+        (opencode-test-check-prompt-links buffer)
+        ;; In the input, RET still sends.
+        (goto-char (point-max))
+        (insert "again https://example.com/x")
+        (font-lock-ensure)
+        (should-not (opencode-test-links (opencode-pmark)))
+        (goto-char (opencode-test-find "example.com/x"))
+        (should (eq (key-binding (kbd "RET")) 'opencode-send-input))
+        (should-not (opencode-test-press buffer "RET"))
+        (should (equal (alist-get 'text (car (last (opencode-test-requests-to 'post "/prompt"))))
+                       "again https://example.com/x"))
+        (should (equal (opencode-test-links (point-min) (opencode-pmark))
+                       (append opencode-test-prompt-links
+                               '(("https://example.com/x" . "https://example.com/x")))))))))
+
+(ert-deftest opencode-test-replayed-prompt-links ()
+  "A prompt replayed from the transcript has its links, after a reload too."
+  (opencode-test-with-transcript
+      (list (opencode-test-prompt "msg_ask" opencode-test-prompt-with-links)
+            (opencode-test-step "msg_reply" '((type . "text") (text . "On it.")))
+            (opencode-test-idle "msg_done"))
+    (let ((buffer (opencode-test-open (opencode-test-session))))
+      (opencode-test-check-prompt-links buffer)
+      (with-current-buffer buffer (revert-buffer))
+      (opencode-test-check-prompt-links buffer))))
+
+(ert-deftest opencode-test-other-client-prompt-links ()
+  "Another client's prompt, rendered as it arrives, has its links, the input kept apart."
+  (opencode-test-with-server
+    (let* ((session (opencode-test-scenario "text"))
+           (buffer (opencode-test-open-empty session)))
+      (with-current-buffer buffer
+        (goto-char (point-max))
+        (insert "draft https://example.com/draft")
+        (opencode-test-dispatch (opencode-test-inbox-events session "msg_tui" opencode-test-prompt-with-links))
+        (should (equal (buffer-substring-no-properties (opencode-pmark) (point-max))
+                       "draft https://example.com/draft"))
+        (should-not (opencode-test-links (opencode-pmark)))
+        (delete-region (opencode-pmark) (point-max)))
+      (opencode-test-check-prompt-links buffer))))
+
 (provide 'opencode-links-test)
 ;;; opencode-links-test.el ends here
