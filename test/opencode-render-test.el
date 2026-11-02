@@ -105,5 +105,85 @@
       (should (equal (get-text-property pmark 'opencode-display) spacer))
       (should-not (get-text-property (1+ pmark) 'opencode-display)))))
 
+;;;; Writing long transcripts
+
+(defun opencode-test-long-transcript (turns)
+  "Return a transcript of TURNS turns, oldest first, as the service projects it.
+Each turn has a prompt, reasoning, a file read, a shell command with its
+output, an answer in Markdown and the turn's end: six parts."
+  (let ((messages nil))
+    (dotimes (turn turns)
+      (push `((id . ,(format "msg_%06du" turn)) (type . "user") (text . ,(format "Look at part %d" turn))
+              (time (created . ,turn)))
+            messages)
+      (push `((id . ,(format "msg_%06da" turn)) (type . "assistant") (time (created . ,turn) (completed . ,turn))
+              (content ((type . "reasoning") (text . ,(format "**Reading** the code of part %d first." turn)))
+                       ((type . "tool") (id . ,(format "call_%06dr" turn)) (name . "read")
+                        (state (status . "completed") (input (path . "README.md"))
+                               (content ((type . "text") (text . "README.md\n")))))
+                       ((type . "tool") (id . ,(format "call_%06ds" turn)) (name . "shell")
+                        (state (status . "completed") (input (command . "make check"))
+                               (content ((type . "text") (text . ,(make-string 400 ?x))))))
+                       ((type . "text")
+                        (text . ,(format "Part %d:\n\n- uses `notes.txt`\n- see https://example.com/%d\n\nDone." turn turn)))))
+            messages)
+      (push `((id . ,(format "msg_%06di" turn)) (type . "idle") (outcome . "succeeded") (time (created . ,turn)))
+            messages))
+    (nreverse messages)))
+
+(defun opencode-test-replay-seconds (messages)
+  "Return the fewest seconds of three that writing MESSAGES whole takes.
+Garbage is collected rarely meanwhile, as in a configuration with a
+large `gc-cons-threshold', where markers left behind slow every
+insertion until a collection."
+  (let ((best nil))
+    (dotimes (_ 3)
+      (with-temp-buffer
+        (opencode-session-mode)
+        (opencode--make-process (current-buffer))
+        (setq opencode-session-id "ses_long")
+        (buffer-enable-undo)
+        (garbage-collect)
+        (let ((gc-cons-threshold (* 64 1024 1024))
+              (start (float-time)))
+          (opencode-replay-messages messages)
+          (let ((seconds (- (float-time) start)))
+            (setq best (if best (min best seconds) seconds))))
+        ;; Only the input's edits are undone, and there is no input.
+        (should-not buffer-undo-list)))
+    best))
+
+(ert-deftest opencode-test-replay-time-linear ()
+  "Writing a transcript takes time proportional to its length.
+Every output change shifted the whole undo list, which every replayed
+prompt grew, and each write left markers that every later insertion
+adjusted: four times the parts took sixteen times as long."
+  (opencode-test-with-server
+    (let ((small (opencode-test-replay-seconds (opencode-test-long-transcript 200)))
+          (large (opencode-test-replay-seconds (opencode-test-long-transcript 800))))
+      (should (< large (* 8 small))))))
+
+(ert-deftest opencode-test-undo-keeps-only-prompt-edits ()
+  "Undo after output undoes what was typed, never the transcript.
+Rendering another client's prompt runs Comint's input sending, whose
+records undo would otherwise replay over the transcript."
+  (opencode-test-with-input
+    (let ((session opencode-session-id)
+          (transcript (buffer-substring-no-properties (point-min) (opencode-pmark))))
+      (buffer-enable-undo)
+      (undo-boundary)
+      (opencode-test-self-insert "draft")
+      (undo-boundary)
+      (opencode-test-dispatch (opencode-test-inbox-events session "msg_undo_other" "Asked elsewhere."))
+      (opencode-test-answer session "msg_undo_answer" "Answered.")
+      (let ((shown (buffer-substring-no-properties (point-min) (opencode-pmark))))
+        (should (string-prefix-p transcript shown))
+        (should (string-search "Asked elsewhere." shown))
+        (should (equal (buffer-substring-no-properties (opencode-pmark) (point-max)) "draft"))
+        (let ((last-command nil))
+          (undo))
+        (should (equal (buffer-substring-no-properties (opencode-pmark) (point-max)) ""))
+        (should (equal (buffer-substring-no-properties (point-min) (opencode-pmark)) shown))))))
+
 (provide 'opencode-render-test)
 ;;; opencode-render-test.el ends here

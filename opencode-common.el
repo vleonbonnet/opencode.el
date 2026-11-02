@@ -335,13 +335,26 @@ candidate can be chosen."
        (eq buffer (window-buffer (selected-window)))
        (frame-focus-state (window-frame (selected-window)))))
 
+(defvar opencode--display-paths (make-hash-table :test #'equal)
+  "Cache of `opencode-relative-path-for-display', keyed by (ROOT . FILE).
+Comparing true names stats every directory of both, and a transcript
+names the same files again and again.")
+
 (defun opencode-relative-path-for-display (file)
   "Return FILE relative to the current project root when inside it."
   (when file
-    (let ((root (opencode-project-directory)))
-      (if (and (file-name-absolute-p file) (file-in-directory-p file root))
-          (file-relative-name file root)
-        file))))
+    (let* ((root (opencode-project-directory))
+           (key (cons root file)))
+      (or (gethash key opencode--display-paths)
+          (progn
+            ;; Bounded: a long-lived Emacs sees many files.
+            (when (> (hash-table-count opencode--display-paths) 4096)
+              (clrhash opencode--display-paths))
+            (puthash key
+                     (if (and (file-name-absolute-p file) (file-in-directory-p file root))
+                         (file-relative-name file root)
+                       file)
+                     opencode--display-paths))))))
 
 (defun opencode-resolve-file-reference (file)
   "Return the absolute name of existing regular FILE, else nil.

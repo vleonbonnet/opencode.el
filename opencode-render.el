@@ -244,22 +244,94 @@ it, which redisplay moves as it needs to show the point."
 
 ;;;; Output
 
+(defvar-local opencode--output-point nil
+  "Marker keeping point after the output written at it, reused by every write.")
+
+(defvar-local opencode--prompt-markers nil
+  "Markers of Comint's last prompt, (START . END), reused by every write.")
+
+(defun opencode--output-filter (process string)
+  "Write STRING at PROCESS's mark exactly as `comint-output-filter' does.
+That one makes three markers on every call, which stay in the buffer
+until a garbage collection, and every insertion adjusts every marker of
+the buffer: writing a long transcript cost quadratic time, the more so
+with a large `gc-cons-threshold'.  This one reuses its markers."
+  (let ((functions comint-preoutput-filter-functions))
+    (while (and functions string)
+      (if (eq (car functions) t)
+          (let ((functions (default-value 'comint-preoutput-filter-functions)))
+            (while (and functions string)
+              (setq string (funcall (car functions) string))
+              (setq functions (cdr functions))))
+        (setq string (funcall (car functions) string)))
+      (setq functions (cdr functions))))
+  (when string
+    (let ((inhibit-read-only t)
+          ;; The point should float after any insertion.
+          (saved-point (if (and (markerp opencode--output-point)
+                                (eq (marker-buffer opencode--output-point) (current-buffer)))
+                           (set-marker opencode--output-point (point))
+                         (setq opencode--output-point (copy-marker (point) t)))))
+      (save-restriction
+        (widen)
+        (goto-char (process-mark process))
+        (set-marker comint-last-output-start (point))
+        (put-text-property 0 (length string) 'field 'output string)
+        (insert string)
+        (set-marker (process-mark process) (point))
+        (unless comint-inhibit-carriage-motion
+          (comint-carriage-motion comint-last-output-start (point)))
+        (goto-char saved-point)
+        (run-hook-with-args 'comint-output-filter-functions string)
+        (set-marker saved-point (point))
+        (goto-char (process-mark process))
+        (unless comint-use-prompt-regexp
+          (comint--mark-as-output comint-last-output-start (point)))
+        ;; Comint's prompt is the last line of output.
+        (let ((prompt-start (save-excursion (forward-line 0) (point))))
+          (when comint-prompt-read-only
+            (with-silent-modifications
+              (or (= (point-min) prompt-start)
+                  (get-text-property (1- prompt-start) 'read-only)
+                  (put-text-property (1- prompt-start) prompt-start 'read-only 'fence))
+              (add-text-properties prompt-start (point) '(read-only t front-sticky (read-only)))))
+          (when comint-last-prompt
+            (font-lock--remove-face-from-text-property
+             (car comint-last-prompt) (cdr comint-last-prompt) 'font-lock-face 'comint-highlight-prompt))
+          ;; Comint forgets its prompt's markers on every input sent,
+          ;; without detaching them: ours are reused instead.
+          (unless (and (markerp (car-safe opencode--prompt-markers))
+                       (eq (marker-buffer (car opencode--prompt-markers)) (current-buffer)))
+            (setq opencode--prompt-markers (cons (make-marker) (make-marker))))
+          (set-marker (car opencode--prompt-markers) prompt-start)
+          (set-marker (cdr opencode--prompt-markers) (point))
+          (setq comint-last-prompt opencode--prompt-markers)
+          (font-lock-append-text-property prompt-start (point) 'font-lock-face 'comint-highlight-prompt)
+          (add-text-properties prompt-start (point) `(rear-nonsticky ,comint--prompt-rear-nonsticky)))
+        (goto-char saved-point)))))
+
 (defun opencode-output (string)
   "Write STRING at the process mark as Comint output."
   (let ((start (save-excursion
                  (goto-char (opencode-pmark))
                  (let ((inhibit-field-text-motion t))
                    (line-beginning-position)))))
-    (comint-output-filter (get-buffer-process (current-buffer)) string)
+    (opencode--output-filter (get-buffer-process (current-buffer)) string)
     (opencode-buttonize start (opencode-pmark))))
+
+(defvar-local opencode-synced-end nil
+  "Marker where the part of the transcript known complete ends, or nil.
+The session module sets it: what follows it is rewritten when the
+buffer catches up with the service after a reconnection.")
 
 (defun opencode-insert-output-at (position string)
   "Insert STRING at POSITION as Comint output and return its end.
 Unlike `opencode-output', this writes inside an already rendered
 transcript, for expanded blocks.  Markers exactly at POSITION that
-track the stream (the process mark, the response start and the table
-scan marker) move past STRING, so later output stays after it, and so
-do the points that follow output (see `opencode-keeping-followers')."
+track the stream (the process mark, the response start, the table scan
+marker and `opencode-synced-end') move past STRING, so later output
+stays after it, and so do the points that follow output (see
+`opencode-keeping-followers')."
   (let* ((process (get-buffer-process (current-buffer)))
          (markers (seq-filter
                    (lambda (marker)
@@ -268,7 +340,8 @@ do the points that follow output (see `opencode-keeping-followers')."
                           (= position (marker-position marker))))
                    (list (and process (process-mark process))
                          opencode-last-response-start
-                         opencode--table-scan-marker)))
+                         opencode--table-scan-marker
+                         opencode-synced-end)))
          (inhibit-read-only t)
          end)
     (opencode-keeping-followers
@@ -349,7 +422,11 @@ Nothing is written when the transcript already ends with one."
       (opencode-output "> ")
       (overlay-put (make-overlay start (opencode-pmark)) 'invisible t)
       (opencode-add-margin start (opencode-pmark) 'opencode-request-margin-highlight)
-      (setq opencode--prompt-start (copy-marker start)))))
+      ;; The previous prompt became a sent input's; its marker would
+      ;; slow every insertion until a garbage collection.
+      (if (markerp opencode--prompt-start)
+          (set-marker opencode--prompt-start start)
+        (setq opencode--prompt-start (copy-marker start))))))
 
 (defun opencode-highlight-input (&optional _process _string)
   "Margin and mark the input just sent or replayed as prompt text."
@@ -704,16 +781,49 @@ SEEN holds the cells and records already shifted, which LIST may share."
              (opencode--output-change-p beg end)
              (list buffer-undo-list))))
 
+(defun opencode--undo-fix (from delta)
+  "Shift the prompt's undo records at or after FROM by DELTA."
+  (unless (or (zerop delta) (not (consp buffer-undo-list)))
+    (let ((seen (make-hash-table :test #'eq)))
+      (opencode--undo-shift buffer-undo-list from delta seen)
+      (opencode--undo-break-stale-run seen))))
+
 (defun opencode--undo-after-change (beg end old-len)
   "Drop the records of the output change at BEG..END of OLD-LEN, shifting the prompt's."
   (when-let* ((snapshot opencode--undo-snapshot))
     (setq opencode--undo-snapshot nil
           buffer-undo-list (car snapshot))
-    (let ((delta (- end beg old-len))
-          (seen (make-hash-table :test #'eq)))
-      (unless (zerop delta)
-        (opencode--undo-shift buffer-undo-list (+ beg old-len) delta seen)
-        (opencode--undo-break-stale-run seen)))))
+    (opencode--undo-fix (+ beg old-len) (- end beg old-len))))
+
+(defun opencode--call-without-undo (function)
+  "Call FUNCTION, writing output that records no undo, then fix the prompt's records.
+See `opencode-without-undo'."
+  (let ((saved buffer-undo-list)
+        (process (get-buffer-process (current-buffer)))
+        (buffer (current-buffer)))
+    (if (or (not (listp saved)) (not process))
+        (funcall function)
+      (let ((pmark (marker-position (process-mark process)))
+            (input (- (point-max) (marker-position (process-mark process)))))
+        (unwind-protect
+            (let ((buffer-undo-list t))
+              (funcall function))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              ;; The input kept its text, so its records only moved with
+              ;; it; any other records would undo the wrong text.
+              (setq buffer-undo-list
+                    (and (= input (- (point-max) (opencode-pmark))) saved))
+              (opencode--undo-fix pmark (- (opencode-pmark) pmark)))))))))
+
+(defmacro opencode-without-undo (&rest body)
+  "Run BODY, which writes output and leaves the input as it found it.
+Each output change otherwise shifts every record of the prompt's undo
+list, and replaying a transcript makes thousands: BODY records nothing,
+and the prompt's records are shifted once afterwards, by how far the
+input moved."
+  (declare (indent 0) (debug t))
+  `(opencode--call-without-undo (lambda () ,@body)))
 
 (defun opencode--undo-forget-sent-input (&rest _)
   "Drop the undo history of a prompt that became part of the conversation."
@@ -738,6 +848,23 @@ overlays."
            for value = (get-text-property position property)
            when value append (list property value)))
 
+(defvar opencode--table-buffer nil
+  "Buffer in `markdown-ts-mode' where tables are aligned, set up once.")
+
+(defun opencode--table-buffer ()
+  "Return the buffer tables are aligned in, setting it up the first time.
+Setting up `markdown-ts-mode' looks up every grammar it may use, which
+costs tens of milliseconds: setting up a buffer for each table made
+writing a transcript with tables slow."
+  (unless (buffer-live-p opencode--table-buffer)
+    (setq opencode--table-buffer (generate-new-buffer " *opencode-table*" t))
+    (with-current-buffer opencode--table-buffer
+      ;; Context modes start timers that would run in the session later.
+      (let ((markdown-ts-enable-table-mode nil)
+            (markdown-ts-enable-code-block-context-mode nil))
+        (delay-mode-hooks (markdown-ts-mode)))))
+  opencode--table-buffer)
+
 (defun opencode-align-markdown-table (beg end)
   "Align the completed Markdown table between BEG and END in place.
 markdown-ts aligns it in an isolated buffer and only the changed text is
@@ -747,13 +874,12 @@ applied back, so properties and markers on unchanged text survive."
         (output-properties (opencode-output-properties beg))
         (inhibit-read-only t))
     (save-excursion
-      (with-temp-buffer
-        ;; Context modes start timers that would run in the session later.
-        (let ((markdown-ts-enable-table-mode nil)
-              (markdown-ts-enable-code-block-context-mode nil))
-          (delay-mode-hooks (markdown-ts-mode)))
+      (with-current-buffer (opencode--table-buffer)
+        (erase-buffer)
         (insert text)
         (goto-char (point-min))
+        ;; Entered anew, the table counts as changed, which alignment needs.
+        (markdown-ts-in-table-mode -1)
         (markdown-ts-in-table-mode 1)
         (markdown-ts-table-align-table t)
         ;; Alignment always ends with a newline; keep an unterminated table so.
@@ -775,6 +901,24 @@ applied back, so properties and markers on unchanged text survive."
                       (setq pos next)))))
               (opencode-buttonize (point-min) (point-max) t))))))))
 
+(defun opencode--table-free-p (finished)
+  "Return non-nil when the text the next table scan covers holds no pipe.
+FINISHED is as for `opencode-align-finished-tables'.  A pipe table needs
+one, and scanning parses the transcript, whose cost grows with it, so
+the scan is skipped: the scan marker is left where it would leave it."
+  (let* ((inhibit-field-text-motion t)
+         (start (marker-position opencode--table-scan-marker))
+         (pmark (opencode-pmark))
+         (end (if finished pmark (save-excursion (goto-char pmark) (line-beginning-position)))))
+    (when (or (>= start end)
+              (not (save-excursion (goto-char start) (search-forward "|" end t))))
+      (if finished
+          (progn (set-marker opencode--table-scan-marker nil)
+                 (setq opencode--table-scan-marker nil))
+        (set-marker opencode--table-scan-marker
+                    (max start (save-excursion (goto-char end) (line-beginning-position 0)))))
+      t)))
+
 (defun opencode-align-finished-tables (&optional finished)
   "Render the tables of the current text block whose end has arrived.
 A table is complete once a later complete line follows it; FINISHED
@@ -782,7 +926,8 @@ means the block ended, so a table at its end is complete too.  One line
 of context is kept for a header whose delimiter row has yet to arrive.
 A table ending the output may grow at the process mark, which then
 moves past it with the points following output."
-  (when opencode--table-scan-marker
+  (when (and opencode--table-scan-marker
+             (not (opencode--table-free-p finished)))
     (opencode-keeping-followers
       (save-excursion
         (save-restriction

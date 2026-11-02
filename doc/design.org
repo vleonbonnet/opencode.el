@@ -128,6 +128,16 @@ Opening a session renders its projected messages; afterwards the event stream dr
 - Notices are inserted before the idle prompt, and a turn started elsewhere lifts the prompt first.
 - A background job's completion is a synthetic message, keyed by its message ID, which its inbox item shares. Its metadata makes it a block of the job's tool, and the element wrapping its text is removed only when it is exactly what the service writes, so an unexpected text shows whole.
 
+* Writing a transcript in linear time
+
+Writing a transcript whole cost time quadratic in its length, which made a reconnection rendering a few long ones take seconds. Three causes stacked, which =opencode-test-replay-time-linear= now guards against: a transcript four times longer must take less than eight times as long.
+
+The undo list keeps only the prompt's edits: an output change drops its records and shifts the prompt's by its length. Replaying a prompt runs Comint's input sending, whose records, made at the input, are not output; they were kept, two per prompt, and every later output change shifted all of them, which was the 1250 profiler samples of =opencode--undo-shift= at the user's reconnection. They also let undo rewrite the transcript. A transcript is now written under =opencode-without-undo=, which records nothing and shifts the prompt's records once afterwards, by how far the input moved; so is another client's prompt rendered live.
+
+=comint-output-filter= makes three markers on every call, which stay in the buffer until a garbage collection, and every insertion adjusts every marker of the buffer. With the user's large =gc-cons-threshold=, tens of thousands accumulated while a transcript was written. Session buffers write with =opencode--output-filter= instead, which does exactly what Comint's does with markers it reuses, the prompt's included, and so does the idle prompt.
+
+Rendering each table had set up =markdown-ts-mode= in a fresh buffer, which looks up every grammar: 8 ms a table, now 0.5 ms with one buffer set up once. Scanning a text block for its tables parses the transcript; a block without a pipe has none, and is no longer scanned. And a tool call's path is made relative to the project through true names, which stat every directory of both; the result is now cached. Byte-compiled, writing 1000 turns of four messages took 6.7 s, and four times as long for twice as many; it takes 0.1 s, and 4000 turns 0.37 s.
+
 * Points that follow output
 
 A point at the end of the transcript or in the input follows output, in the buffer and in every window showing it, selected or not; one elsewhere in the transcript keeps its text, and its window its start. The end of the transcript starts at the idle prompt when one is shown, whose markup is hidden, so that a point before it looks the same as one after it; otherwise at the process mark.

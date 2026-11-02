@@ -968,29 +968,30 @@ transcript or in the input stay there, others at their line, as
 (defun opencode--render-user-prompt (text &optional message-id note)
   "Render a user prompt with TEXT for MESSAGE-ID, followed by NOTE when given.
 Input still being typed is lifted out and put back afterwards."
-  (let* ((process (get-buffer-process (current-buffer)))
-         (pending (buffer-substring (opencode-pmark) (point-max)))
-         (inhibit-read-only t))
-    (delete-region (opencode-pmark) (point-max))
-    (unless (opencode-prompt-shown-p)
-      (opencode-open-block 'user)
-      (opencode-show-prompt))
-    (goto-char (point-max))
-    (insert text)
-    (let ((comint-input-sender #'opencode-highlight-input)
-          (comint-input-filter-functions nil))
-      (comint-send-input nil t))
-    (when message-id
-      (with-silent-modifications
-        (put-text-property comint-last-input-start comint-last-input-end
-                           'opencode-message message-id)))
-    (when note
-      (opencode-output (opencode-fontify-as (propertize (concat note "\n") 'font-lock-face 'opencode-notice)
-                                            'verbatim)))
-    (setq opencode--last-block-kind 'user)
-    (goto-char (point-max))
-    (insert pending)
-    (set-marker (process-mark process) (- (point-max) (length pending)))))
+  (opencode-without-undo
+    (let* ((process (get-buffer-process (current-buffer)))
+           (pending (buffer-substring (opencode-pmark) (point-max)))
+           (inhibit-read-only t))
+      (delete-region (opencode-pmark) (point-max))
+      (unless (opencode-prompt-shown-p)
+        (opencode-open-block 'user)
+        (opencode-show-prompt))
+      (goto-char (point-max))
+      (insert text)
+      (let ((comint-input-sender #'opencode-highlight-input)
+            (comint-input-filter-functions nil))
+        (comint-send-input nil t))
+      (when message-id
+        (with-silent-modifications
+          (put-text-property comint-last-input-start comint-last-input-end
+                             'opencode-message message-id)))
+      (when note
+        (opencode-output (opencode-fontify-as (propertize (concat note "\n") 'font-lock-face 'opencode-notice)
+                                              'verbatim)))
+      (setq opencode--last-block-kind 'user)
+      (goto-char (point-max))
+      (insert pending)
+      (set-marker (process-mark process) (- (point-max) (length pending))))))
 
 (defun opencode--user-message-text (message)
   "Return the prompt text of user MESSAGE with its attachments named."
