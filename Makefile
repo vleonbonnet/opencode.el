@@ -5,7 +5,11 @@
 
 EMACS ?= emacs
 DEPS ?= $(HOME)/.emacs.d/elpaca/builds
-LOAD_PATH = -L . -L test -L $(DEPS)/plz -L $(DEPS)/transient -L $(DEPS)/cond-let -L $(DEPS)/compat -L $(DEPS)/llama
+DEP_PATH = $(foreach dep,plz transient cond-let compat llama,-L $(abspath $(DEPS))/$(dep))
+LOAD_PATH = -L . -L test $(DEP_PATH)
+# A graphical Emacs may start in another directory, such as the Mac
+# port's in the home directory, and prints only to its *Messages*.
+GUI_LOAD_PATH = -L $(CURDIR) -L $(CURDIR)/test $(DEP_PATH)
 # Stale byte code must never shadow an edited source, in builds or tests.
 PREFER_NEWER = --eval '(setq load-prefer-newer t)'
 BATCH = $(EMACS) -Q --batch $(LOAD_PATH) $(PREFER_NEWER)
@@ -29,8 +33,10 @@ test:
 	$(BATCH) -l test/opencode-test-helpers.el $(addprefix -l ,$(TESTS)) -f ert-run-tests-batch-and-exit
 
 test-gui:
-	$(EMACS) -Q $(LOAD_PATH) $(PREFER_NEWER) -l test/opencode-test-helpers.el $(addprefix -l ,$(TESTS)) \
-	  --eval '(ert-run-tests-batch-and-exit (quote (tag gui)))'
+	$(EMACS) -Q $(GUI_LOAD_PATH) $(PREFER_NEWER) \
+	  --eval '(add-hook (quote kill-emacs-hook) (lambda () (princ (with-current-buffer "*Messages*" (buffer-string)) (function external-debugging-output))))' \
+	  -l $(CURDIR)/test/opencode-test-helpers.el $(addprefix -l $(CURDIR)/,$(TESTS)) \
+	  --eval '(kill-emacs (if (zerop (ert-stats-completed-unexpected (ert-run-tests-batch (quote (tag gui))))) 0 1))'
 
 contract:
 	$(BATCH) -l dev/contract/record-requests.el "$(CONTRACT_LOG)"
