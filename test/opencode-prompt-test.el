@@ -113,8 +113,9 @@
         (setq opencode-test-requests nil)
         (revert-buffer)
         (should (equal (mapcar (lambda (request) (plist-get request :path))
-                               (seq-take (reverse opencode-test-requests) 2))
-                       (list (concat "/api/session/" id) (format "/api/session/%s/message" id))))
+                               (seq-take (reverse opencode-test-requests) 3))
+                       (list (concat "/api/session/" id) (format "/api/session/%s/inbox" id)
+                             (format "/api/session/%s/message" id))))
         (should (equal (opencode-test-input buffer) "draft"))
         (should (equal (string-trim-right (string-remove-suffix "draft" (opencode-test-text buffer)))
                        transcript))))))
@@ -552,7 +553,9 @@ ran the mode's setup of that table."
           (should (zerop (hash-table-count (opencode--sent-input-table)))))))))
 
 (ert-deftest opencode-test-steering-prompts-get-their-ids ()
-  "Prompts sent while a turn streams each get their ID, in any order, and cut in the conversation's order."
+  "Prompts sent while a turn streams show as pending, then in the transcript once delivered.
+Each shows where its delivery places it, in the order delivered, with
+its ID, so cuts follow the conversation."
   (opencode-test-with-server
     (let ((session (opencode-test-scenario "text"))
           (ids nil))
@@ -576,24 +579,32 @@ ran the mode's setup of that table."
               (data ,@base (text . "Working on it after steer one after steer two")))))
           (pcase-let ((`(,two ,one ,start) ids))
             (should (= (length (delete-dups (copy-sequence ids))) 3))
-            (should (= (hash-table-count (opencode--sent-input-table)) 2))
+            ;; Pending, in the order sent, and not in the transcript.
+            (should-not (string-search "> steer one" (buffer-string)))
+            (should (string-match-p "steer one\\(.\\|\n\\)*steer two" (opencode-inbox-area-string)))
+            (should (equal (opencode-test-input (current-buffer)) ""))
+            (should (zerop (hash-table-count (opencode--sent-input-table))))
+            (opencode-test-dispatch (list (car (opencode-test-inbox-events session one "steer one"))
+                                          (car (opencode-test-inbox-events session two "steer two"))))
             ;; The second one is reported delivered first.
             (opencode-test-dispatch (cdr (opencode-test-inbox-events session two "steer two")))
-            (should (equal (opencode-message-at (opencode-test-find "steer two")) two))
-            (should-not (opencode-message-at (opencode-test-find "steer one")))
+            (should (equal (opencode-message-at (+ 2 (opencode-test-find "> steer two"))) two))
+            (should (= (how-many "> steer two" (point-min) (point-max)) 1))
+            (should-not (string-search "steer two" (opencode-inbox-area-string)))
+            (should (string-search "steer one" (opencode-inbox-area-string)))
+            (should-not (string-search "> steer one" (buffer-string)))
             (opencode-test-dispatch (cdr (opencode-test-inbox-events session one "steer one")))
-            (should (equal (opencode-message-at (opencode-test-find "steer one")) one))
-            ;; Each ID covers its own input and nothing of the output around it.
+            (should (equal (opencode-message-at (+ 2 (opencode-test-find "> steer one"))) one))
+            (should (= (how-many "> steer one" (point-min) (point-max)) 1))
+            (should-not (opencode-inbox-area-string))
+            ;; Each ID covers its own prompt and nothing of the output around it.
             (should (equal (opencode-message-at (opencode-test-find " after steer one")) "msg_busy"))
             (should (equal (opencode-message-at (opencode-test-find " after steer two")) "msg_busy"))
-            (should-not (text-property-any (opencode-test-find "steer one")
-                                           (+ (opencode-test-find "steer one") (length "steer one"))
-                                           'opencode-message two))
             (opencode-test-answer session "msg_next" "Next step.")
             ;; The conversation reads: start, busy, two, one, next.
             (should (equal (opencode--message-boundary (opencode-test-find "start working")) "msg_busy"))
-            (should (equal (opencode--message-boundary (opencode-test-find "steer two")) one))
-            (should (equal (opencode--message-boundary (opencode-test-find "steer one")) "msg_next"))
+            (should (equal (opencode--message-boundary (+ 2 (opencode-test-find "> steer two"))) one))
+            (should (equal (opencode--message-boundary (+ 2 (opencode-test-find "> steer one"))) "msg_next"))
             (dolist (answer '("Working on it" " after steer one" " after steer two"))
               (should (equal (opencode--message-boundary (opencode-test-find answer)) two)))
             (should-not (opencode--message-boundary (opencode-test-find "Next step.")))

@@ -52,7 +52,8 @@
                                (cons (intern (format "%s" (car pair))) (format "%s" (cdr pair))))
                              query)
                    (make-hash-table)))
-       ,@(cond ((stringp encoded) `((body . ,encoded)))
+       ;; The encoding is UTF-8 bytes, which only text may hold in a JSON string.
+       ,@(cond ((stringp encoded) `((body . ,(decode-coding-string encoded 'utf-8))))
                (encoded `((encodeError . ,(plist-get encoded :encode-error)))))
        (test . ,(format "%s" (and (ert-running-test) (ert-test-name (ert-running-test)))))))))
 

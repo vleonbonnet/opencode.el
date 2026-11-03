@@ -378,6 +378,37 @@ the cache is still there to save the next turn's cost."
 It shows how long the bar would be, without drawing attention."
   :group 'opencode-faces)
 
+;;;; Pending prompts
+
+(defcustom opencode-pending-prompt-icon "\U000F0150" ; nf-md-clock_outline
+  "Icon of a prompt the service took but has not delivered to its session yet.
+Session buffers show such prompts between the transcript and the input,
+each headed by this icon and a label in `opencode-pending-label'.  The
+default icon comes from Nerd Fonts; an empty string shows the label
+alone."
+  :type 'string
+  :group 'opencode)
+
+(defface opencode-pending-label
+  '((t :inherit opencode-session-status-working :slant italic))
+  "Label heading a pending prompt, which tells when it will be delivered.
+It inherits the working status: a pending prompt waits on the turn."
+  :group 'opencode-faces)
+
+(defface opencode-pending-prompt '((t :inherit shadow))
+  "Text of a pending prompt, dimmed: it is not part of the conversation yet."
+  :group 'opencode-faces)
+
+(defface opencode-pending-attachment
+  '((t :inherit (font-lock-constant-face opencode-pending-prompt)))
+  "Labels of the files, subagents and skills a pending prompt attaches."
+  :group 'opencode-faces)
+
+(defface opencode-pending-margin
+  '((t :inherit opencode-session-status-working :height reset))
+  "Margin of pending prompts, in the colour of the turn they wait on."
+  :group 'opencode-faces)
+
 ;;;; Numbers
 
 (defun opencode-format-duration (seconds)
