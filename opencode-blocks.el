@@ -87,10 +87,12 @@ Pending permissions and questions use it to mark the block they belong to.")
 (defvar opencode-collapsible-keymap
   (let ((map (make-sparse-keymap)))
     (keymap-set map "RET" #'opencode-toggle-block)
-    (keymap-set map "<mouse-1>" #'opencode-toggle-block)
+    (keymap-set map "<mouse-1>" #'opencode-mouse-toggle-block)
     (keymap-set map "TAB" #'opencode-toggle-block)
     map)
-  "Keymap of collapsible summary lines.")
+  "Keymap of collapsible summary lines.
+A click toggles the block on its box only: elsewhere on the line, it
+does what it does in other text.")
 
 (defun opencode-blocks-ensure ()
   "Initialize the block table of this buffer."
@@ -161,13 +163,22 @@ Pending permissions and questions use it to mark the block they belong to.")
     (_ tool)))
 
 (defun opencode-boxed-label (icon label face)
-  "Return ICON in an inverse box and LABEL in a bordered box, colored as FACE."
+  "Return ICON in an inverse box and LABEL in a bordered box, colored as FACE.
+Both make one box, the box a click on a block's summary toggles it on.
+Under the mouse, Emacs draws text in its `mouse-face' alone, not over
+its face, so the box's `mouse-face' is the icon's face, box and slant
+included: the icon stays as it is and the label fills with the color,
+every glyph keeping its width."
   (let* ((foreground (face-foreground face nil t))
+         (box (list :color foreground))
          (icon-face (list :foreground foreground :background (face-background 'default nil t)
-                          :inverse-video t))
-         (box-face (list :box (list :color foreground) :slant 'italic)))
-    (concat (propertize (format " %s " icon) 'face icon-face 'font-lock-face icon-face)
-            (propertize (format " %s " label) 'face box-face 'font-lock-face box-face))))
+                          :inverse-video t :box box :slant 'italic))
+         (box-face (list :box box :slant 'italic)))
+    ;; One `mouse-face' object, so that both highlight as one.
+    (concat (propertize (format " %s " icon) 'face icon-face 'font-lock-face icon-face
+                        'mouse-face icon-face 'opencode-box t)
+            (propertize (format " %s " label) 'face box-face 'font-lock-face box-face
+                        'mouse-face icon-face 'opencode-box t))))
 
 (defun opencode--generic-tool-description (input)
   "Describe INPUT by its only value, or by its number of arguments."
@@ -444,19 +455,24 @@ this overlay: its end marker sits after the trailing newline and follows
 every summary replacement."
   (let ((start (opencode-pmark)))
     (opencode-output (opencode--summary-text (concat summary "\n")))
-    (let ((overlay (make-overlay start (opencode-pmark) nil t nil))
-          (margin (opencode-margin face)))
-      (overlay-put overlay 'opencode-collapsible t)
-      (overlay-put overlay 'opencode-expanded nil)
-      (overlay-put overlay 'opencode-data data)
-      (overlay-put overlay 'opencode-summary summary)
-      (overlay-put overlay 'before-string (opencode-disclosure-string nil face))
-      (overlay-put overlay 'keymap opencode-collapsible-keymap)
-      (overlay-put overlay 'mouse-face 'highlight)
-      (overlay-put overlay 'line-prefix margin)
-      (overlay-put overlay 'wrap-prefix margin)
-      (opencode-summary-fit-queue overlay)
-      overlay)))
+    (opencode--collapsible-overlay start (opencode-pmark) summary face data)))
+
+(defun opencode--collapsible-overlay (start end summary face data)
+  "Return the overlay of a collapsed block whose SUMMARY line spans START..END.
+FACE colors its arrow and margin; DATA is kept on it.  Text inserted at
+START goes before it."
+  (let ((overlay (make-overlay start end nil t nil))
+        (margin (opencode-margin face)))
+    (overlay-put overlay 'opencode-collapsible t)
+    (overlay-put overlay 'opencode-expanded nil)
+    (overlay-put overlay 'opencode-data data)
+    (overlay-put overlay 'opencode-summary summary)
+    (overlay-put overlay 'before-string (opencode-disclosure-string nil face))
+    (overlay-put overlay 'keymap opencode-collapsible-keymap)
+    (overlay-put overlay 'line-prefix margin)
+    (overlay-put overlay 'wrap-prefix margin)
+    (opencode-summary-fit-queue overlay)
+    overlay))
 
 (defun opencode-replace-summary (overlay summary)
   "Replace OVERLAY's summary text with SUMMARY, unless it already shows it.
@@ -516,17 +532,28 @@ in another color."
       (opencode-tool-summary tool input face nil "…"))
      (t (opencode-tool-summary tool input face nil nil (opencode-tool-background-note data))))))
 
+(defun opencode-block-summary (overlay)
+  "Return the summary block OVERLAY shows for its data, or nil to keep its own.
+A notice's summary is given once, as it is written."
+  (let ((data (opencode-block-data overlay)))
+    (pcase (plist-get data :type)
+      ('reasoning (opencode-reasoning-summary (plist-get data :text) (plist-get data :hidden-kind)
+                                              (plist-get data :dropped)))
+      ('tool (opencode-tool-collapsed-summary data))
+      ('group (opencode-group-summary (plist-get data :members))))))
+
 (defun opencode-refresh-block (overlay)
-  "Redraw OVERLAY's summary, colors and expanded content after its data changed."
+  "Redraw OVERLAY's summary, colors and expanded content after its data changed.
+A block of an earlier turn that becomes able to join a group, or no
+longer is, groups its turn's blocks anew (see `opencode-group-runs')."
   (when (and (overlayp overlay) (overlay-buffer overlay))
     (let ((data (opencode-block-data overlay)))
-      (if (eq (plist-get data :type) 'reasoning)
-          (opencode-replace-summary
-           overlay (opencode-reasoning-summary (plist-get data :text) (plist-get data :hidden-kind)
-                                               (plist-get data :dropped)))
-        (opencode-replace-summary overlay (opencode-tool-collapsed-summary data)))
+      (when-let* ((summary (opencode-block-summary overlay)))
+        (opencode-replace-summary overlay summary))
       (opencode-style-block overlay (opencode-block-face data))
-      (opencode--refresh-expanded overlay))))
+      (opencode--refresh-expanded overlay)
+      (unless (eq (plist-get data :type) 'group)
+        (opencode--regroup-after-change overlay)))))
 
 (defun opencode-block-update (overlay &rest properties)
   "Set PROPERTIES on OVERLAY's data and redraw it when they change anything."
@@ -674,8 +701,10 @@ Each receives the block data and returns a string, or nil to defer.")
 (defun opencode--refresh-expanded (overlay)
   "Rewrite OVERLAY's expansion after its data changed.
 Points in the old expansion stay at its start, and those following
-output after it, as `opencode-call-preserving-viewport' keeps them."
-  (when (overlay-get overlay 'opencode-expanded)
+output after it, as `opencode-call-preserving-viewport' keeps them.
+A group's expansion is its blocks, which stay."
+  (when (and (overlay-get overlay 'opencode-expanded)
+             (not (opencode-group-p overlay)))
     (let ((old (overlay-get overlay 'opencode-content-overlay))
           (inhibit-read-only t))
       ;; Told apart before the deletion, which brings the points of an
@@ -689,7 +718,8 @@ output after it, as `opencode-call-preserving-viewport' keeps them."
                (delete-overlay old)
                (delete-region start end)
                (opencode--insert-expansion overlay start))
-           (opencode--insert-expansion overlay (overlay-end overlay))))))))
+           (opencode--insert-expansion overlay (overlay-end overlay)))
+         (opencode--refit-group-of overlay))))))
 
 (defun opencode-collapsible-at (position)
   "Return the collapsible summary overlay at POSITION, if any."
@@ -705,17 +735,35 @@ output after it, as `opencode-call-preserving-viewport' keeps them."
                 (overlays-at position))))
 
 (defun opencode-expand-block (overlay)
-  "Expand OVERLAY's block unless it is already expanded."
+  "Expand OVERLAY's block unless it is already expanded.
+A group shows its blocks, as they were."
   (unless (overlay-get overlay 'opencode-expanded)
     (let ((inhibit-read-only t)
           (face (opencode-block-face (opencode-block-data overlay))))
       (overlay-put overlay 'opencode-expanded t)
-      (opencode--insert-expansion overlay (overlay-end overlay))
+      (if (opencode-group-p overlay)
+          (opencode--group-show overlay t)
+        (opencode--insert-expansion overlay (overlay-end overlay))
+        (opencode--refit-group-of overlay))
       (overlay-put overlay 'before-string (opencode-disclosure-string t face)))))
 
+(defun opencode--refit-group-of (overlay)
+  "Make the group of block OVERLAY, if any, hide it as it is now."
+  (when-let* ((group (overlay-get overlay 'opencode-group))
+              ((overlay-buffer group)))
+    (opencode--group-fit-body group)))
+
 (defun opencode-collapse-block (overlay)
-  "Collapse OVERLAY's block unless it is already collapsed."
-  (when (overlay-get overlay 'opencode-expanded)
+  "Collapse OVERLAY's block unless it is already collapsed.
+A group hides its blocks again."
+  (cond
+   ((not (overlay-get overlay 'opencode-expanded)))
+   ((opencode-group-p overlay)
+    (overlay-put overlay 'opencode-expanded nil)
+    (opencode--group-show overlay nil)
+    (overlay-put overlay 'before-string
+                 (opencode-disclosure-string nil (opencode-block-face (opencode-block-data overlay)))))
+   (t
     (let* ((content (overlay-get overlay 'opencode-content-overlay))
            (pmark (and (get-buffer-process (current-buffer)) (opencode-pmark)))
            (inhibit-read-only t))
@@ -731,7 +779,8 @@ output after it, as `opencode-call-preserving-viewport' keeps them."
         (overlay-put overlay 'opencode-content-overlay nil)
         (overlay-put overlay 'opencode-expanded nil)
         (overlay-put overlay 'before-string
-                     (opencode-disclosure-string nil (opencode-block-face (opencode-block-data overlay))))))))
+                     (opencode-disclosure-string nil (opencode-block-face (opencode-block-data overlay))))
+        (opencode--refit-group-of overlay))))))
 
 (defun opencode-toggle-block (&optional position)
   "Expand or collapse the block whose summary is at POSITION or point."
@@ -741,13 +790,39 @@ output after it, as `opencode-call-preserving-viewport' keeps them."
         (opencode-collapse-block overlay)
       (opencode-expand-block overlay))))
 
+(defun opencode-mouse-toggle-block (event)
+  "Expand or collapse the block whose box was clicked, EVENT being the click.
+Only the box at the start of a summary takes clicks (see
+`opencode-boxed-label'); elsewhere, the click runs its global binding,
+as on other text."
+  (interactive "e")
+  (let* ((end (event-end event))
+         (window (posn-window end))
+         (position (posn-point end)))
+    (if (and (windowp window) (integerp position)
+             (with-current-buffer (window-buffer window)
+               (and (get-text-property position 'opencode-box)
+                    (opencode-collapsible-at position))))
+        (with-selected-window window
+          (opencode-toggle-block position))
+      (opencode-run-global-click event))))
+
+(defun opencode-run-global-click (event)
+  "Run the global binding of the click EVENT, if any."
+  (interactive "e")
+  (when-let* ((command (lookup-key global-map (vector (car-safe event))))
+              ((commandp command)))
+    (call-interactively command nil (vector event))))
+
 (defun opencode--next-block-start (position)
-  "Return the start of the first collapsible summary after POSITION, or nil."
+  "Return the start of the first collapsible summary after POSITION, or nil.
+The blocks a collapsed group hides are skipped."
   (let (best)
     (dolist (overlay (overlays-in position (point-max)) best)
       (when (and (overlay-get overlay 'opencode-collapsible)
                  (> (overlay-start overlay) position)
-                 (or (null best) (< (overlay-start overlay) best)))
+                 (or (null best) (< (overlay-start overlay) best))
+                 (not (invisible-p (overlay-start overlay))))
         (setq best (overlay-start overlay))))))
 
 (defun opencode-tab-dwim ()
@@ -891,6 +966,270 @@ KEY, when given, identifies the block."
                   (list :type 'notice :key key :text text))))
     (when key (puthash key overlay opencode--blocks))
     overlay))
+
+;;;; Groups of blocks
+
+;; Once a later prompt is sent, the blocks of an earlier turn matter
+;; less than the answers between them: each run of two blocks or more
+;; following one another collapses into one group, whose summary counts
+;; its blocks by kind, and expands to show them as they were.  The
+;; group's summary is buffer text written before the run, so that keys,
+;; points and fitting treat it as any summary; its blocks stay, hidden
+;; by an overlay from the end of the summary's line to the end of the
+;; last block's line, as Org hides an entry.  Groups are made where a
+;; prompt is written, sent or rendered from the service, so that a
+;; buffer rendered again groups as it grouped live.  A block still
+;; running, or waiting on the user, joins none, and once it is done its
+;; turn groups again.
+
+(defconst opencode-group-icon "\U000F0328"     ; nf-md-layers
+  "Icon of a group's box.")
+
+(defun opencode-group-p (overlay)
+  "Return non-nil when OVERLAY is the summary of a group of blocks."
+  (eq (plist-get (overlay-get overlay 'opencode-data) :type) 'group))
+
+(defun opencode--groupable-p (overlay)
+  "Return non-nil when block OVERLAY may join a group of an earlier turn.
+It may once done: a tool call finished and waiting on nobody, reasoning
+ended, a notice; never a group."
+  (when (and (overlay-buffer overlay) (overlay-get overlay 'opencode-collapsible))
+    (let ((data (opencode-block-data overlay)))
+      (pcase (plist-get data :type)
+        ('tool (and (member (plist-get data :status) '("completed" "error"))
+                    (not (plist-get data :waiting))))
+        ('reasoning (plist-get data :ended))
+        ('notice t)))))
+
+(defun opencode--block-end (overlay)
+  "Return where block OVERLAY ends, its expansion included."
+  (let ((content (overlay-get overlay 'opencode-content-overlay)))
+    (if (and (overlayp content) (overlay-buffer content))
+        (max (overlay-end overlay) (overlay-end content))
+      (overlay-end overlay))))
+
+(defun opencode--block-kind-label (data)
+  "Return the name a group's summary counts block DATA under."
+  (pcase (plist-get data :type)
+    ('tool (opencode-tool-short-label (plist-get data :tool)))
+    ('reasoning (or (plist-get data :hidden-kind) "thinking"))
+    (_ "notice")))
+
+(defun opencode-group-summary (members)
+  "Return the summary of a group of MEMBERS, block overlays, in order.
+Its box counts the blocks; then come the counts of each kind, in the
+order they first appear, and of the failed ones, in the error face."
+  (let ((counts nil)
+        (total 0)
+        (failed 0))
+    (dolist (member members)
+      (when (overlay-buffer member)
+        (let* ((data (opencode-block-data member))
+               (kind (opencode--block-kind-label data))
+               (entry (assoc kind counts)))
+          (cl-incf total)
+          (if entry
+              (cl-incf (cdr entry))
+            (push (cons kind 1) counts))
+          (when (or (plist-get data :error) (cdr (opencode-tool-background-outcome data)))
+            (cl-incf failed)))))
+    (concat (opencode-boxed-label opencode-group-icon (format "%d blocks" total)
+                                  'opencode-tool-margin-highlight)
+            " "
+            (mapconcat (lambda (entry) (format "%d %s" (cdr entry) (car entry))) (nreverse counts) " · ")
+            (when (> failed 0)
+              (concat " · " (propertize (format "%d failed" failed) 'face 'error 'font-lock-face 'error))))))
+
+(defun opencode--group-body (overlay)
+  "Return the live overlay hiding the blocks of group OVERLAY, or nil."
+  (let ((body (overlay-get overlay 'opencode-group-body)))
+    (and (overlayp body) (overlay-buffer body) body)))
+
+(defun opencode--group-settle-points (overlay)
+  "Bring the points that collapsed group OVERLAY hides to its summary line.
+The buffer's point and its windows' points go to the start of the line,
+and a window starting in the hidden text starts there."
+  (when-let* ((body (opencode--group-body overlay)))
+    (let ((from (overlay-start body))
+          (to (overlay-end body))
+          (home (overlay-start overlay)))
+      (cl-flet ((hidden (position) (< from position to)))
+        (when (hidden (point))
+          (goto-char home))
+        (dolist (window (get-buffer-window-list nil nil t))
+          (when (hidden (window-point window))
+            (set-window-point window home))
+          (when (hidden (window-start window))
+            (set-window-start window home t)))))))
+
+(defun opencode--group-fit-body (overlay)
+  "Make the overlay hiding the blocks of group OVERLAY cover them as they are now.
+A block expanded or collapsed changes where the last one ends."
+  (when-let* ((body (opencode--group-body overlay))
+              (last (seq-find #'overlay-buffer (reverse (plist-get (opencode-block-data overlay) :members)))))
+    (move-overlay body (1- (overlay-end overlay)) (max (1- (overlay-end overlay))
+                                                       (1- (opencode--block-end last))))))
+
+(defun opencode--group-show (overlay show)
+  "Show the blocks of group OVERLAY when SHOW is non-nil, else hide them."
+  (when-let* ((body (opencode--group-body overlay)))
+    (opencode--group-fit-body overlay)
+    (overlay-put body 'invisible (unless show 'opencode-group))
+    (unless show
+      (opencode--group-settle-points overlay))))
+
+(defun opencode--group-isearch-open (body)
+  "Expand the group whose blocks BODY hides, as Isearch found a match there."
+  (when-let* ((overlay (overlay-get body 'opencode-group-of))
+              ((overlay-buffer overlay)))
+    (opencode-expand-block overlay)))
+
+(defun opencode--make-group (members expanded)
+  "Group MEMBERS, block overlays following one another; return the group's overlay.
+Its summary line is written before the first; the blocks show when
+EXPANDED, else hide, the points they held going to the summary."
+  (let* ((start (overlay-start (car members)))
+         (summary (opencode-group-summary members))
+         (face 'opencode-tool-margin-highlight)
+         (inhibit-read-only t)
+         (end (opencode-insert-output-at start (opencode--summary-text (concat summary "\n"))))
+         (overlay (opencode--collapsible-overlay start end summary face
+                                                 (list :type 'group :members members)))
+         (body (make-overlay (1- end) (1- (opencode--block-end (car (last members)))) nil t t)))
+    (overlay-put body 'opencode-group-of overlay)
+    (overlay-put body 'isearch-open-invisible #'opencode--group-isearch-open)
+    (overlay-put overlay 'opencode-group-body body)
+    (dolist (member members)
+      (overlay-put member 'opencode-group overlay))
+    (if expanded
+        (progn (overlay-put overlay 'opencode-expanded t)
+               (overlay-put overlay 'before-string (opencode-disclosure-string t face)))
+      (opencode--group-show overlay nil))
+    overlay))
+
+(defun opencode--dissolve-group (overlay)
+  "Delete group OVERLAY and its summary line, its blocks showing again as they are."
+  (let ((inhibit-read-only t))
+    (when-let* ((body (opencode--group-body overlay)))
+      (delete-overlay body))
+    (dolist (member (plist-get (opencode-block-data overlay) :members))
+      (when (eq (overlay-get member 'opencode-group) overlay)
+        (overlay-put member 'opencode-group nil)))
+    (dolist (fit (overlay-get overlay 'opencode-fit-overlays))
+      (delete-overlay (cdr fit)))
+    (when (overlay-buffer overlay)
+      (let ((start (overlay-start overlay))
+            (end (overlay-end overlay)))
+        (delete-overlay overlay)
+        (opencode-keeping-followers
+          (delete-region start end))))))
+
+(defun opencode--block-runs (blocks headers)
+  "Return the runs of BLOCKS, overlays in buffer order, that may form groups.
+A run is a list of two blocks or more, each able to join a group, each
+starting where the one before it ends, or where the summary line of a
+group ends that starts there, HEADERS mapping the start of such a line
+to its end."
+  (let ((runs nil)
+        (run nil))
+    (dolist (overlay blocks)
+      (if (not (opencode--groupable-p overlay))
+          (progn (push run runs)
+                 (setq run nil))
+        (when run
+          (let ((end (opencode--block-end (car run))))
+            (unless (= (gethash end headers end) (overlay-start overlay))
+              (push run runs)
+              (setq run nil))))
+        (push overlay run)))
+    (push run runs)
+    (mapcar #'reverse (seq-filter #'cdr runs))))
+
+(defun opencode-group-runs (from to)
+  "Group the blocks between FROM and TO, where an earlier turn lies.
+Each run of two blocks or more following one another, each done (see
+`opencode--groupable-p'), becomes a group, collapsed.  A group already
+there that holds a run as it is stays as it is, expanded or not; the
+others make way, a group made of blocks of an expanded one starting
+expanded.  Points left in the text a group hides go to its summary."
+  (opencode-without-undo
+    (let ((from (copy-marker from))
+          (to (copy-marker to))
+          (headers (make-hash-table))
+          (groups nil)
+          (blocks nil))
+      (unwind-protect
+          (progn
+            (dolist (overlay (overlays-in from to))
+              (when (and (overlay-get overlay 'opencode-collapsible)
+                         (<= from (overlay-start overlay)) (< (overlay-start overlay) to))
+                (if (opencode-group-p overlay)
+                    (progn (push overlay groups)
+                           (puthash (overlay-start overlay) (overlay-end overlay) headers))
+                  (push overlay blocks))))
+            (let ((runs (opencode--block-runs (sort blocks :key #'overlay-start) headers))
+                  (expanded nil))
+              (dolist (group groups)
+                (let ((members (plist-get (opencode-block-data group) :members)))
+                  (if (member members runs)
+                      (progn (setq runs (delete members runs))
+                             (opencode-refresh-block group))
+                    (when (overlay-get group 'opencode-expanded)
+                      (setq expanded (append members expanded)))
+                    (opencode--dissolve-group group))))
+              (dolist (run runs)
+                (opencode--make-group run (seq-some (lambda (member) (memq member expanded)) run)))))
+        (set-marker from nil)
+        (set-marker to nil)))))
+
+(defun opencode--earlier-turn (position)
+  "Return (FROM . TO) of the earlier turn holding POSITION, or nil.
+FROM is the end of the prompt before POSITION, or the start of the
+buffer, and TO the start of the prompt after it; POSITION in the latest
+turn, after the last prompt, gives nil."
+  (when-let* (((get-buffer-process (current-buffer)))
+              (pmark (opencode-pmark))
+              (to (next-single-property-change position 'opencode-prompt nil pmark))
+              ((< to pmark)))
+    (cons (or (previous-single-property-change position 'opencode-prompt) (point-min)) to)))
+
+(defun opencode-group-earlier-turn (prompt-start)
+  "Group the blocks of the turn that the prompt at PROMPT-START follows.
+That turn runs from the end of the prompt before, or the start of the
+buffer, to PROMPT-START (see `opencode-group-runs')."
+  (opencode-group-runs (or (previous-single-property-change prompt-start 'opencode-prompt) (point-min))
+                       prompt-start))
+
+(defun opencode--regroup-after-change (overlay)
+  "Group anew the turn of block OVERLAY when the change of its data matters.
+In a group still able to join one, it only changes the group's summary;
+in an earlier turn, becoming able to join a group or no longer able to
+groups its turn again."
+  (let ((group (overlay-get overlay 'opencode-group))
+        (groupable (opencode--groupable-p overlay)))
+    (when (and group (not (overlay-buffer group)))
+      (setq group nil))
+    (cond
+     ((and group groupable)
+      (opencode-refresh-block group))
+     ((or group groupable)
+      (when-let* ((turn (opencode--earlier-turn (overlay-start overlay))))
+        (opencode-group-runs (car turn) (cdr turn)))))))
+
+(defun opencode-group-all-turns ()
+  "Group the blocks of every turn followed by a prompt, as rendering them does."
+  (when (get-buffer-process (current-buffer))
+    (let ((position (point-min))
+          (start (make-marker)))
+      (while (< (setq position (if (get-text-property position 'opencode-prompt)
+                                   position
+                                 (next-single-property-change position 'opencode-prompt nil (opencode-pmark))))
+                (opencode-pmark))
+        ;; Grouping writes before the prompt.
+        (set-marker start position)
+        (opencode-group-earlier-turn position)
+        (setq position (next-single-property-change start 'opencode-prompt nil (opencode-pmark))))
+      (set-marker start nil))))
 
 ;;;; Fitting summaries to the window
 
@@ -1076,11 +1415,31 @@ tens of milliseconds a slice; the others are fitted when scrolled to."
       (setq opencode--fit-timer (run-with-timer 0 nil #'opencode--fit-flush (current-buffer))))))
 
 (defun opencode-blocks-setup ()
-  "Prepare block state and window fitting in this session buffer."
+  "Prepare block state, groups and window fitting in this session buffer."
   (opencode-blocks-ensure)
+  (add-to-invisibility-spec 'opencode-group)
   (add-hook 'window-size-change-functions #'opencode--fit-visible nil t)
   (add-hook 'window-scroll-functions #'opencode--fit-visible nil t)
   (add-hook 'text-scale-mode-hook #'opencode-summary-fit-all-windows nil t))
+
+;;;; Blocks drawn by earlier versions
+
+(defun opencode-blocks-upgrade ()
+  "Bring the blocks this session buffer shows to this version's look.
+Earlier versions highlighted a summary's whole line under the mouse,
+and drew its box otherwise; nor did they group the blocks of earlier
+turns.  Points and windows stay at their text."
+  (add-to-invisibility-spec 'opencode-group)
+  (opencode-call-preserving-viewport
+   (current-buffer)
+   (lambda ()
+     (opencode-without-undo
+       (dolist (overlay (overlays-in (point-min) (point-max)))
+         (when (and (overlay-get overlay 'opencode-collapsible) (not (opencode-group-p overlay)))
+           (overlay-put overlay 'mouse-face nil)
+           (when-let* ((summary (opencode-block-summary overlay)))
+             (opencode-replace-summary overlay summary)))))))
+  (opencode-group-all-turns))
 
 (provide 'opencode-blocks)
 ;;; opencode-blocks.el ends here

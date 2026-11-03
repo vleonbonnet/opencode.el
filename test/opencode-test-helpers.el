@@ -441,6 +441,10 @@ The fake service's inboxes follow their events (see `opencode-test-inbox')."
                  (payload (text . ,text) ,@(when metadata `((metadata . ,metadata)))))))
     ((type . "session.inbox.delivered") (data (sessionID . ,session) (inboxID . ,id)))))
 
+(defun opencode-test-event (session type id &rest data)
+  "Return event TYPE of SESSION with ID, its data DATA."
+  `((type . ,type) (id . ,id) (data (sessionID . ,session) ,@data)))
+
 (defun opencode-test-answer (session message text)
   "Stream TEXT as the answer of assistant MESSAGE in SESSION."
   (let ((base `((sessionID . ,session) (assistantMessageID . ,message) (ordinal . 0))))

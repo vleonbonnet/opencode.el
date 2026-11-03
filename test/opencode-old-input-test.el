@@ -9,10 +9,12 @@
 
 ;;; Commentary:
 
-;; RET or mouse-2 on an earlier prompt sends nothing: the prompt goes,
-;; whole, to `opencode-old-input-function', by default into the input,
-;; its attachments with it when they can go again.  A link in the
-;; prompt keeps its own RET, and RET in the input still sends.
+;; RET on an earlier prompt sends nothing: the region, else the
+;; prompt's line at point, goes to `opencode-old-input-function', by
+;; default into the input, its attachments with it when they can go
+;; again; C-c RET puts the whole prompt there.  The mouse does nothing
+;; special on prompts.  A link in the prompt keeps its own RET, and RET
+;; in the input still sends.
 
 ;;; Code:
 
@@ -41,8 +43,8 @@ The calls are in `recorded', newest first, as (TEXT BUFFER CURRENT)."
            (lambda (text buffer) (push (list text buffer (current-buffer)) recorded))))
      ,@body))
 
-(ert-deftest opencode-test-old-input-ret-gives-whole-prompt ()
-  "RET on an earlier prompt, of one line or several, gives it whole and sends nothing."
+(ert-deftest opencode-test-old-input-ret-gives-line-or-region ()
+  "RET on an earlier prompt gives the line at point, or the region, and sends nothing."
   (opencode-test-with-server
     (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
       (opencode-test-old-send "a single line")
@@ -54,14 +56,39 @@ The calls are in `recorded', newest first, as (TEXT BUFFER CURRENT)."
             (goto-char (+ (opencode-test-find (car spot)) (cdr spot)))
             (should-not (opencode-test-press (current-buffer) "RET")))
           (should (equal (mapcar #'car (reverse recorded))
-                         '("a single line" "first line\nsecond line\nthird line"
-                           "first line\nsecond line\nthird line" "first line\nsecond line\nthird line")))
+                         '("a single line" "second line" "first line" "third line")))
           (dolist (call recorded)
             (should (eq (nth 1 call) (current-buffer)))
             (should (eq (nth 2 call) (current-buffer))))
+          ;; The region, when active, whatever line point is on.
+          (setq recorded nil)
+          (let ((transient-mark-mode t))
+            (goto-char (+ (opencode-test-find "first line") 6))
+            (push-mark (point) t t)
+            (goto-char (+ (opencode-test-find "second line") 6))
+            (should (use-region-p))
+            (opencode-send-input)
+            (deactivate-mark))
+          (should (equal (mapcar #'car recorded) '("line\nsecond")))
           ;; The input is left alone, and nothing is sent.
           (should (equal (opencode-test-typed) ""))
           (should (= (opencode-test-prompt-count) prompts)))))))
+
+(ert-deftest opencode-test-old-input-line-keeps-attachments ()
+  "The line RET gives carries the attachments of its labels that can go again."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
+      (goto-char (point-max))
+      (insert "intro\nlook at ")
+      (opencode--insert-mention "explore")
+      (should-not (opencode-test-press (current-buffer) "RET"))
+      (opencode-test-with-recorded-old-input
+        (goto-char (opencode-test-find "look at"))
+        (should-not (opencode-test-press (current-buffer) "RET"))
+        (let ((text (car (car recorded))))
+          (should (equal (substring-no-properties text) "look at `@explore`"))
+          (should (equal (get-text-property (string-search "@explore" text) 'opencode-sent-attachment text)
+                         '(:agent "explore"))))))))
 
 (ert-deftest opencode-test-old-input-archived-restores-nothing ()
   "RET on an earlier prompt of an archived session restores nothing, sending nothing."
@@ -78,7 +105,7 @@ The calls are in `recorded', newest first, as (TEXT BUFFER CURRENT)."
       (should (opencode-session-archived-p)))))
 
 (ert-deftest opencode-test-old-input-default-puts-it-in-the-input ()
-  "Without a function of its own, the earlier prompt goes into the input, a draft kept."
+  "Without a function of its own, the line at point goes into the input, a draft kept."
   (opencode-test-with-server
     (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
       (opencode-test-old-send "first line\nsecond line")
@@ -86,9 +113,9 @@ The calls are in `recorded', newest first, as (TEXT BUFFER CURRENT)."
             (opencode-old-input-function nil))
         (goto-char (opencode-test-find "second"))
         (should-not (opencode-test-press (current-buffer) "RET"))
-        (should (equal (opencode-test-typed) "first line\nsecond line"))
+        (should (equal (opencode-test-typed) "second line"))
         (should (= (point) (point-max)))
-        ;; A draft stays, the prompt following it after a blank line.
+        ;; A draft stays, the line following it after a blank line.
         (delete-region (opencode-pmark) (point-max))
         (goto-char (point-max))
         (insert "my draft")
@@ -99,20 +126,20 @@ The calls are in `recorded', newest first, as (TEXT BUFFER CURRENT)."
                        (when format (push (apply #'format-message format arguments) messages)))))
             (should-not (opencode-test-press (current-buffer) "RET")))
           (should (member "The earlier prompt follows the input already typed" messages)))
-        (should (equal (opencode-test-typed) "my draft\n\nfirst line\nsecond line"))
+        (should (equal (opencode-test-typed) "my draft\n\nfirst line"))
         (should (= (opencode-test-prompt-count) prompts))
         ;; A blank input is replaced.
         (delete-region (opencode-pmark) (point-max))
         (goto-char (point-max))
         (insert "  \n")
-        (goto-char (opencode-test-find "first"))
+        (goto-char (opencode-test-find "second"))
         (should-not (opencode-test-press (current-buffer) "RET"))
-        (should (equal (opencode-test-typed) "first line\nsecond line"))
+        (should (equal (opencode-test-typed) "second line"))
         ;; RET in the input still sends it.
         (should-not (opencode-test-press (current-buffer) "RET"))
         (should (= (opencode-test-prompt-count) (1+ prompts)))
         (should (equal (alist-get 'text (car (last (opencode-test-requests-to 'post "/prompt"))))
-                       "first line\nsecond line"))))))
+                       "second line"))))))
 
 (ert-deftest opencode-test-old-input-link-keeps-its-ret ()
   "RET on a link of an earlier prompt follows it; elsewhere on the prompt, edits it."
@@ -219,31 +246,56 @@ The calls are in `recorded', newest first, as (TEXT BUFFER CURRENT)."
                                                   :file))
                        uri))))))
 
-(ert-deftest opencode-test-old-input-mouse-and-copy ()
-  "mouse-2 on an earlier prompt does what RET does; C-c RET puts it in the input."
+(defun opencode-test-mouse-properties ()
+  "Return the `mouse-face' and `help-echo' values found on prompt text, outside links."
+  (let ((found nil)
+        (pos (point-min)))
+    (while (< pos (opencode-pmark))
+      (when (and (get-text-property pos 'opencode-prompt) (not (get-text-property pos 'button)))
+        (dolist (property '(mouse-face help-echo))
+          (when-let* ((value (get-text-property pos property)))
+            (cl-pushnew (cons property value) found :test #'equal))))
+      (cl-incf pos))
+    found))
+
+(ert-deftest opencode-test-old-input-no-mouse-and-copy ()
+  "Earlier prompts take no highlight, help nor click; C-c RET puts one whole in the input."
   (opencode-test-with-server
     (let ((buffer (opencode-test-open-empty (opencode-test-scenario "text"))))
       (with-current-buffer buffer
-        (opencode-test-old-send "first line\nsecond line")
-        (should (eq (command-remapping 'comint-insert-input) 'opencode-mouse-old-input))
+        (opencode-test-old-send "first line\nsecond line https://example.com/x")
+        ;; Rendered from the service as another client's prompt.
+        (opencode-test-dispatch (opencode-test-inbox-events opencode-session-id "msg_other" "from the TUI"))
+        (font-lock-ensure)
+        (should (opencode-test-find "from the TUI"))
+        (should-not (opencode-test-mouse-properties))
+        ;; The link keeps its own.
+        (should (get-text-property (opencode-test-find "example.com") 'mouse-face))
+        (should-not (fboundp 'opencode-mouse-old-input))
+        (should (eq (command-remapping 'comint-insert-input) 'opencode-run-global-click))
         (should (eq (key-binding (kbd "C-c RET") nil t) 'comint-copy-old-input))
         (should (eq (key-binding (kbd "C-c RET")) 'opencode-copy-old-input))
         (should (eq (command-remapping 'comint-copy-old-input) 'opencode-copy-old-input))
-        (should (equal (get-text-property (opencode-test-find "second") 'help-echo)
-                       "RET, mouse-2: edit this prompt to send it again"))
-        (let ((prompts (opencode-test-prompt-count)))
+        (let ((prompts (opencode-test-prompt-count))
+              (clicked nil))
           (opencode-test-with-recorded-old-input
             (save-window-excursion
               (set-window-buffer (selected-window) buffer)
-              (let ((position (opencode-test-find "second")))
-                (opencode-mouse-old-input
-                 (list 'mouse-2 (list (selected-window) position '(0 . 0) 0 nil position nil nil nil nil)))))
-            (should (equal (mapcar #'car recorded) '("first line\nsecond line")))
+              (let* ((position (opencode-test-find "second"))
+                     (event (list 'mouse-2 (list (selected-window) position '(0 . 0) 0 nil position
+                                                 nil nil nil nil)))
+                     (global-map (make-sparse-keymap)))
+                (keymap-set global-map "<mouse-2>" (lambda (event) (interactive "e") (push event clicked)))
+                (opencode-run-global-click event)
+                ;; A click does what it does on other text, nothing more.
+                (should (equal clicked (list event)))))
+            (should-not recorded)
+            (should (equal (opencode-test-typed) ""))
             ;; C-c RET puts it in the input whatever the function.
             (goto-char (opencode-test-find "first"))
             (should-not (opencode-test-press buffer "C-c RET"))
-            (should (= (length recorded) 1))
-            (should (equal (opencode-test-typed) "first line\nsecond line")))
+            (should-not recorded)
+            (should (equal (opencode-test-typed) "first line\nsecond line https://example.com/x")))
           (should (= (opencode-test-prompt-count) prompts)))))))
 
 (provide 'opencode-old-input-test)

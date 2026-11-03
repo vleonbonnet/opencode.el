@@ -95,16 +95,18 @@ Each function receives a plist (:kind :text :name) and may return
   :group 'opencode)
 
 (defcustom opencode-old-input-function nil
-  "Function given an earlier prompt to edit, or nil to edit it in the input.
-\\<opencode-session-mode-map>\\[opencode-send-input] or \\[opencode-mouse-old-input] on an earlier prompt of a session buffer calls
-it with the prompt's whole text and the session buffer, in that buffer;
-nothing is sent.  The labels of the attachments that can go with a
-prompt again, subagent mentions and files still on disk, carry the
-attachment as their `opencode-sent-attachment' property (see
-`opencode-old-input').  Nil stands for `opencode-put-old-input', which
-puts the text in the session's own input.  Packages that write prompts
-elsewhere, such as drover, set it when it is nil, so that a function
-of the user's own stays."
+  "Function given what RET picks on an earlier prompt, or nil to put it in the input.
+\\<opencode-session-mode-map>\\[opencode-send-input] on an earlier prompt of a session buffer calls it, in
+that buffer, point and the region as the user left them, with the text
+picked and the session buffer; nothing is sent.  The text is the active
+region's, else the prompt's line at point.  The labels of the
+attachments that can go with a prompt again, subagent mentions and
+files still on disk, carry the attachment as their
+`opencode-sent-attachment' property (see `opencode-old-input').  Nil
+stands for `opencode-put-old-input', which puts the text in the
+session's own input; \\[opencode-copy-old-input] puts the whole prompt there whatever
+this says.  Packages that quote text elsewhere, such as drover, set it
+when it is nil, so that a function of the user's own stays."
   :type '(choice (const :tag "Into the session's input" nil) function)
   :group 'opencode)
 
@@ -648,8 +650,8 @@ first selectable entry of the cached catalog."
   ;; Any key sending input goes through the checks, the archive and the
   ;; attachments, as RET does.
   "<remap> <comint-send-input>" #'opencode-send-input
-  ;; An earlier prompt is edited, whole, never sent as it is.
-  "<remap> <comint-insert-input>" #'opencode-mouse-old-input
+  ;; Earlier prompts take no clicks: Comint's would put one at the prompt.
+  "<remap> <comint-insert-input>" #'opencode-run-global-click
   "<remap> <comint-copy-old-input>" #'opencode-copy-old-input
   ;; C-c C-o opens links, as in Org, instead of deleting the last output.
   "C-c C-o" #'opencode-open-link-at-point
@@ -1339,6 +1341,7 @@ Input still being typed is lifted out and put back afterwards."
         (with-silent-modifications
           (put-text-property comint-last-input-start comint-last-input-end
                              'opencode-message message-id)))
+      (opencode-group-earlier-turn comint-last-input-start)
       (when note
         (opencode-output (opencode-fontify-as (propertize (concat note "\n") 'font-lock-face 'opencode-notice)
                                               'verbatim)))
@@ -2936,14 +2939,14 @@ Checks run before Comint takes the input, so declining leaves it as typed.
 An archived session is restored from the archive once the checks passed,
 and the input sent once the service restored it; were the restore
 refused, the input stays at the prompt.  On an earlier prompt, nothing
-is sent: the prompt goes, whole, to `opencode-old-input-function', to
-be edited and sent again."
+is sent: the region, else the prompt's line at point, goes to
+`opencode-old-input-function', quoted elsewhere or put in the input."
   (interactive)
   (cond
    ((not (and opencode-session-id (get-buffer-process (current-buffer))))
     (opencode--comint-send))
    ((< (point) (opencode-pmark))
-    (unless (opencode--reuse-old-input (point))
+    (unless (opencode--reuse-old-input)
       (message "Not on an earlier prompt; nothing sent")))
    (opencode--input-awaits-restore
     (message "The session is being restored from the archive; the input is sent then"))
@@ -3018,6 +3021,19 @@ A subagent mention can; a file can while it is on disk."
                   (file (opencode--uri-file uri)))
         (file-exists-p file))))
 
+(defun opencode--old-input-text (start end)
+  "Return the text of an earlier prompt from START to END, as `opencode-old-input' does."
+  (let* ((text (string-trim-right (buffer-substring-no-properties start end)))
+         (limit (+ start (length text)))
+         (pos start))
+    (while (< pos limit)
+      (let ((attachment (get-text-property pos 'opencode-sent-attachment))
+            (next (next-single-property-change pos 'opencode-sent-attachment nil limit)))
+        (when (and attachment (opencode--reattachable-p attachment))
+          (put-text-property (- pos start) (- next start) 'opencode-sent-attachment attachment text))
+        (setq pos next)))
+    text))
+
 (defun opencode-old-input (&optional position)
   "Return the text of the earlier prompt at POSITION, or nil when none.
 POSITION defaults to point, and may be at the end of the prompt.  The
@@ -3028,22 +3044,22 @@ mentions, and files still on disk, whose label carries the attachment,
 property.  The labels of other attachments, such as a buffer or region
 sent inline, are text."
   (when-let* ((bounds (opencode--prompt-bounds (or position (point)))))
-    (pcase-let* ((`(,start . ,end) bounds)
-                 (text (string-trim-right (buffer-substring-no-properties start end)))
-                 (limit (+ start (length text)))
-                 (pos start))
-      (while (< pos limit)
-        (let ((attachment (get-text-property pos 'opencode-sent-attachment))
-              (next (next-single-property-change pos 'opencode-sent-attachment nil limit)))
-          (when (and attachment (opencode--reattachable-p attachment))
-            (put-text-property (- pos start) (- next start) 'opencode-sent-attachment attachment text))
-          (setq pos next)))
-      text)))
+    (opencode--old-input-text (car bounds) (cdr bounds))))
 
-(defun opencode--reuse-old-input (position)
-  "Give the earlier prompt at POSITION to `opencode-old-input-function'.
-Return non-nil when there is one."
-  (when-let* ((text (opencode-old-input position)))
+(defun opencode-old-input-at-point ()
+  "Return what RET picks on the earlier prompt at point, or nil when none.
+That is the active region's text, else the prompt's line at point,
+as `opencode-old-input' returns a prompt: the labels of attachments
+that can go again carry them."
+  (when-let* ((bounds (opencode--prompt-bounds (point))))
+    (if (use-region-p)
+        (opencode--old-input-text (region-beginning) (region-end))
+      (opencode--old-input-text (max (car bounds) (pos-bol)) (min (cdr bounds) (pos-eol))))))
+
+(defun opencode--reuse-old-input ()
+  "Give what RET picks on the earlier prompt at point to `opencode-old-input-function'.
+Return non-nil when point is on one."
+  (when-let* ((text (opencode-old-input-at-point)))
     (funcall (or opencode-old-input-function #'opencode-put-old-input) text (current-buffer))
     t))
 
@@ -3064,7 +3080,7 @@ Its labels carrying an attachment stand for it again, as typed ones do."
         (setq pos next)))))
 
 (defun opencode-put-old-input (text buffer)
-  "Put TEXT, an earlier prompt of session BUFFER, in BUFFER's input.
+  "Put TEXT, an earlier prompt of session BUFFER or a part of one, in BUFFER's input.
 TEXT is as `opencode-old-input' returns it: its labels carrying an
 attachment stand for it again.  A blank input is replaced; input typed
 already stays, TEXT following it after a blank line, which the echo
@@ -3084,23 +3100,6 @@ what nil stands for in `opencode-old-input-function'."
       (opencode--insert-old-input text)
       (when draft
         (message "The earlier prompt follows the input already typed")))))
-
-(defun opencode-mouse-old-input (event)
-  "Edit the earlier prompt clicked, as RET on it does.
-The prompt goes, whole, to `opencode-old-input-function'; nothing is
-sent.  Elsewhere, Comint's `comint-insert-input' runs, which falls back
-to the global binding of the click.  EVENT is the click."
-  (interactive "e")
-  (let* ((end (event-end event))
-         (window (posn-window end))
-         (position (posn-point end)))
-    (if (and (windowp window) (integerp position)
-             (with-current-buffer (window-buffer window)
-               (and (derived-mode-p 'opencode-session-mode)
-                    (opencode--prompt-bounds position))))
-        (with-selected-window window
-          (opencode--reuse-old-input position))
-      (comint-insert-input event))))
 
 (defun opencode-copy-old-input ()
   "Put the earlier prompt at point, whole, in the input, to be edited.
@@ -3176,6 +3175,8 @@ that can go with a prompt again (see `opencode--mark-sent-attachments')."
       (opencode--forget-attachment-labels comint-last-input-start comint-last-input-end)
       (opencode--mark-sent-attachments comint-last-input-start comint-last-input-end)
       (setq region (cons comint-last-input-start comint-last-input-end)))
+    (when (and region (not (eq decision 'cancel)) (memq (plist-get request :kind) '(prompt command)))
+      (opencode-group-earlier-turn (car region)))
     (if (eq decision 'cancel)
         (opencode--restore-input string)
       (setq opencode--attachments nil
@@ -4191,6 +4192,32 @@ The session shown in the selected window is marked viewed."
   (unless (require 'consult nil t) (user-error "This command needs consult"))
   (consult-line-multi (list :predicate (lambda (buffer)
                                          (buffer-local-value 'opencode-session-id buffer)))))
+
+;;;; Buffers rendered by earlier versions
+
+(defun opencode--unhighlight-sent-prompts ()
+  "Take from the prompts of this buffer what Comint gave them for the mouse.
+Earlier versions left its highlight and its help on them; their links
+keep their own."
+  (when-let* ((process (get-buffer-process (current-buffer))))
+    (let ((end (marker-position (process-mark process)))
+          (pos (point-min)))
+      (with-silent-modifications
+        (while (< pos end)
+          (let ((next (min (next-single-property-change pos 'opencode-prompt nil end)
+                           (next-single-property-change pos 'button nil end))))
+            (when (and (get-text-property pos 'opencode-prompt) (not (get-text-property pos 'button)))
+              (remove-list-of-text-properties pos next '(mouse-face help-echo)))
+            (setq pos next)))))))
+
+;; Loaded over an earlier version, this one gives the session buffers
+;; that version rendered its look.
+(dolist (buffer (buffer-list))
+  (when (provided-mode-derived-p (buffer-local-value 'major-mode buffer) 'opencode-session-mode)
+    (with-current-buffer buffer
+      (with-demoted-errors "OpenCode: cannot update the look of a session buffer: %S"
+        (opencode--unhighlight-sent-prompts)
+        (opencode-blocks-upgrade)))))
 
 (provide 'opencode-session)
 ;;; opencode-session.el ends here

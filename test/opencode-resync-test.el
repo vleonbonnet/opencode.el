@@ -53,10 +53,6 @@
                 (plist-get request :query)))
             (reverse opencode-test-requests)))
 
-(defun opencode-test-event (session type id &rest data)
-  "Return event TYPE of SESSION with ID, its data DATA."
-  `((type . ,type) (id . ,id) (data (sessionID . ,session) ,@data)))
-
 (ert-deftest opencode-test-resync-up-to-date-writes-nothing ()
   "A buffer that missed nothing writes nothing: one page of the newest messages tells."
   (opencode-test-with-transcript (append (opencode-test-turn-messages 1) (opencode-test-turn-messages 2))

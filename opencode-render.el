@@ -236,11 +236,11 @@ it, which redisplay moves as it needs to show the point."
                   (`(end ,distance) (max (point-min) (- (point-max) distance)))
                   (`(line ,line) (opencode--line-position line)))))
       (pcase-dolist (`(,who ,place ,start) viewport)
-        (cond ((eq who t) (goto-char (position place)))
+        (cond ((eq who t) (goto-char (opencode-shown-position (position place))))
               ((and (window-live-p who) (eq (window-buffer who) (current-buffer)))
                (unless (eq (car place) 'end)
-                 (set-window-start who (opencode--line-position start) t))
-               (set-window-point who (position place))))))))
+                 (set-window-start who (opencode-shown-position (opencode--line-position start)) t))
+               (set-window-point who (opencode-shown-position (position place)))))))))
 
 ;;;; Output
 
@@ -432,13 +432,14 @@ Nothing is written when the transcript already ends with one."
   "Margin and mark the input just sent or replayed as prompt text.
 Its links become buttons, as those of output do: sent, it is part of
 the transcript, where a click or RET follows them.  Elsewhere on it,
-the keys of `opencode-send-input' and `opencode-mouse-old-input' edit
-it again (see `opencode-old-input-function')."
+RET gives the line or the region to `opencode-old-input-function'
+\(see `opencode-send-input'); the mouse neither highlights it nor
+tells anything about it, unlike Comint's earlier inputs."
   (opencode-add-margin comint-last-input-start comint-last-input-end
                        'opencode-request-margin-highlight)
   (with-silent-modifications
-    (add-text-properties comint-last-input-start comint-last-input-end
-                         '(opencode-prompt t help-echo "RET, mouse-2: edit this prompt to send it again")))
+    (remove-list-of-text-properties comint-last-input-start comint-last-input-end '(mouse-face help-echo))
+    (put-text-property comint-last-input-start comint-last-input-end 'opencode-prompt t))
   (opencode-buttonize comint-last-input-start comint-last-input-end t))
 
 (defun opencode-insert-block-with-margin (text face)
@@ -454,10 +455,22 @@ it again (see `opencode-old-input-function')."
                            face)
       beginning)))
 
+(defun opencode-shown-position (position)
+  "Return POSITION, or the start of the summary of the collapsed group hiding it.
+A group of blocks hides them under an overlay whose `opencode-group-of'
+property is the group's summary overlay (see `opencode-group-runs')."
+  (let ((body (seq-find (lambda (overlay) (overlay-get overlay 'opencode-group-of))
+                        (overlays-at position))))
+    (if (and body (overlay-get body 'invisible) (> position (overlay-start body))
+             (overlay-buffer (overlay-get body 'opencode-group-of)))
+        (overlay-start (overlay-get body 'opencode-group-of))
+      (if (markerp position) (marker-position position) position))))
+
 (defun opencode-call-preserving-viewport (buffer function)
   "Call FUNCTION in BUFFER without moving its point or any window's viewport.
 A point in the transcript stays at its text, and its window keeps its
-start.  A point at the end of the transcript or in the input follows
+start, unless a group of blocks FUNCTION collapses hides that text: it
+goes to the group's summary then.  A point at the end of the transcript or in the input follows
 the output FUNCTION writes, as Comint's points do: see
 `opencode-keeping-followers'."
   (with-current-buffer buffer
@@ -472,12 +485,12 @@ the output FUNCTION writes, as Comint's points do: see
       (unwind-protect
           (opencode--call-keeping-followers function)
         (when point-marker
-          (goto-char point-marker)
+          (goto-char (opencode-shown-position point-marker))
           (set-marker point-marker nil))
         (pcase-dolist (`(,window ,start ,window-point) windows)
           (when (and (window-live-p window) (eq (window-buffer window) buffer))
-            (set-window-start window start t)
-            (set-window-point window window-point))
+            (set-window-start window (opencode-shown-position start) t)
+            (set-window-point window (opencode-shown-position window-point)))
           (set-marker start nil)
           (set-marker window-point nil))))))
 
