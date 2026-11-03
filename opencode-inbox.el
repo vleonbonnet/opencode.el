@@ -415,7 +415,9 @@ withheld deliveries take out of it."
 It is called in the session buffer with the prompt's text, as
 `opencode-old-input' returns one, the labels of its attachments
 carrying them, and that buffer.  Nil stands for `opencode-put-old-input',
-which puts it in the session's input, its attachments with it."
+which puts it in the session's input, its attachments with it.  The
+echo area says the prompt was withdrawn before it is called, so that a
+function of your own may tell where it went instead."
   :type '(choice (const :tag "The session's input" nil) function)
   :group 'opencode)
 

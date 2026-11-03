@@ -1981,11 +1981,13 @@ reload erases it; one typed while a turn ran shows once delivered."
 
 (defun opencode--restore-withdrawn (id text)
   "Give TEXT, the prompt ID withdrawn from the inbox, back to be edited.
-It goes to `opencode-withdrawn-prompt-function', the input by default."
+It goes to `opencode-withdrawn-prompt-function', the input by default.
+The echo area tells it first, so that the function may tell where the
+prompt went instead."
   (remhash id opencode--own-inputs)
   (opencode--release-sent-input id)
-  (funcall (or opencode-withdrawn-prompt-function #'opencode-put-old-input) text (current-buffer))
-  (message "The pending prompt was withdrawn: edit it and send it again"))
+  (message "The pending prompt was withdrawn: edit it and send it again")
+  (funcall (or opencode-withdrawn-prompt-function #'opencode-put-old-input) text (current-buffer)))
 
 (defun opencode--event-notice (event)
   "Render the notice EVENT reports: a synthetic message, new instructions or a skill."
