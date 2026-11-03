@@ -155,9 +155,38 @@ REQUEST's query may hold `limit', `order' (default \"desc\") or a
                     `((previous . ,(cursor (car page) "previous"))
                       (next . ,(cursor (car (last page)) "next")))))))))
 
+(defvar opencode-test-inbox nil
+  "Items the fake service's inboxes hold, oldest first, as `GET .../inbox' lists them.
+`opencode-test-dispatch' keeps it as the inbox events it dispatches say.")
+
+(defun opencode-test-inbox-follow (event)
+  "Update `opencode-test-inbox' as inbox EVENT says."
+  (let* ((data (alist-get 'data event))
+         (id (alist-get 'inboxID data)))
+    (pcase (alist-get 'type event)
+      ("session.inbox.enqueued"
+       (unless (assoc id opencode-test-inbox)
+         (setq opencode-test-inbox
+               (append opencode-test-inbox
+                       (list (cons id `((id . ,id) (sessionID . ,(alist-get 'sessionID data))
+                                        ,@(alist-get 'item data))))))))
+      ((or "session.inbox.delivered" "session.inbox.cancelled")
+       (setq opencode-test-inbox (assoc-delete-all id opencode-test-inbox)))
+      ("session.inbox.delivery.changed"
+       (when-let* ((entry (assoc id opencode-test-inbox)))
+         (setf (alist-get 'delivery (cdr entry)) (alist-get 'delivery data)))))))
+
+(defun opencode-test-inbox-route ()
+  "Return the route listing a session's inbox from `opencode-test-inbox'."
+  (list 'get "\\`/api/session/\\(ses_[A-Za-z0-9]+\\)/inbox\\'"
+        (lambda (request)
+          `((data . ,(seq-filter (lambda (item) (equal (alist-get 'sessionID item) (plist-get request :match)))
+                                 (mapcar #'cdr opencode-test-inbox)))))))
+
 (defun opencode-test-default-routes ()
   "Return routes serving the recorded sessions and catalogs."
   (list
+   (opencode-test-inbox-route)
    (list 'get "\\`/api/session/\\(ses_[A-Za-z0-9]+\\)/message\\'"
          (lambda (request)
            (let ((file (format "messages-%s.json" (plist-get request :match))))
@@ -337,6 +366,7 @@ session registry starts empty and follows events once a test dispatches
   `(opencode-test-with-state
      (opencode-test-with-fresh-catalogs
        (let ((opencode-test-requests nil)
+             (opencode-test-inbox nil)
              (opencode-test-deferred nil)
              (opencode-test-routes (opencode-test-default-routes))
              (opencode-session-buffers (make-hash-table :test #'equal))
@@ -387,8 +417,10 @@ session registry starts empty and follows events once a test dispatches
     (opencode-session-open info :no-display t)))
 
 (defun opencode-test-dispatch (events)
-  "Run the handlers of EVENTS in order."
+  "Run the handlers of EVENTS in order.
+The fake service's inboxes follow their events (see `opencode-test-inbox')."
   (dolist (event events)
+    (opencode-test-inbox-follow event)
     (opencode-events--handle event)))
 
 (defun opencode-test-dispatch-until (events type)
@@ -396,6 +428,7 @@ session registry starts empty and follows events once a test dispatches
   (let ((done nil))
     (while (and events (not done))
       (let ((event (pop events)))
+        (opencode-test-inbox-follow event)
         (opencode-events--handle event)
         (setq done (equal (alist-get 'type event) type))))
     events))

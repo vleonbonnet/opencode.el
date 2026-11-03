@@ -34,7 +34,8 @@
 ;; switches them.  Prompts carry an ID generated here, so the echo of
 ;; Emacs's own prompt on the stream is recognized while prompts sent by
 ;; other clients are rendered.  A prompt sent while a turn runs steers
-;; it by default (`opencode-prompt-delivery').
+;; it by default (`opencode-prompt-delivery'), and shows as pending until
+;; the service delivers it (see opencode-inbox.el).
 ;;
 ;; A shell command or subagent run in the background ends its tool call
 ;; at once.  The server posts the job's completion later as a synthetic
@@ -54,6 +55,7 @@
 (require 'opencode-common)
 (require 'opencode-events)
 (require 'opencode-http)
+(require 'opencode-inbox)
 (require 'opencode-links)
 (require 'opencode-notify)
 (require 'opencode-render)
@@ -196,9 +198,6 @@ message's keys go once it is finished, so the table stays small.")
 
 (defvar-local opencode--reasoning-native nil
   "Hash table of reasoning keys to the native data their start event carried.")
-
-(defvar-local opencode--pending-inbox nil
-  "Hash table of inbox IDs to items enqueued by others, rendered once delivered.")
 
 (defvar-local opencode--attachments nil
   "Files and agents to send with the next prompt, newest first.
@@ -751,12 +750,21 @@ interrupt the turn or are refused (`opencode-comint-unsupported'), and
   (setq opencode--own-inputs (make-hash-table :test #'equal)
         opencode--text-blocks (make-hash-table :test #'equal))
   (add-hook 'kill-buffer-hook #'opencode--session-cleanup nil t)
-  (add-hook 'comint-input-filter-functions
-            (lambda (&rest _) (setq opencode--last-block-kind 'user)) nil t)
+  (add-hook 'comint-input-filter-functions #'opencode--note-input-sent nil t)
+  (opencode-inbox-setup)
   (add-hook 'fill-nobreak-predicate #'opencode--in-attachment-p nil t)
   (visual-line-mode)
   (cursor-intangible-mode)
   (yank-media-handler "\\`image/" #'opencode--yank-image))
+
+(defvar-local opencode--block-kind-before-input nil
+  "The kind of the last block before Comint took the input last sent.
+A prompt deferred until its delivery leaves the transcript as it was.")
+
+(defun opencode--note-input-sent (&rest _)
+  "Note that the input Comint takes is the last block written."
+  (setq opencode--block-kind-before-input opencode--last-block-kind
+        opencode--last-block-kind 'user))
 
 (defun opencode--make-process (buffer)
   "Create BUFFER's pipe process.
@@ -1117,7 +1125,10 @@ leaves the rest withheld."
                 (funcall (cdr entry))
               (error
                (message "OpenCode: %s handler failed: %s"
-                        (alist-get 'type (car entry)) (error-message-string err))))))))))
+                        (alist-get 'type (car entry)) (error-message-string err))))))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (opencode-inbox-update)))))
 
 (defun opencode--held-status ()
   "Return the status before the first withheld turn event, or nil without one.
@@ -1205,24 +1216,27 @@ The session's events are withheld meanwhile, then applied."
     (setq opencode--loading t
           opencode--pinned t)
     (opencode--hold)
-    (opencode--fetch-messages
-     id
-     (lambda (messages)
-       (opencode-replay-messages
-        messages
-        (lambda ()
-          (opencode-request
-           'get "/api/session/active"
-           :else else
-           :then (lambda (response)
-                   (opencode--unpin)
-                   (opencode--show-status
-                    (opencode--status-after-fetch
-                     (assq (intern id) (opencode-request-data response))))
-                   (run-hooks 'opencode-session-replayed-hook)
-                   (opencode--loaded)
-                   (when callback (funcall callback)))))))
-     else)))
+    ;; The inbox first: a prompt delivered after it is in the messages.
+    (opencode-inbox-fetch
+     (lambda ()
+       (opencode--fetch-messages
+        id
+        (lambda (messages)
+          (opencode-replay-messages
+           messages
+           (lambda ()
+             (opencode-request
+              'get "/api/session/active"
+              :else else
+              :then (lambda (response)
+                      (opencode--unpin)
+                      (opencode--show-status
+                       (opencode--status-after-fetch
+                        (assq (intern id) (opencode-request-data response))))
+                      (run-hooks 'opencode-session-replayed-hook)
+                      (opencode--loaded)
+                      (when callback (funcall callback)))))))
+        else)))))
 
 (defun opencode--session-revert (&rest _)
   "Reload the transcript, as `revert-buffer' does in a session buffer."
@@ -1909,43 +1923,69 @@ the hooks of a finished call, as the call did end live."
 
 (defun opencode--event-inbox (event)
   "Handle the `session.inbox.*' EVENT.
-Prompts sent from this buffer are already shown, and get their message
-ID once delivered.  Other items, such as prompts from other clients,
-commands' prompts and background job notifications, are shown once
-delivered: that is where the transcript places them."
+A prompt typed here at an idle session is already shown, and gets its
+message ID once delivered.  Other items, such as prompts from other
+clients, commands' prompts, prompts sent here while a turn ran and
+background job notifications, are shown once delivered: that is where
+the transcript places them.  Until then, prompts show as pending (see
+`opencode-inbox-update'), and the delivery moves them into the
+transcript."
   (opencode--on-session-event event
     (let ((id (alist-get 'inboxID data)))
-      (unless (hash-table-p opencode--pending-inbox)
-        (setq opencode--pending-inbox (make-hash-table :test #'equal)))
       (pcase (alist-get 'type event)
         ("session.inbox.enqueued"
          (let ((item (alist-get 'item data)))
            (when (equal (alist-get 'type item) "user")
              (opencode-dismiss-turn-notifications)
              (opencode--claim-command-prompt id item))
-           ;; Own prompts too: one whose input a reload erased is shown once delivered.
-           (puthash id item opencode--pending-inbox)))
+           (opencode-inbox-enqueued id item)))
+        ("session.inbox.delivery.changed"
+         (opencode-inbox-delivery-changed id (alist-get 'delivery data)))
         ("session.inbox.delivered"
-         (let* ((item (gethash id opencode--pending-inbox))
-                (own (gethash id opencode--own-inputs))
-                (sent (opencode--stamp-sent-input id))
+         (let* ((own (gethash id opencode--own-inputs))
+                (shown (and own (opencode--input-shown-p id)))
+                (entry (opencode-inbox-leave id 'delivered))
+                (item (plist-get entry :item))
                 ;; Prompts and notes become messages named after the item.
                 (appended (if item (member (alist-get 'type item) '("user" "synthetic")) own)))
-           (remhash id opencode--pending-inbox)
+           (opencode--stamp-sent-input id)
            (remhash id opencode--own-inputs)
-           (when (and item (or (not own) (plist-get sent :lost))
-                      (not (opencode--message-known-p id)))
+           (when (and item (not shown) (not (opencode--message-known-p id)))
              (opencode-call-preserving-viewport
               (current-buffer)
               (lambda () (opencode--render-inbox-item id item))))
            (when appended
              (opencode--note-message id))))
         ("session.inbox.cancelled"
-         (remhash id opencode--pending-inbox)
-         (opencode--release-sent-input id)
-         (when (gethash id opencode--own-inputs)
-           (remhash id opencode--own-inputs)
-           (opencode-output-notice "A queued prompt was cancelled")))))))
+         (let ((entry (opencode-inbox-leave id 'cancelled)))
+           (opencode--release-sent-input id)
+           (when (gethash id opencode--own-inputs)
+             (remhash id opencode--own-inputs)
+             (cond
+              ((plist-get entry :withdraw))
+              ;; Shown nowhere else, it goes back to be sent again.
+              ((plist-get entry :typed)
+               (opencode-put-old-input (plist-get entry :text) (current-buffer))
+               (opencode-output-notice "A pending prompt was cancelled; it is back in the input"))
+              (t (opencode-output-notice "A queued prompt was cancelled"))))))))))
+
+(defun opencode--input-shown-p (id)
+  "Return non-nil when the transcript shows the input sent here as prompt ID.
+A prompt typed at an idle session shows where it was typed until a
+reload erases it; one typed while a turn ran shows once delivered."
+  (when-let* (((gethash id opencode--own-inputs))
+              (entry (gethash id (opencode--sent-input-table)))
+              (start (plist-get entry :start)))
+    (and (markerp start) (eq (marker-buffer start) (current-buffer))
+         (not (plist-get entry :command)))))
+
+(defun opencode--restore-withdrawn (id text)
+  "Give TEXT, the prompt ID withdrawn from the inbox, back to be edited.
+It goes to `opencode-withdrawn-prompt-function', the input by default."
+  (remhash id opencode--own-inputs)
+  (opencode--release-sent-input id)
+  (funcall (or opencode-withdrawn-prompt-function #'opencode-put-old-input) text (current-buffer))
+  (message "The pending prompt was withdrawn: edit it and send it again"))
 
 (defun opencode--event-notice (event)
   "Render the notice EVENT reports: a synthetic message, new instructions or a skill."
@@ -2125,6 +2165,7 @@ compaction the transcript fetched meanwhile shows finished already."
                    ("session.inbox.enqueued" . opencode--event-inbox)
                    ("session.inbox.delivered" . opencode--event-inbox)
                    ("session.inbox.cancelled" . opencode--event-inbox)
+                   ("session.inbox.delivery.changed" . opencode--event-inbox)
                    ("session.synthetic" . opencode--event-notice)
                    ("session.instructions.updated" . opencode--event-notice)
                    ("session.skill.activated" . opencode--event-notice)
@@ -2328,19 +2369,23 @@ begun before another reconnection gives up, without calling THEN."
          (when (current-p)
            (with-current-buffer buffer
              (opencode--adopt-info info location-generation)
-             (opencode--fetch-newer
-              id anchor
-              (lambda (newer)
+             ;; The inbox first: a prompt delivered after it is in the messages.
+             (opencode-inbox-fetch
+              (lambda ()
                 (when (current-p)
-                  (with-current-buffer buffer
-                    (if (eq newer :missing)
-                        (opencode--render-again #'finish)
-                      (opencode--resync-turn
-                       epoch (lambda (active)
-                               (when (current-p)
-                                 (with-current-buffer buffer
-                                   (catch-up newer active)))))))))
-              #'fail))))
+                  (opencode--fetch-newer
+                   id anchor
+                   (lambda (newer)
+                     (when (current-p)
+                       (with-current-buffer buffer
+                         (if (eq newer :missing)
+                             (opencode--render-again #'finish)
+                           (opencode--resync-turn
+                            epoch (lambda (active)
+                                    (when (current-p)
+                                      (with-current-buffer buffer
+                                        (catch-up newer active)))))))))
+                   #'fail)))))))
        nil #'fail))))
 
 (defun opencode--resync-pump ()
@@ -2553,6 +2598,22 @@ so delivery points there are forgotten."
                                  `((name . ,name))))
                              (reverse opencode--attachments)))))
 
+(defun opencode--prompt-skills ()
+  "Return the skills attached to the next prompt, as a vector."
+  (vconcat (delq nil (mapcar (lambda (attachment)
+                               (when-let* ((id (plist-get attachment :skill)))
+                                 `((id . ,id))))
+                             (reverse opencode--attachments)))))
+
+(defun opencode--defer-prompt-p ()
+  "Return non-nil when a prompt sent now shows as pending until delivered.
+While a turn runs, the service delivers a prompt at the next step, or
+once the turn ends, and the transcript places it there; so does it
+while other prompts wait, which it delivers first.  An idle session
+with nothing pending starts a turn with it at once."
+  (or (not (eq opencode-session-status 'idle))
+      (opencode-inbox-shown-p)))
+
 (defun opencode-thinking-metadata (metadata &optional accept)
   "Return prompt METADATA with its stale-thinking choice.
 Thinking from earlier turns goes stale when what preceded it changed.
@@ -2630,20 +2691,28 @@ meanwhile is dropped."
            (opencode-state--one-line (opencode-error-describe error)))
    300 nil nil "…"))
 
-(cl-defun opencode-session-send (text &key files agents delivery metadata accept-thinking-loss
-                                      show region then else)
+(cl-defun opencode-session-send (text &key files agents skills delivery metadata accept-thinking-loss
+                                      show region input then else)
   "Send TEXT as a prompt of this session.
-FILES and AGENTS are vectors of attachments; DELIVERY overrides
+FILES, AGENTS and SKILLS are vectors of attachments; DELIVERY overrides
 `opencode-prompt-delivery'; METADATA is an alist attached to the
 prompt.  ACCEPT-THINKING-LOSS lets the server replace earlier thinking
 that no longer matches the conversation, which it otherwise refuses to
-send (see `opencode-thinking-metadata').  SHOW renders the prompt once
-the server delivers it, like one from another client; otherwise the
-caller rendered it, and REGION, a cons (START . END) of the text showing
-it, gets the prompt's message ID as its `opencode-message' property once
-the server delivers it, the message existing only then.  THEN runs with
-the admitted inbox item, ELSE with the error; a prompt that fails keeps
-no ID.
+send (see `opencode-thinking-metadata').
+
+Where the prompt shows: REGION, a cons (START . END) of the text showing
+it as typed, gets the prompt's message ID as its `opencode-message'
+property once the server delivers it, the message existing only then.
+INPUT, the prompt as typed at this buffer's input, as `opencode-old-input'
+returns a prompt, shows it as pending until delivered, then in the
+transcript, where it goes back to the input should the server refuse
+it.  SHOW renders it once delivered, like a prompt of another client,
+and as pending until then while a turn runs or other prompts wait (see
+`opencode--defer-prompt-p').  Pending, it can be withdrawn to be edited
+again (see `opencode-edit-pending-prompt').
+
+THEN runs with the admitted inbox item, ELSE with the error; a prompt
+that fails keeps no ID.
 
 An archived session (see `opencode-session-archived-p') is restored from
 the archive first, and the prompt sent once the service restored it;
@@ -2656,12 +2725,21 @@ the session waits on a permission request or a question reaches the
 agent once that is answered or dismissed, as the agent's step waits for
 it."
   (let ((id (opencode-generate-id "msg_"))
-        (metadata (opencode-thinking-metadata metadata accept-thinking-loss)))
+        (metadata (opencode-thinking-metadata metadata accept-thinking-loss))
+        (delivery (symbol-name (or delivery opencode-prompt-delivery))))
     (opencode-dismiss-turn-notifications)
     (unless show
       (puthash id t opencode--own-inputs)
       (when region
         (opencode--track-sent-input id region)))
+    (when (and (not region) (or input (opencode--defer-prompt-p)))
+      (opencode-inbox-add-local
+       id (or input
+              (opencode-inbox-attachments-text
+               text (append (mapcar (lambda (file) (list (list :file file))) files)
+                            (mapcar (lambda (agent) (list (list :agent (alist-get 'name agent)))) agents)
+                            (mapcar (lambda (skill) (list (list :skill (alist-get 'id skill)))) skills))))
+       delivery (and input t)))
     (when opencode-session-model
       (setq opencode-last-model opencode-session-model))
     ;; The turn shows only through the stream.
@@ -2670,18 +2748,30 @@ it."
           (body `((id . ,id) (text . ,text)
                   ,@(when (and files (> (length files) 0)) `((files . ,files)))
                   ,@(when (and agents (> (length agents) 0)) `((agents . ,agents)))
+                  ,@(when (and skills (> (length skills) 0)) `((skills . ,skills)))
                   ,@(when metadata `((metadata . ,metadata)))
-                  (delivery . ,(symbol-name (or delivery opencode-prompt-delivery))))))
+                  (delivery . ,delivery))))
       (cl-flet ((fail (error describe)
                   (remhash id opencode--own-inputs)
                   (opencode--release-sent-input id)
-                  (if else (funcall else error)
-                    (opencode-output-notice (funcall describe error) 'error))))
+                  (let ((pending (opencode-inbox-drop id)))
+                    (cond
+                     (else (funcall else error))
+                     ((plist-get pending :typed)
+                      ;; Shown nowhere else, it goes back to be sent again.
+                      (opencode-put-old-input (plist-get pending :text) (current-buffer))
+                      (opencode-output-notice
+                       (concat (funcall describe error) "; the prompt is back in the input")
+                       'error))
+                     (t (opencode-output-notice (funcall describe error) 'error))))))
         (opencode--after-restore
          (lambda ()
            (opencode-request
             'post path :body body
-            :then (lambda (response) (when then (funcall then (opencode-request-data response))))
+            :then (lambda (response)
+                    (let ((item (opencode-request-data response)))
+                      (opencode-inbox-admitted id (and (consp item) (alist-get 'type item) item))
+                      (when then (funcall then item))))
             :else (lambda (error) (fail error #'opencode-error-describe))))
          (lambda (error) (fail error #'opencode--restore-failure)))))
     id))
@@ -3041,24 +3131,34 @@ Input that did not go through `opencode-send-input' is checked here.  The
 input of a prompt or a command gets the ID of the message it makes once
 the service delivers it, which reverting and forking at point need; a
 shell command makes no prompt, only a shell message and its result,
-which like other messages between prompts never start a cut.  The
-prompt's attachments are those whose labels the input held; Comint
-leaves their overlays emptied, which go, the labels' text keeping the
-attachments that can go with a prompt again (see
-`opencode--mark-sent-attachments')."
-  (opencode-highlight-input)
-  (opencode-output "\n")
-  (opencode--forget-attachment-labels comint-last-input-start comint-last-input-end)
-  (opencode--mark-sent-attachments comint-last-input-start comint-last-input-end)
+which like other messages between prompts never start a cut.  A prompt
+sent while a turn runs, or while other prompts wait, leaves the
+transcript: it shows as pending until delivered, then where the
+conversation places it (see `opencode--defer-prompt-p').  The prompt's
+attachments are those whose labels the input held; Comint leaves their
+overlays emptied, which go, the labels' text keeping the attachments
+that can go with a prompt again (see `opencode--mark-sent-attachments')."
   (let* ((opencode--sending-input nil)
          (request (opencode-input-request string))
          (string (plist-get request :text))
          (decision (or opencode--send-decision (opencode-check-send request)))
          (metadata (and (consp decision) decision))
+         (deferred (and (not (eq decision 'cancel))
+                        (eq (plist-get request :kind) 'prompt)
+                        (opencode--defer-prompt-p)))
+         (input (and deferred (opencode--sent-input-text string)))
          (files (opencode--prompt-files))
          (agents (opencode--prompt-agents))
+         (skills (opencode--prompt-skills))
          (temp-files opencode--temp-files)
-         (region (cons comint-last-input-start comint-last-input-end)))
+         (region nil))
+    (if deferred
+        (opencode--unsend-input)
+      (opencode-highlight-input)
+      (opencode-output "\n")
+      (opencode--forget-attachment-labels comint-last-input-start comint-last-input-end)
+      (opencode--mark-sent-attachments comint-last-input-start comint-last-input-end)
+      (setq region (cons comint-last-input-start comint-last-input-end)))
     (if (eq decision 'cancel)
         (opencode--restore-input string)
       (setq opencode--attachments nil
@@ -3071,9 +3171,41 @@ attachments that can go with a prompt again (see
         ('shell
          (opencode--session-shell (substring string 1)))
         ('prompt
-         (opencode-session-send string :files files :agents agents :metadata metadata :region region
+         (opencode-session-send string :files files :agents agents :skills skills :metadata metadata
+                                :region region :input input
                                 :then (lambda (_) (mapc (lambda (file) (ignore-errors (delete-file file)))
                                                         temp-files))))))))
+
+(defun opencode--sent-input-text (string)
+  "Return STRING, the prompt Comint took, as `opencode-old-input' returns one.
+Each attachment label carries its attachment, inline ones included, so
+that the prompt withdrawn or refused goes back to the input whole.  The
+labels are those of `opencode--input-sent', the input before Comint
+took it; without it, labels of the prompt's attachments follow STRING."
+  (let ((input (plist-get opencode--input-sent :text)))
+    (if (and input (string= (string-trim-right (substring-no-properties input)) string))
+        (let ((text (copy-sequence string)))
+          (set-text-properties 0 (length text) nil text)
+          (pcase-dolist (`(,from ,to ,attachment ,_display) (plist-get opencode--input-sent :labels))
+            (when (<= to (length text))
+              (put-text-property from to 'opencode-sent-attachment attachment text)))
+          text)
+      (opencode-inbox-attachments-text
+       string (mapcar #'list (reverse opencode--attachments))))))
+
+(defun opencode--unsend-input ()
+  "Take the input Comint just sent out of the transcript, as it was before.
+A deferred prompt shows as pending until delivered, then where the
+conversation places it.  Its labels' attachments stay with the prompt."
+  (let ((start (marker-position comint-last-input-start))
+        (end (opencode-pmark))
+        (inhibit-read-only t))
+    (opencode--forget-attachment-labels start end)
+    (opencode-delete-parsers start end)
+    (let ((opencode--sending-input (current-buffer)))
+      (delete-region start end))
+    (set-marker (process-mark (get-buffer-process (current-buffer))) start)
+    (setq opencode--last-block-kind opencode--block-kind-before-input)))
 
 ;;;; Attachments
 
