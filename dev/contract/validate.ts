@@ -4,6 +4,10 @@
 // parameters and JSON body must satisfy the documented schemas.  Exits
 // non-zero when any does not.  `make contract' runs it with the ajv an
 // OpenCode checkout installs.
+//
+// Operations in `optional' are newer than some services opencode.el
+// talks to, which answer them with a 404 the client handles: a document
+// without them only lists them as absent, one with them checks them.
 import Ajv2020 from "ajv/dist/2020"
 
 const [specPath, requestsPath] = process.argv.slice(2)
@@ -22,6 +26,8 @@ const rewrite = (schema: unknown): unknown => {
   }
   return schema
 }
+
+const optional = new Set(["GET /api/experimental/session/search"])
 
 type Operation = { parameters?: any[]; requestBody?: any; operationId?: string }
 const routes: { method: string; regex: RegExp; template: string; op: Operation }[] = []
@@ -62,6 +68,7 @@ const decodeQuery = (value: string, schema: any): unknown => {
 const lines = (await Bun.file(requestsPath).text()).split("\n").filter(Boolean)
 const problems = new Map<string, Set<string>>()
 const seen = new Set<string>()
+const absent = new Set<string>()
 const note = (key: string, problem: string, test: string) => {
   if (!problems.has(key)) problems.set(key, new Set())
   problems.get(key)!.add(`${problem}   [${test}]`)
@@ -72,6 +79,10 @@ for (const line of lines) {
   const route = routes.find((r) => r.method === request.method && r.regex.test(path))
   const key = `${request.method} ${route?.template ?? path}`
   seen.add(key)
+  if (!route && optional.has(key)) {
+    absent.add(key)
+    continue
+  }
   if (!route) {
     note(key, "no such operation in the OpenAPI document", request.test)
     continue
@@ -102,6 +113,7 @@ for (const line of lines) {
   } else if (route.op.requestBody?.required) note(key, "missing required body", request.test)
 }
 console.log(`${lines.length} requests, ${seen.size} operations, ${problems.size} with problems`)
+for (const key of absent) console.log(`absent, optional: ${key}`)
 for (const [key, list] of problems) {
   console.log(`\n${key}`)
   for (const problem of list) console.log(`  - ${problem}`)

@@ -108,6 +108,155 @@ filters of the first page, so later pages send it alone."
                  (opencode-fetch-sessions query callback else next (append accumulated data))
                (funcall callback (append accumulated data)))))))
 
+;;;; Full-text search
+
+(defface opencode-search-match '((t :inherit match))
+  "Face of the words a search matched in its snippets."
+  :group 'opencode)
+
+(defcustom opencode-search-snippet-length 320
+  "Most characters of a search snippet, the service's own bound."
+  :type 'natnum
+  :group 'opencode)
+
+(defvar opencode-search--unsupported nil
+  "IDs of services without the search route, which only my fork has.")
+
+(defun opencode-search--snippet (snippet)
+  "Return SNIPPET, the service's text and match ranges, as one propertized line.
+Matches get the face `opencode-search-match', and their ranges are
+returned too, as (START . END) pairs of character positions, as the
+cons (TEXT . RANGES).  The text is cut to `opencode-search-snippet-length'."
+  (let* ((text (replace-regexp-in-string "[\n\r\t]" " " (or (alist-get 'text snippet) "")))
+         (limit opencode-search-snippet-length)
+         (cut (if (> (length text) limit) (concat (substring text 0 (max 0 (1- limit))) "…") text))
+         (end (if (> (length text) limit) (max 0 (1- limit)) (length text)))
+         (ranges nil))
+    (dolist (match (alist-get 'matches snippet))
+      (let ((start (alist-get 'start match))
+            (stop (alist-get 'end match)))
+        (when (and (natnump start) (natnump stop) (< start stop) (<= stop end))
+          (add-face-text-property start stop 'opencode-search-match nil cut)
+          (push (cons start stop) ranges))))
+    (cons cut (nreverse ranges))))
+
+(defun opencode-search--match (match)
+  "Return the plist describing MATCH, one match of the service's answer."
+  (let ((snippet (opencode-search--snippet (alist-get 'snippet match))))
+    (list :session-id (alist-get 'sessionID match)
+          :title (alist-get 'title match)
+          :message-id (alist-get 'messageID match)
+          :role (intern (alist-get 'role match))
+          :time (when-let* ((created (alist-get 'created (alist-get 'time match))))
+                  (/ created 1000.0))
+          :snippet (car snippet)
+          :matches (cdr snippet))))
+
+(defun opencode-search (query &rest arguments)
+  "Search the text of every session's messages for QUERY, asynchronously.
+QUERY holds words, all of which a message must contain; double quotes
+group a phrase, and a word ending in * matches as a prefix.  Only user
+prompts and the visible text of assistant messages are searched, not
+tool calls, their output or reasoning.
+
+ARGUMENTS are keywords:
+
+  :then     called with MATCHES and INFO once the service answers.
+            MATCHES is a list of plists, best match first:
+              :session-id  the session's ID
+              :title       its title, or nil
+              :message-id  the matching message's ID
+              :role        `user' or `assistant'
+              :time        when the message was created, in float seconds
+              :snippet     one line of at most `opencode-search-snippet-length'
+                           characters around the match, the matched words
+                           in the face `opencode-search-match'
+              :matches     those words' (START . END) positions in :snippet
+            INFO is a plist: :next, the cursor of the following page or
+            nil on the last; :complete, nil while the service is still
+            indexing the history it held before it could search, when only
+            what is indexed so far can match; and then :processed and
+            :total, how many of those messages it went through.
+  :else     called with REASON and MESSAGE when the search fails.
+            REASON is `unsupported' when the service has no search
+            route (an older build, or not my fork), so callers can skip
+            it silently; `invalid' when it refused the query or cursor;
+            `failed' otherwise.  MESSAGE describes the failure.  Without
+            :else, failures other than `unsupported' are reported.
+  :archived t searches archived sessions only, nil unarchived ones only;
+            omitted, both.
+  :project  a project ID; :directory a session directory; :parent a
+            session ID, whose subagents are searched, or `root' for
+            top-level sessions only.
+  :limit    the most matches per page, at most 100; 20 by default.
+  :cursor   the :next of an earlier page of the same search.
+
+THEN and ELSE run in the buffer current at the call when it still lives,
+at most one of them once, and neither once the search is cancelled.  Return a function that cancels the
+search when called with no argument; it does nothing once the search
+settled."
+  (let* ((then (plist-get arguments :then))
+         (else (plist-get arguments :else))
+         (origin (current-buffer))
+         (cancelled nil)
+         (exchange nil)
+         (service (plist-get opencode-service-connection :id))
+         (query-alist
+          `((q . ,query)
+            ,@(when (plist-member arguments :archived)
+                `((archived . ,(if (plist-get arguments :archived) "true" "false"))))
+            ,@(when-let* ((project (plist-get arguments :project))) `((project . ,project)))
+            ,@(when-let* ((directory (plist-get arguments :directory)))
+                `((directory . ,(opencode-directory-name directory))))
+            ,@(when-let* ((parent (plist-get arguments :parent)))
+                `((parentID . ,(if (eq parent 'root) "null" parent))))
+            ,@(when-let* ((limit (plist-get arguments :limit))) `((limit . ,limit)))
+            ,@(when-let* ((cursor (plist-get arguments :cursor))) `((cursor . ,cursor))))))
+    (cl-flet ((deliver (function &rest values)
+                (unless cancelled
+                  (setq cancelled t)
+                  (when function
+                    (if (buffer-live-p origin)
+                        (with-current-buffer origin (apply function values))
+                      (apply function values)))))
+              (fail (reason message)
+                (list (cond (else)
+                            ((eq reason 'unsupported) nil)
+                            (t (lambda (_reason message)
+                                 (opencode-report-error (concat "OpenCode search: " message)))))
+                      reason message)))
+      (if (and service (member service opencode-search--unsupported))
+          ;; Known to lack the route: fail as it would, after returning.
+          (run-at-time 0 nil (lambda ()
+                               (apply #'deliver (fail 'unsupported "this OpenCode service cannot search sessions"))))
+        (setq exchange
+              (opencode-request
+               'get "/api/experimental/session/search" :directory nil :buffer nil :query query-alist
+               :then (lambda (response)
+                       (let ((index (alist-get 'index response)))
+                         (deliver then
+                                  (mapcar #'opencode-search--match (opencode-request-data response))
+                                  (list :next (alist-get 'next (alist-get 'cursor response))
+                                        :complete (and (alist-get 'complete index) t)
+                                        :processed (alist-get 'processed index)
+                                        :total (alist-get 'total index)))))
+               :else (lambda (error)
+                       (let ((status (opencode-error-status error)))
+                         (apply #'deliver
+                                (cond
+                                 ;; An unknown route answers a 404 without an error tag.
+                                 ((and (eql status 404) (null (opencode-error-tag error)))
+                                  (when-let* ((id (plist-get opencode-service-connection :id)))
+                                    (cl-pushnew id opencode-search--unsupported :test #'equal))
+                                  (fail 'unsupported "this OpenCode service cannot search sessions"))
+                                 ((eql status 400) (fail 'invalid (opencode-error-describe error)))
+                                 (t (fail 'failed (opencode-error-describe error))))))))))
+      (lambda ()
+        (unless cancelled
+          (setq cancelled t)
+          (when (and (opencode-transport-exchange-p exchange) (opencode-transport-live-p exchange))
+            (opencode-transport-cancel exchange)))))))
+
 ;;;; Branches
 
 (defvar opencode--branches (make-hash-table :test #'equal)

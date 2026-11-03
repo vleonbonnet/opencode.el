@@ -25,7 +25,7 @@
 | =opencode-display.el=     | Agent, model, provider, variant and context-use displays for any session, long-context pricing tiers                                                      |
 | =opencode-modeline.el=    | The session mode line, and reporting a context passing its price tier                                                                                     |
 | =opencode-variant.el=     | The variant a model runs with when none is selected, from the catalogs                                                                                    |
-| =opencode-sessions.el=    | Session pickers, projects, worktree branches, worktrees, MCP servers                                                                                      |
+| =opencode-sessions.el=    | Session pickers, projects, worktree branches, worktrees, MCP servers, full-text search                                                                    |
 | =opencode-edits.el=       | Post-edit hooks, safe visiting and saving, indentation, Prettier, Flycheck                                                                                |
 | =opencode-desktop.el=     | Desktop saving and in-place restoring                                                                                                                     |
 | =opencode-convert.el=     | Markdown transcripts                                                                                                                                      |
@@ -125,7 +125,11 @@ A redisplay changing nothing costs 0.1 ms throughout, and one forcing every mode
 
 * No session list
 
-opencode.el has no session list buffer. drover lists the sessions of every agent front end, this one's included, and one listing is maintained rather than two that drift apart: drover reads the registry, which holds every unarchived session, can fetch others, such as archived ones, with =opencode-fetch-sessions=, names projects with =opencode-fetch-projects=, =opencode-project-for-directory= and =opencode-project-name=, and shows branches from =opencode-git-branch=. What opencode.el keeps is completion: =opencode= and the other pickers offer sessions in the minibuffer, and commands that act on a session pick one there when called outside a session buffer.
+opencode.el has no session list buffer. drover lists the sessions of every agent front end, this one's included, and one listing is maintained rather than two that drift apart: drover reads the registry, which holds every unarchived session, can fetch others, such as archived ones, with =opencode-fetch-sessions=, names projects with =opencode-fetch-projects=, =opencode-project-for-directory= and =opencode-project-name=, shows branches from =opencode-git-branch=, and finds sessions by what was said in them with =opencode-search=. What opencode.el keeps is completion: =opencode= and the other pickers offer sessions in the minibuffer, and commands that act on a session pick one there when called outside a session buffer.
+
+* Full-text search
+
+My fork's =GET /api/experimental/session/search= searches an FTS5 index of user prompts and assistant text; =opencode-search= wraps it for lists such as drover's, which call it only when it is defined and run it as one source among others. So a service without the route must cost them nothing: it answers an untagged 404, as an unknown route does, which =opencode-search= reports as =unsupported= without a message, and remembers by service ID, so later searches fail at once, from a timer, without a request, until a service of another ID, such as a newer build, is reached. A tagged 400 (a malformed cursor or too many terms) is =invalid=, anything else =failed=. Matches come back as plists with their time in float seconds, as elsewhere, and a snippet of one line, at most =opencode-search-snippet-length= characters, the matched words in =opencode-search-match=: the service locates them by character, which Emacs indexes by too. A search is cancelled by the function it returns, which closes its request when one is in flight and in any case keeps both callbacks from running, since a request may be retried on another connection the cancellation does not see. The contract check lists the route as optional, absent from the deployed service's document and checked against the fork's.
 
 * Session pickers
 
