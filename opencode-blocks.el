@@ -86,13 +86,19 @@ Pending permissions and questions use it to mark the block they belong to.")
 
 (defvar opencode-collapsible-keymap
   (let ((map (make-sparse-keymap)))
-    (keymap-set map "RET" #'opencode-toggle-block)
     (keymap-set map "<mouse-1>" #'opencode-mouse-toggle-block)
     (keymap-set map "TAB" #'opencode-toggle-block)
     map)
   "Keymap of collapsible summary lines.
-A click toggles the block on its box only: elsewhere on the line, it
-does what it does in other text.")
+TAB toggles the block anywhere on the line, a click on its box only:
+elsewhere on the line, a click does what it does in other text, and RET
+quotes the line as on any line of the transcript (see
+`opencode-old-input-function').")
+
+;; Loaded over an earlier version, whose RET toggled the block, this one
+;; leaves RET to quote the line.
+(when (eq (keymap-lookup opencode-collapsible-keymap "RET") #'opencode-toggle-block)
+  (keymap-unset opencode-collapsible-keymap "RET" t))
 
 (defun opencode-blocks-ensure ()
   "Initialize the block table of this buffer."
@@ -1269,6 +1275,9 @@ groups its turn again."
             (face (get-text-property pos 'font-lock-face text)))
         (when face (put-text-property pos next 'face face text))
         (setq pos next)))
+    ;; Measured in a work buffer that would refuse to add properties to
+    ;; read-only text, which it reads as this buffer does.
+    (remove-list-of-text-properties 0 (length text) '(opencode-transcript read-only) text)
     text))
 
 (defun opencode--fit-chars (text room buffer)

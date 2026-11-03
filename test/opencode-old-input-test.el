@@ -9,12 +9,12 @@
 
 ;;; Commentary:
 
-;; RET on an earlier prompt sends nothing: the region, else the
-;; prompt's line at point, goes to `opencode-old-input-function', by
-;; default into the input, its attachments with it when they can go
-;; again; C-c RET puts the whole prompt there.  The mouse does nothing
-;; special on prompts.  A link in the prompt keeps its own RET, and RET
-;; in the input still sends.
+;; RET on an earlier prompt, or anywhere in the transcript, sends
+;; nothing: the region, else the line at point, goes to
+;; `opencode-old-input-function', by default into the input, its
+;; attachments with it when they can go again; C-c RET puts the whole
+;; prompt there.  The mouse does nothing special on prompts.  A link in
+;; the prompt keeps its own RET, and RET in the input still sends.
 
 ;;; Code:
 
@@ -125,7 +125,7 @@ The calls are in `recorded', newest first, as (TEXT BUFFER CURRENT)."
                      (lambda (format &rest arguments)
                        (when format (push (apply #'format-message format arguments) messages)))))
             (should-not (opencode-test-press (current-buffer) "RET")))
-          (should (member "The earlier prompt follows the input already typed" messages)))
+          (should (member "The text follows the input already typed" messages)))
         (should (equal (opencode-test-typed) "my draft\n\nfirst line"))
         (should (= (opencode-test-prompt-count) prompts))
         ;; A blank input is replaced.
@@ -161,17 +161,40 @@ The calls are in `recorded', newest first, as (TEXT BUFFER CURRENT)."
             (should (equal (mapcar #'car recorded) '("Look at https://example.com/page please")))))
         (should (= (opencode-test-prompt-count) prompts))))))
 
-(ert-deftest opencode-test-old-input-ret-on-output-sends-nothing ()
-  "RET on the transcript outside a prompt sends nothing, as Comint would."
+(ert-deftest opencode-test-old-input-ret-on-output-quotes-it ()
+  "RET on the transcript outside a prompt quotes its line, or the region, and sends nothing."
   (opencode-test-with-server
     (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
       (opencode-test-old-send "hello")
-      (opencode-test-answer opencode-session-id "msg_answer" "An answer line")
+      (opencode-test-answer opencode-session-id "msg_answer" "An answer line\n\nAnother paragraph")
       (let ((prompts (opencode-test-prompt-count)))
         (opencode-test-with-recorded-old-input
           (goto-char (opencode-test-find "answer line"))
           (should-not (get-text-property (point) 'opencode-prompt))
           (should-not (opencode-test-press (current-buffer) "RET"))
+          (should (equal (mapcar #'car recorded) '("An answer line")))
+          (should (eq (nth 1 (car recorded)) (current-buffer)))
+          ;; A region across a prompt and the answer, as it is.
+          (setq recorded nil)
+          (let ((transient-mark-mode t))
+            (goto-char (opencode-test-find "hello"))
+            (push-mark (point) t t)
+            (goto-char (+ (opencode-test-find "Another") 7))
+            (should-not (opencode-test-press (current-buffer) "RET"))
+            (deactivate-mark))
+          (should (equal (mapcar #'car recorded) '("hello\n\nAn answer line\n\nAnother")))
+          ;; A blank line quotes nothing, and says so.
+          (setq recorded nil)
+          (goto-char (opencode-test-find "Another"))
+          (forward-line -1)
+          (should (string-blank-p (buffer-substring (pos-bol) (pos-eol))))
+          (let ((messages nil))
+            (cl-letf (((symbol-function 'message)
+                       (lambda (format &rest arguments)
+                         (unless (member format '(nil ""))
+                           (push (apply #'format-message format arguments) messages)))))
+              (should-not (opencode-test-press (current-buffer) "RET")))
+            (should (equal messages '("Nothing to quote here"))))
           (should-not recorded))
         (should (= (opencode-test-prompt-count) prompts))
         (should (equal (opencode-test-typed) ""))))))

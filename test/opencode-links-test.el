@@ -408,7 +408,10 @@ The input typed meanwhile is left as it is, and buffers of other modes too."
         ;; Linking is no edit.
         (should (eq (buffer-modified-p) modified))
         (should (eq buffer-undo-list undo))
-        (delete-region (opencode-pmark) (point-max)))
+        (delete-region (opencode-pmark) (point-max))
+        ;; Its prompts were not read-only either, until loading the
+        ;; session module, which does as this.
+        (opencode-protect-transcript))
       (opencode-test-check-prompt-links buffer))))
 
 (provide 'opencode-links-test)

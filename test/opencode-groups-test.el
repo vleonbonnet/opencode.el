@@ -152,10 +152,10 @@ PROPERTY-VALUES holds the `mouse-face' and `opencode-box' there."
               (click (opencode-test-find " read "))
               (should-not (overlay-get overlay 'opencode-expanded))
               (should (= (length clicked) 1))
-              ;; The keys stay on the whole line.
+              ;; TAB stays on the whole line; RET quotes it, as on any line.
               (goto-char (opencode-test-find "README.md"))
-              (should (eq (key-binding (kbd "RET")) 'opencode-toggle-block))
-              (should (eq (key-binding (kbd "TAB")) 'opencode-toggle-block)))))))))
+              (should (eq (key-binding (kbd "TAB")) 'opencode-toggle-block))
+              (should (eq (key-binding (kbd "RET")) 'opencode-send-input)))))))))
 
 (defun opencode-test-pixel-positions (buffer start end)
   "Return the x pixel positions of the characters of BUFFER from START to END.
@@ -373,7 +373,7 @@ Run in a graphical Emacs, with the user's font and theme when given."
           (should (eq (opencode-collapsible-at (point)) (opencode-test-group-at "3 blocks"))))))))
 
 (ert-deftest opencode-test-group-expand-and-collapse ()
-  "RET or TAB on a group shows its blocks as they were; again, hides them, points coming back."
+  "TAB on a group shows its blocks as they were; again, hides them, points coming back."
   (opencode-test-with-transcript (append (opencode-test-group-turn 1) (opencode-test-group-turn 2))
     (let ((buffer (opencode-test-open (opencode-test-session))))
       (with-current-buffer buffer
@@ -381,7 +381,7 @@ Run in a graphical Emacs, with the user's font and theme when given."
           (set-window-buffer (selected-window) buffer)
           (let ((group (opencode-test-group-at "3 blocks")))
             (goto-char (overlay-start group))
-            (should-not (opencode-test-press buffer "RET"))
+            (should-not (opencode-test-press buffer "TAB"))
             (should (overlay-get group 'opencode-expanded))
             (let ((visible (opencode-test-visible-text)))
               (should (string-search "Thinking about 1." visible))

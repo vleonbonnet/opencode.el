@@ -95,18 +95,22 @@ Each function receives a plist (:kind :text :name) and may return
   :group 'opencode)
 
 (defcustom opencode-old-input-function nil
-  "Function given what RET picks on an earlier prompt, or nil to put it in the input.
-\\<opencode-session-mode-map>\\[opencode-send-input] on an earlier prompt of a session buffer calls it, in
-that buffer, point and the region as the user left them, with the text
-picked and the session buffer; nothing is sent.  The text is the active
-region's, else the prompt's line at point.  The labels of the
-attachments that can go with a prompt again, subagent mentions and
-files still on disk, carry the attachment as their
-`opencode-sent-attachment' property (see `opencode-old-input').  Nil
-stands for `opencode-put-old-input', which puts the text in the
-session's own input; \\[opencode-copy-old-input] puts the whole prompt there whatever
-this says.  Packages that quote text elsewhere, such as drover, set it
-when it is nil, so that a function of the user's own stays."
+  "Function given what RET picks in the transcript, or nil to put it in the input.
+\\<opencode-session-mode-map>\\[opencode-send-input] in the transcript of a session buffer, on an earlier
+prompt, the agent's text, a block's summary or any other line, calls it,
+in that buffer, point and the region as the user left them, with the
+text picked and the session buffer; nothing is sent.  The text is the
+active region's, else the line at point, as `opencode-transcript-text'
+returns it: what overlays hide, such as the blocks of a collapsed
+group, is left out.  The labels of the attachments that can go with a
+prompt again, subagent mentions and files still on disk, carry the
+attachment as their `opencode-sent-attachment' property (see
+`opencode-old-input').  Links and other text with keys of their own
+keep their RET.  Nil stands for `opencode-put-old-input', which puts the
+text in the session's own input; \\[opencode-copy-old-input] puts a whole earlier prompt
+there whatever this says.  Packages that quote text elsewhere, such as
+drover, set it when it is nil, so that a function of the user's own
+stays."
   :type '(choice (const :tag "Into the session's input" nil) function)
   :group 'opencode)
 
@@ -730,6 +734,15 @@ non-exclusively."
 
 (define-derived-mode opencode-session-mode comint-mode "OpenCode"
   "Major mode of an OpenCode session buffer.
+\\<opencode-session-mode-map>
+The transcript is the server's: it is read-only, typing or deleting
+there does nothing, and killing copies.  Point moves anywhere, and
+\\[opencode-send-input] in the transcript quotes the region, else the line at point,
+through `opencode-old-input-function', but on a link or other text with
+keys of its own; in the input at the bottom, it sends.  In the
+transcript, TAB expands or collapses the block or group at point, as a
+click on its summary's box does (see `opencode-tab-dwim').
+
 Only standard keys are bound.  Comint commands meant for a subprocess
 interrupt the turn or are refused (`opencode-comint-unsupported'), and
 `revert-buffer' renders the transcript again.
@@ -2938,16 +2951,15 @@ any asynchronous step.  `opencode-before-send-functions' run first."
 Checks run before Comint takes the input, so declining leaves it as typed.
 An archived session is restored from the archive once the checks passed,
 and the input sent once the service restored it; were the restore
-refused, the input stays at the prompt.  On an earlier prompt, nothing
-is sent: the region, else the prompt's line at point, goes to
+refused, the input stays at the prompt.  In the transcript, nothing is
+sent: the region, else the line at point, goes to
 `opencode-old-input-function', quoted elsewhere or put in the input."
   (interactive)
   (cond
    ((not (and opencode-session-id (get-buffer-process (current-buffer))))
     (opencode--comint-send))
    ((< (point) (opencode-pmark))
-    (unless (opencode--reuse-old-input)
-      (message "Not on an earlier prompt; nothing sent")))
+    (opencode--reuse-old-input))
    (opencode--input-awaits-restore
     (message "The session is being restored from the archive; the input is sent then"))
    (t
@@ -3021,18 +3033,49 @@ A subagent mention can; a file can while it is on disk."
                   (file (opencode--uri-file uri)))
         (file-exists-p file))))
 
-(defun opencode--old-input-text (start end)
-  "Return the text of an earlier prompt from START to END, as `opencode-old-input' does."
-  (let* ((text (string-trim-right (buffer-substring-no-properties start end)))
-         (limit (+ start (length text)))
-         (pos start))
-    (while (< pos limit)
+(defun opencode--attachment-text (start end)
+  "Return the text from START to END without properties but on reattachable labels.
+The labels of the attachments that can go with a prompt again carry
+them as their `opencode-sent-attachment' property."
+  (let ((text (buffer-substring-no-properties start end))
+        (pos start))
+    (while (< pos end)
       (let ((attachment (get-text-property pos 'opencode-sent-attachment))
-            (next (next-single-property-change pos 'opencode-sent-attachment nil limit)))
+            (next (next-single-property-change pos 'opencode-sent-attachment nil end)))
         (when (and attachment (opencode--reattachable-p attachment))
           (put-text-property (- pos start) (- next start) 'opencode-sent-attachment attachment text))
         (setq pos next)))
     text))
+
+(defun opencode--old-input-text (start end)
+  "Return the text of an earlier prompt from START to END, as `opencode-old-input' does."
+  (string-trim-right (opencode--attachment-text start end)))
+
+(defun opencode--hidden-p (position)
+  "Return non-nil when an overlay hides the character at POSITION.
+Those are the blocks of a collapsed group and the prompt string before
+each prompt; text that markup hides, such as a link's target, shows."
+  (seq-some (lambda (overlay)
+              (when-let* ((invisible (overlay-get overlay 'invisible)))
+                (invisible-p invisible)))
+            (overlays-at position)))
+
+(defun opencode-transcript-text (start end)
+  "Return the transcript's text from START to END as RET quotes it.
+What overlays hide is left out, the blocks of a collapsed group and
+the prompt string before each prompt, and so is the trailing
+whitespace; the Markdown stays as written, markup and link targets
+included.  The text has no properties but on the labels of the
+attachments that can go with a prompt again, which carry them, as in
+`opencode-old-input'."
+  (let ((parts nil)
+        (pos start))
+    (while (< pos end)
+      (let ((next (min end (next-overlay-change pos))))
+        (unless (opencode--hidden-p pos)
+          (push (opencode--attachment-text pos next) parts))
+        (setq pos next)))
+    (string-trim-right (apply #'concat (nreverse parts)))))
 
 (defun opencode-old-input (&optional position)
   "Return the text of the earlier prompt at POSITION, or nil when none.
@@ -3047,20 +3090,27 @@ sent inline, are text."
     (opencode--old-input-text (car bounds) (cdr bounds))))
 
 (defun opencode-old-input-at-point ()
-  "Return what RET picks on the earlier prompt at point, or nil when none.
-That is the active region's text, else the prompt's line at point,
-as `opencode-old-input' returns a prompt: the labels of attachments
-that can go again carry them."
-  (when-let* ((bounds (opencode--prompt-bounds (point))))
+  "Return what RET picks in the transcript at point, or nil in the input.
+That is the active region's text, else the line at point, up to the
+input: an earlier prompt's, the agent's, a block's summary or any
+other.  The text is as `opencode-transcript-text' returns it, without
+what overlays hide; the labels of attachments that can go again carry
+them, as in `opencode-old-input'."
+  (when-let* ((process (get-buffer-process (current-buffer)))
+              (pmark (marker-position (process-mark process)))
+              ((< (point) pmark)))
     (if (use-region-p)
-        (opencode--old-input-text (region-beginning) (region-end))
-      (opencode--old-input-text (max (car bounds) (pos-bol)) (min (cdr bounds) (pos-eol))))))
+        (opencode-transcript-text (region-beginning) (region-end))
+      (opencode-transcript-text (pos-bol) (min (pos-eol) pmark)))))
 
 (defun opencode--reuse-old-input ()
-  "Give what RET picks on the earlier prompt at point to `opencode-old-input-function'.
-Return non-nil when point is on one."
+  "Give what RET picks in the transcript at point to `opencode-old-input-function'.
+Return non-nil when point is in the transcript.  A blank line gives
+nothing, and the echo area says so."
   (when-let* ((text (opencode-old-input-at-point)))
-    (funcall (or opencode-old-input-function #'opencode-put-old-input) text (current-buffer))
+    (if (string-blank-p text)
+        (message "Nothing to quote here")
+      (funcall (or opencode-old-input-function #'opencode-put-old-input) text (current-buffer)))
     t))
 
 (defun opencode--insert-old-input (text)
@@ -3080,7 +3130,7 @@ Its labels carrying an attachment stand for it again, as typed ones do."
         (setq pos next)))))
 
 (defun opencode-put-old-input (text buffer)
-  "Put TEXT, an earlier prompt of session BUFFER or a part of one, in BUFFER's input.
+  "Put TEXT, an earlier prompt or other text of session BUFFER, in BUFFER's input.
 TEXT is as `opencode-old-input' returns it: its labels carrying an
 attachment stand for it again.  A blank input is replaced; input typed
 already stays, TEXT following it after a blank line, which the echo
@@ -3099,7 +3149,7 @@ what nil stands for in `opencode-old-input-function'."
         (goto-char pmark))
       (opencode--insert-old-input text)
       (when draft
-        (message "The earlier prompt follows the input already typed")))))
+        (message "The text follows the input already typed")))))
 
 (defun opencode-copy-old-input ()
   "Put the earlier prompt at point, whole, in the input, to be edited.
@@ -4217,7 +4267,8 @@ keep their own."
     (with-current-buffer buffer
       (with-demoted-errors "OpenCode: cannot update the look of a session buffer: %S"
         (opencode--unhighlight-sent-prompts)
-        (opencode-blocks-upgrade)))))
+        (opencode-blocks-upgrade)
+        (opencode-read-only-upgrade)))))
 
 (provide 'opencode-session)
 ;;; opencode-session.el ends here

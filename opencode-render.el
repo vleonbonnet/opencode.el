@@ -58,9 +58,10 @@ or builds grammars lets the first session on a fresh machine set them up."
 
 (defcustom opencode-render-table-function #'opencode-align-markdown-table
   "Function rendering the completed Markdown table between BEG and END.
-It replaces the region in the session buffer and must keep the Comint
-output properties, as `opencode-output-properties' returns them, on
-whatever it inserts.  Font-lock owns `display' in session buffers, so
+It replaces the region in the session buffer, read-only text that it
+is called with `inhibit-read-only' bound to write, and must keep the
+Comint output properties, as `opencode-output-properties' returns them,
+on whatever it inserts.  Font-lock owns `display' in session buffers, so
 a rendering laid out with it keeps it with `opencode-keep-display'.
 The default aligns the table's pipes with markdown-ts and keeps its
 markup."
@@ -69,8 +70,9 @@ markup."
 
 (defcustom opencode-rerender-tables-function nil
   "Function reflowing rendered tables after a window resize, or nil.
-Like `opencode-render-table-function', it keeps any `display' it lays
-the tables out with by `opencode-keep-display'."
+Like `opencode-render-table-function', it is called with
+`inhibit-read-only' bound, and keeps any `display' it lays the tables
+out with by `opencode-keep-display'."
   :type '(choice (const :tag "Never reflow" nil) function)
   :group 'opencode)
 
@@ -308,7 +310,18 @@ with a large `gc-cons-threshold'.  This one reuses its markers."
           (setq comint-last-prompt opencode--prompt-markers)
           (font-lock-append-text-property prompt-start (point) 'font-lock-face 'comint-highlight-prompt)
           (add-text-properties prompt-start (point) `(rear-nonsticky ,comint--prompt-rear-nonsticky)))
+        ;; Last, once Comint's stickiness is set.
+        (opencode-protect comint-last-output-start (point))
         (goto-char saved-point)))))
+
+(defun opencode-move-pmark (position)
+  "Move the process mark to POSITION, after output written at it.
+What it passes over becomes read-only: output written at the mark
+does not move it, nor does the change protect it (see
+`opencode--protect-change')."
+  (let ((pmark (process-mark (get-buffer-process (current-buffer)))))
+    (opencode-protect pmark position)
+    (set-marker pmark position)))
 
 (defun opencode-output (string)
   "Write STRING at the process mark as Comint output."
@@ -349,7 +362,8 @@ stays after it, and so do the points that follow output (see
         (goto-char position)
         (insert string)
         (setq end (point))
-        (comint--mark-as-output position end))
+        (comint--mark-as-output position end)
+        (opencode-protect position end))
       (dolist (marker markers)
         (set-marker marker end)))
     (opencode-buttonize position end t)
@@ -434,12 +448,14 @@ Its links become buttons, as those of output do: sent, it is part of
 the transcript, where a click or RET follows them.  Elsewhere on it,
 RET gives the line or the region to `opencode-old-input-function'
 \(see `opencode-send-input'); the mouse neither highlights it nor
-tells anything about it, unlike Comint's earlier inputs."
+tells anything about it, unlike Comint's earlier inputs.  It becomes
+read-only, the newline after it too."
   (opencode-add-margin comint-last-input-start comint-last-input-end
                        'opencode-request-margin-highlight)
   (with-silent-modifications
     (remove-list-of-text-properties comint-last-input-start comint-last-input-end '(mouse-face help-echo))
     (put-text-property comint-last-input-start comint-last-input-end 'opencode-prompt t))
+  (opencode-protect comint-last-input-start (opencode-pmark))
   (opencode-buttonize comint-last-input-start comint-last-input-end t))
 
 (defun opencode-insert-block-with-margin (text face)
@@ -869,6 +885,7 @@ instead of sending the input."
                     markdown-ts-setext-heading))
       (face-remap-add-relative face 'opencode-heading)))
   (opencode-undo-setup)
+  (opencode-read-only-setup)
   (add-hook 'window-size-change-functions #'opencode--rerender-tables nil t))
 
 ;;;; Undo of the prompt only
@@ -988,6 +1005,176 @@ overlays."
   (add-hook 'after-change-functions #'opencode--undo-after-change nil t)
   (add-hook 'comint-input-filter-functions #'opencode--undo-forget-sent-input nil t))
 
+;;;; The transcript, read-only
+
+;; Everything before the process mark is the server's: the user reads,
+;; selects and copies it, and types only in the input.  The transcript
+;; carries the `opencode-transcript' property, which session buffers
+;; read as `read-only' (`char-property-alias-alist'): text copied out of
+;; them, by a package measuring it or into another buffer, is read-only
+;; nowhere else, as text carrying `read-only' itself would be.  It is
+;; front-sticky so that nothing is inserted within the transcript or
+;; before it, and rear-nonsticky so that the input is typed right after
+;; it and inherits nothing.  Every writer binds `inhibit-read-only'.
+
+(defun opencode-protect (start end)
+  "Make the transcript text from START to END read-only to the user.
+It gets the `opencode-transcript' property, which session buffers read
+as `read-only', front-sticky and rear-nonsticky, whatever stickiness
+the text had for its other properties, which it keeps.  Text inserted
+in front of it later is protected after Comint marks it as output (see
+`opencode--protect-inserted')."
+  (when (< start end)
+    (with-silent-modifications
+      (let ((pos start))
+        (while (< pos end)
+          (let ((next (next-single-property-change pos 'front-sticky nil end))
+                (value (get-text-property pos 'front-sticky)))
+            (unless (or (eq value t) (memq 'read-only value))
+              (put-text-property pos next 'front-sticky (cons 'read-only value)))
+            (setq pos next))))
+      (let ((pos start))
+        (while (< pos end)
+          (let ((next (next-single-property-change pos 'rear-nonsticky nil end))
+                (value (get-text-property pos 'rear-nonsticky)))
+            (unless (or (eq value t)
+                        (and (memq 'read-only value) (memq 'opencode-transcript value)))
+              (put-text-property pos next 'rear-nonsticky
+                                 (append (unless (memq 'read-only value) '(read-only))
+                                         (unless (memq 'opencode-transcript value) '(opencode-transcript))
+                                         value)))
+            (setq pos next))))
+      (let ((pos start))
+        (while (< pos end)
+          (let ((next (next-single-property-change pos 'insert-in-front-hooks nil end))
+                (hooks (get-text-property pos 'insert-in-front-hooks)))
+            (when (and (memq #'comint--mark-as-output hooks)
+                       (not (memq #'opencode--protect-inserted hooks)))
+              (put-text-property pos next 'insert-in-front-hooks
+                                 (append hooks (list #'opencode--protect-inserted))))
+            (setq pos next))))
+      (put-text-property start end 'opencode-transcript t))))
+
+(defun opencode--protect-inserted (beg end)
+  "Make the text inserted from BEG to END in front of the transcript read-only.
+Comint marks such text as output, its stickiness with it, after the
+buffer's change hooks protected it: this one comes after Comint's."
+  (opencode-protect beg end))
+
+(defun opencode--protect-change (beg end old-length)
+  "Make the text written from BEG to END in place of OLD-LENGTH characters read-only.
+That is text written before the process mark, by writers binding
+`inhibit-read-only': output written at the mark is protected as it is
+written (see `opencode--output-filter'), input never.  A change of
+properties alone, which keeps the text, keeps its protection."
+  (when-let* (((/= old-length (- end beg)))
+              (process (get-buffer-process (current-buffer)))
+              (pmark (marker-position (process-mark process)))
+              ((< beg pmark)))
+    (opencode-protect beg (min end pmark))))
+
+(defun opencode-protect-transcript ()
+  "Make the whole transcript of this session buffer read-only to the user, at once."
+  (when-let* ((process (get-buffer-process (current-buffer))))
+    (save-restriction
+      (widen)
+      (opencode-protect (point-min) (marker-position (process-mark process))))))
+
+(defconst opencode--protect-slice 65536
+  "Characters of a transcript an earlier version rendered protected at a time.")
+
+(defun opencode--protect-from (marker)
+  "Protect the transcript of MARKER's buffer from MARKER on, a slice at a time.
+Each slice protects `opencode--protect-slice' characters and leaves the
+rest to a timer, so that a long transcript blocks nothing for long."
+  (when-let* ((buffer (marker-buffer marker)))
+    (with-current-buffer buffer
+      (with-demoted-errors "OpenCode: cannot make a transcript read-only: %S"
+        (let* ((process (get-buffer-process buffer))
+               (pmark (and process (marker-position (process-mark process))))
+               (end (and pmark (min pmark (+ marker opencode--protect-slice)))))
+          (if (not (and end (< marker end)))
+              (set-marker marker nil)
+            (save-restriction
+              (widen)
+              (opencode-protect marker end))
+            (set-marker marker end)
+            (run-at-time 0 nil #'opencode--protect-from marker)))))))
+
+(defun opencode-read-only-upgrade ()
+  "Make the transcript of a session buffer an earlier version rendered read-only.
+What it writes from now on is protected as it is written, and what it
+showed already a slice at a time, the first at once (see
+`opencode--protect-from')."
+  (unless (memq #'opencode--protect-change after-change-functions)
+    (opencode-read-only-setup)
+    (opencode--protect-from (copy-marker (point-min)))))
+
+(defvar opencode-transcript-quiet-commands
+  '((self-insert-command . insert) (opencode-electric-slash . insert)
+    (opencode-add-subagent . insert) (newline . insert) (open-line . insert)
+    (electric-newline-and-maybe-indent . insert) (quoted-insert . insert)
+    (insert-char . insert) (yank . insert) (clipboard-yank . insert)
+    (yank-from-kill-ring . insert)
+    (delete-char . forward) (delete-forward-char . forward)
+    (delete-backward-char . backward) (backward-delete-char . backward)
+    (backward-delete-char-untabify . backward))
+  "Commands that do nothing in the transcript, rather than say it is read-only.
+Each is (COMMAND . WHERE), WHERE telling what COMMAND changes: `insert'
+inserts at point, `forward' deletes after point, `backward' before it.
+Typing or holding a key in the transcript then changes nothing and
+says nothing; other edits there signal that the text is read-only, and
+killing copies it (see `kill-read-only-ok').")
+
+(defconst opencode--region-deleting-commands
+  '(delete-forward-char delete-backward-char backward-delete-char-untabify)
+  "Commands deleting the active region when the option `delete-active-region' says so.")
+
+(defun opencode--transcript-edit-start ()
+  "Return where the command about to run would change the buffer, or nil.
+For a command of `opencode-transcript-quiet-commands', called before it
+runs: the region's start when it would replace or delete the region,
+else point, or the first character a backward deletion deletes."
+  (when-let* ((where (alist-get this-command opencode-transcript-quiet-commands)))
+    (let ((count (prefix-numeric-value prefix-arg)))
+      (cond
+       ((and (use-region-p)
+             (or (and (bound-and-true-p delete-selection-mode)
+                      (get this-command 'delete-selection))
+                 (and delete-active-region (= count 1)
+                      (memq this-command opencode--region-deleting-commands))))
+        (region-beginning))
+       ((eq where 'backward) (- (point) (max 1 count)))
+       (t (point))))))
+
+(defun opencode--quiet-transcript-edit ()
+  "Have the edit about to run do nothing when it would change the transcript.
+The command is replaced by `ignore', which says nothing.  For the
+buffer's `pre-command-hook'."
+  (when-let* ((process (get-buffer-process (current-buffer)))
+              (start (opencode--transcript-edit-start))
+              ((< start (marker-position (process-mark process)))))
+    (setq this-command #'ignore)))
+
+(defun opencode-read-only-setup ()
+  "Make this buffer's transcript read-only to the user, and quietly so.
+Text written before the process mark becomes read-only, typing there
+does nothing, and killing there copies.  Yanking text copied from the
+transcript into the input leaves it editable."
+  (unless (memq 'opencode-transcript (alist-get 'read-only char-property-alias-alist))
+    (setq-local char-property-alias-alist
+                (cons (cons 'read-only (cons 'opencode-transcript
+                                             (alist-get 'read-only char-property-alias-alist)))
+                      (assq-delete-all 'read-only (copy-alist char-property-alias-alist)))))
+  (unless (assq 'opencode-transcript text-property-default-nonsticky)
+    (setq-local text-property-default-nonsticky
+                (cons '(opencode-transcript . t) text-property-default-nonsticky)))
+  (unless (or (eq yank-excluded-properties t) (memq 'opencode-transcript yank-excluded-properties))
+    (setq-local yank-excluded-properties (cons 'opencode-transcript yank-excluded-properties)))
+  (add-hook 'after-change-functions #'opencode--protect-change nil t)
+  (add-hook 'pre-command-hook #'opencode--quiet-transcript-edit nil t)
+  (setq-local kill-read-only-ok t))
+
 ;;;; Tables
 
 (defun opencode-output-properties (position)
@@ -1048,6 +1235,7 @@ applied back, so properties and markers on unchanged text survive."
                       (unless (get-text-property pos 'field)
                         (add-text-properties pos next output-properties))
                       (setq pos next)))))
+              (opencode-protect (point-min) (point-max))
               (opencode-buttonize (point-min) (point-max) t))))))))
 
 (defun opencode--table-free-p (finished)
@@ -1110,10 +1298,11 @@ moves past it with the points following output."
                                       (output-end (= end (opencode-pmark))))
                                   (unwind-protect
                                       (progn
-                                        (funcall opencode-render-table-function beg end)
+                                        (let ((inhibit-read-only t))
+                                          (funcall opencode-render-table-function beg end))
                                         ;; What aligning appends to a table ending the output is output too.
                                         (when output-end
-                                          (set-marker (process-mark (get-buffer-process (current-buffer))) next))
+                                          (opencode-move-pmark next))
                                         (goto-char next)
                                         (set-marker opencode--table-scan-marker next))
                                     (set-marker next nil)))
@@ -1138,8 +1327,12 @@ output."
                                     opencode--table-scan-marker)))
            (distances (mapcar (lambda (marker) (- (point-max) marker)) markers)))
       (opencode-keeping-followers
-        (funcall opencode-rerender-tables-function))
-      (cl-mapc (lambda (marker distance) (set-marker marker (- (point-max) distance)))
+        (let ((inhibit-read-only t))
+          (funcall opencode-rerender-tables-function)))
+      (cl-mapc (lambda (marker distance)
+                 (if (and process (eq marker (process-mark process)))
+                     (opencode-move-pmark (- (point-max) distance))
+                   (set-marker marker (- (point-max) distance))))
                markers distances))))
 
 (provide 'opencode-render)

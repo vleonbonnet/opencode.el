@@ -357,6 +357,40 @@ They are real timer objects, which `timerp' recognizes, never scheduled."
          (when (timerp timer)
            (cancel-timer timer))))))
 
+(defun opencode-test-unprotected (buffer)
+  "Return the first position of BUFFER's transcript the user could change, or nil.
+The transcript, before the process mark, must read as `read-only',
+front-sticky and rear-nonsticky, so that nothing is inserted within it."
+  (with-current-buffer buffer
+    (when-let* ((process (get-buffer-process buffer)))
+      (save-restriction
+        (widen)
+        (let ((pmark (marker-position (process-mark process)))
+              (found nil))
+          (unless (= pmark (point-min))
+            (setq found (text-property-any (point-min) pmark 'opencode-transcript nil))
+            (dolist (stickiness '(front-sticky rear-nonsticky))
+              (let ((pos (point-min)))
+                (while (and (not found) (< pos pmark))
+                  (let ((value (get-text-property pos stickiness)))
+                    (unless (or (eq value t) (memq 'read-only value))
+                      (setq found pos)))
+                  (setq pos (next-single-property-change pos stickiness nil pmark))))))
+          found)))))
+
+(defun opencode-test-check-read-only (messages-start)
+  "Check that the session buffers' transcripts stay read-only, and were written.
+No writer met read-only text since MESSAGES-START, a position in
+*Messages*: an error it demoted would say so there."
+  (maphash (lambda (_id buffer)
+             (when (buffer-live-p buffer)
+               (should-not (opencode-test-unprotected buffer))))
+           opencode-session-buffers)
+  (with-current-buffer (messages-buffer)
+    (should-not (string-match-p "text-read-only\\|Text is read-only"
+                                (buffer-substring-no-properties (min messages-start (point-max))
+                                                                (point-max))))))
+
 (defmacro opencode-test-with-server (&rest body)
   "Run BODY with requests answered by `opencode-test-routes' and no display.
 Notifications reach `opencode-test-notifications' instead of the OS.  The
@@ -397,7 +431,10 @@ session registry starts empty and follows events once a test dispatches
                    ((symbol-function 'display-buffer) (lambda (&rest _) (ert-fail "Unexpected display")))
                    ((symbol-function 'pop-to-buffer) (lambda (&rest _) (ert-fail "Unexpected pop-to-buffer")))
                    ((symbol-function 'switch-to-buffer) (lambda (&rest _) (ert-fail "Unexpected switch"))))
-           (unwind-protect (progn ,@body)
+           (unwind-protect
+               (let ((messages-start (with-current-buffer (messages-buffer) (point-max))))
+                 (prog1 (progn ,@body)
+                   (opencode-test-check-read-only messages-start)))
              (dolist (timer (list opencode--mode-line-animation-timer opencode--mode-line-registry-timer))
                (when (timerp timer)
                  (cancel-timer timer)))
