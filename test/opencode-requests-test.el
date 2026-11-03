@@ -727,7 +727,7 @@ in `opencode-test-answered' instead."
       (opencode-test-choosing '(?c ?a ?s)
         (opencode-send-input)
         (should (equal (car opencode-test-asked)
-                       "A question is pending; the agent reads a prompt only once it is answered or dismissed."))
+                       "This session waits for your answer to a question; it reads the prompt only once the question is answered or dismissed."))
         (should-not (opencode-test-sends))
         (should (equal (opencode-test-typed) "use red instead"))
         ;; Answering opens the question, keeping the input, and says nothing more.
@@ -767,7 +767,8 @@ in `opencode-test-answered' instead."
       (opencode-test-type "/review HEAD")
       (opencode-test-choosing '(?s)
         (opencode-send-input)
-        (should (string-prefix-p "A permission request is pending;" (car opencode-test-asked)))
+        (should (string-prefix-p "This session waits for your answer to a permission request;"
+                                (car opencode-test-asked)))
         (should (equal (mapcar #'car (opencode-test-sends)) '(command)))))))
 
 (ert-deftest opencode-test-send-while-waiting-without-asking ()
@@ -800,68 +801,167 @@ in `opencode-test-answered' instead."
         (should-not opencode-test-asked)
         (should (equal (mapcar #'car (opencode-test-sends)) '(prompt)))))))
 
+(defun opencode-test-subagent-events (&optional background)
+  "Return the events of the subagent scenario's parent and child, oldest first.
+With BACKGROUND, the parent runs the subagent in the background: its
+call says so and ends at once, the subagent still running, as the
+service reports such a call."
+  (let* ((parent (opencode-test-scenario "subagent"))
+         (child (opencode-test-scenario "subagent-child"))
+         (events (seq-filter (lambda (event)
+                               (member (or (alist-get 'sessionID (alist-get 'data event))
+                                           (alist-get 'sessionID (alist-get 'form (alist-get 'data event))))
+                                       (list parent child)))
+                             (opencode-test-events))))
+    (if (not background)
+        events
+      (mapcan
+       (lambda (event)
+         (let ((type (alist-get 'type event))
+               (data (alist-get 'data event)))
+           (cl-flet ((with-data (data) (cons (cons 'data data) (assq-delete-all 'data (copy-alist event)))))
+             (cond
+              ((not (equal (alist-get 'sessionID data) parent)) (list event))
+              ((and (equal type "session.tool.called") (alist-get 'agent (alist-get 'input data)))
+               (list (with-data (cons (cons 'input (append (alist-get 'input data) '((background . t))))
+                                      (assq-delete-all 'input (copy-alist data))))))
+              ((and (equal type "session.tool.progress")
+                    (equal (alist-get 'sessionID (alist-get 'metadata data)) child))
+               (list event
+                     `((type . "session.tool.success")
+                       (data (sessionID . ,parent)
+                             (assistantMessageID . ,(alist-get 'assistantMessageID data))
+                             (id . ,(alist-get 'id data))
+                             (content ((type . "text")
+                                       (text . ,(format "The subagent is working in the background (sessionID: %s)."
+                                                        child))))
+                             (metadata (sessionID . ,child) (status . "running"))))))
+              ;; Its foreground completion.
+              ((and (equal type "session.tool.success")
+                    (equal (alist-get 'sessionID (alist-get 'metadata data)) child))
+               nil)
+              (t (list event))))))
+       events))))
+
+(defun opencode-test-open-subagent-asking (&optional background)
+  "Open the subagent scenario's parent and stream until its child asks permission.
+BACKGROUND runs the child in the background, as for
+`opencode-test-subagent-events'.  Return the parent's buffer."
+  (let ((buffer (opencode-test-open-empty (opencode-test-scenario "subagent"))))
+    (opencode-test-dispatch-until (opencode-test-subagent-events background) "permission.asked")
+    (opencode--flush-sync)
+    (should (buffer-live-p (gethash (opencode-test-scenario "subagent-child") opencode-session-buffers)))
+    buffer))
+
+(defun opencode-test-subagent-block (buffer)
+  "Return the data of the block of the subagent call in BUFFER."
+  (with-current-buffer buffer
+    (opencode-block-data (seq-find (lambda (overlay)
+                                     (equal (plist-get (opencode-block-data overlay) :tool) "subagent"))
+                                   (opencode-tool-blocks)))))
+
 (ert-deftest opencode-test-send-while-subagent-asks ()
-  "A subagent's request makes its parent ask, and answering goes through the parent."
+  "A subagent run in the foreground and asking makes its parent ask, naming it, and is answered in its buffer."
   (opencode-test-with-server
-    (let* ((parent (opencode-test-scenario "subagent"))
-           (child (opencode-test-scenario "subagent-child"))
-           (buffer (opencode-test-open-empty parent)))
-      (opencode-test-dispatch-until
-       (seq-filter (lambda (event)
-                     (member (or (alist-get 'sessionID (alist-get 'data event))
-                                 (alist-get 'sessionID (alist-get 'form (alist-get 'data event))))
-                             (list parent child)))
-                   (opencode-test-events))
-       "permission.asked")
-      (should (buffer-live-p (gethash child opencode-session-buffers)))
-      (opencode--flush-sync)
+    (let* ((child (opencode-test-scenario "subagent-child"))
+           (buffer (opencode-test-open-subagent-asking)))
       (with-current-buffer buffer
+        (should (equal (plist-get (opencode-test-subagent-block buffer) :status) "running"))
         (should (equal opencode--pending-children (list child)))
         (setq opencode-test-requests nil)
         (opencode-test-type "never mind")
         (opencode-test-choosing '(?a)
           (opencode-send-input)
-          (should (string-prefix-p "A subagent's permission request is pending;" (car opencode-test-asked)))
-          (should (equal opencode-test-answered `((respond ,buffer))))
-          (should-not (opencode-test-sends)))))))
+          (should (equal (car opencode-test-asked)
+                         (format-message "Its subagent `%s' waits for your answer to a permission request; this session reads the prompt only once the request is answered or dismissed."
+                                         (opencode-test-session-title child))))
+          (should (equal opencode-test-answered `((respond-session ,child))))
+          (should-not (opencode-test-sends))
+          (should (equal (opencode-test-typed) "never mind")))))))
+
+(ert-deftest opencode-test-send-while-background-subagent-asks ()
+  "A subagent run in the background holds up nothing: its parent sends at once, and still answers it."
+  (opencode-test-with-server
+    (let* ((child (opencode-test-scenario "subagent-child"))
+           (buffer (opencode-test-open-subagent-asking t)))
+      (with-current-buffer buffer
+        (let ((block (opencode-test-subagent-block buffer)))
+          (should (equal (plist-get block :status) "completed"))
+          (should (equal (opencode-tool-background-note block) "in the background")))
+        (should-not opencode--pending-children)
+        (should-not (opencode-awaited-requests))
+        (should (equal (mapcar (lambda (request) (plist-get request :session)) (opencode-tree-requests))
+                       (list child)))
+        (setq opencode-test-requests nil)
+        (opencode-test-type "meanwhile, look at the docs")
+        (opencode-test-choosing nil
+          (opencode-send-input)
+          (should-not opencode-test-asked)
+          (pcase-let ((`((prompt . ,body)) (opencode-test-sends)))
+            (should (equal (alist-get 'text body) "meanwhile, look at the docs"))
+            (should (equal (alist-get 'delivery body) "steer"))))
+        ;; Answering from the parent still reaches the subagent.
+        (cl-letf (((symbol-function 'opencode-respond-session)
+                   (lambda (id &rest arguments) (push (cons id arguments) opencode-test-answered))))
+          (let ((opencode-test-answered nil))
+            (opencode-respond)
+            (should (equal opencode-test-answered `((,child))))))))))
 
 (ert-deftest opencode-test-send-while-registry-knows-request ()
-  "Requests the registry knows of subagents without a buffer count too, and are answered there."
+  "Requests the registry knows count when they hold up the session: its own, and its foreground subagents'."
   (opencode-test-with-server
-    (let* ((parent (opencode-test-scenario "text"))
+    (let* ((parent (opencode-test-scenario "subagent"))
+           (child (opencode-test-scenario "subagent-child"))
            (buffer (opencode-test-open-empty parent))
            (opencode-state--ready t)
            (opencode-state--stream opencode-events--stream))
+      ;; The parent runs its child in the foreground; the child has no buffer.
+      (opencode-test-dispatch-until (opencode-test-events parent) "session.tool.progress")
+      (should-not (gethash child opencode-session-buffers))
       (puthash parent (list :id parent :running t) opencode-state--sessions)
-      (puthash "ses_test_child" (list :id "ses_test_child" :parent-id parent :running t
-                                      :requests '((:kind question :id "frm_child" :time 1.0)))
+      (puthash child (list :id child :parent-id parent :running t :title "Delete junk"
+                           :requests '((:kind question :id "frm_child" :time 2.0)))
                opencode-state--sessions)
-      (puthash "ses_test_grandchild" (list :id "ses_test_grandchild" :parent-id "ses_test_child" :running t
-                                           :requests '((:kind permission :id "per_grandchild" :time 2.0)))
+      ;; Below a subagent without a buffer, nothing tells how it runs its own.
+      (puthash "ses_test_grandchild" (list :id "ses_test_grandchild" :parent-id child :running t
+                                           :requests '((:kind permission :id "per_grandchild" :time 1.0)))
+               opencode-state--sessions)
+      ;; No call of the parent runs it: it runs in the background.
+      (puthash "ses_test_background" (list :id "ses_test_background" :parent-id parent :running t
+                                           :requests '((:kind question :id "frm_background" :time 3.0)))
                opencode-state--sessions)
       (puthash "ses_test_other" (list :id "ses_test_other" :running t
-                                      :requests '((:kind question :id "frm_other" :time 3.0)))
+                                      :requests '((:kind question :id "frm_other" :time 0.5)))
                opencode-state--sessions)
       (with-current-buffer buffer
+        (should (equal (mapcar (lambda (request) (plist-get request :id)) (opencode-tree-requests))
+                       '("per_grandchild" "frm_child" "frm_background")))
         (should (equal (mapcar (lambda (request) (plist-get request :id)) (opencode-awaited-requests))
-                       '("frm_child" "per_grandchild")))
+                       '("frm_child")))
         (opencode-test-type "go on")
         (opencode-test-choosing '(?a)
           (opencode-send-input)
-          (should (string-prefix-p "2 requests are pending;" (car opencode-test-asked)))
-          (should (equal opencode-test-answered '((respond-session "ses_test_child"))))
+          (should (equal (car opencode-test-asked)
+                         (format-message "Its subagent `Delete junk' waits for your answer to a question; this session reads the prompt only once the question is answered or dismissed.")))
+          (should (equal opencode-test-answered `((respond-session ,child))))
           (should-not (opencode-test-sends))
           (should (equal (opencode-test-typed) "go on")))
+        ;; Its own request comes first, and both are told.
+        (puthash parent (list :id parent :running t
+                              :requests '((:kind permission :id "per_parent" :time 4.0)))
+                 opencode-state--sessions)
+        (should (equal (mapcar (lambda (request) (plist-get request :id)) (opencode-awaited-requests))
+                       '("per_parent" "frm_child")))
+        (should (equal (opencode--describe-awaited (opencode-awaited-requests))
+                       "This session and its subagents wait for your answer to 2 requests; this session reads the prompt only once they are answered or dismissed."))
+        (should (equal (opencode--describe-awaited (list (car (opencode-awaited-requests))))
+                       "This session waits for your answer to a permission request; it reads the prompt only once the request is answered or dismissed."))
         ;; A registry that no longer follows the service is not trusted.
         (let ((opencode-state--ready nil))
-          (should-not (opencode-awaited-requests)))))))
+          (should-not (opencode-awaited-requests))
+          (should-not (opencode-tree-requests)))))))
 
-;;;; Key hints
-
-(defun opencode-test-drover-keys (command)
-  "Return keys a package binding COMMAND in its own maps would report, or nil."
-  (alist-get command '((opencode-respond . "C-' A") (opencode-revert-clear . "C-' R")
-                       (opencode-interrupt . "C-' k"))))
+;;;; Answering a subagent's request from its parent
 
 (defmacro opencode-test-capturing-messages (&rest body)
   "Run BODY and return the messages it showed, oldest first."
@@ -872,6 +972,94 @@ in `opencode-test-answered' instead."
                   (when format (push (apply #'format-message format arguments) messages)))))
        ,@body)
      (nreverse messages)))
+
+(ert-deftest opencode-test-background-subagent-in-place ()
+  "Answered in place, a parent answers the request of a subagent it runs in the background."
+  (opencode-test-with-server
+    (let* ((parent (opencode-test-scenario "subagent"))
+           (child (opencode-test-scenario "subagent-child"))
+           (buffer (opencode-test-open-subagent-asking t))
+           (child-buffer (gethash child opencode-session-buffers))
+           (permission (car (buffer-local-value 'opencode-pending-permissions child-buffer))))
+      (with-current-buffer buffer (should-not (opencode-pending-request-p)))
+      (opencode-test-in-place parent
+        (opencode-respond-session parent nil t)
+        (should (eq (plist-get opencode--permission-transient-state :buffer) child-buffer))
+        (opencode-test-keys "o"))
+      (should (opencode-test-requests-to
+               'post (format "/api/session/%s/permission/%s/reply" child (plist-get permission :id))))
+      (with-current-buffer child-buffer (should-not opencode-pending-permissions)))))
+
+(ert-deftest opencode-test-nested-subagent-in-place ()
+  "Answered in place, a session answers the request of a subagent of its subagent, none of them shown."
+  (opencode-test-with-server
+    (let* ((top (opencode-test-scenario "text"))
+           (child (opencode-test-scenario "subagent-child"))
+           (buffer (opencode-test-open-empty top)))
+      (opencode-test-dispatch-until (opencode-test-subagent-events) "permission.asked")
+      (let* ((child-buffer (gethash child opencode-session-buffers))
+             (permission (car (buffer-local-value 'opencode-pending-permissions child-buffer)))
+             (opencode-state--ready t))
+        ;; The child asking runs under a subagent of TOP, which has no buffer.
+        (puthash top (list :id top :running t) opencode-state--sessions)
+        (puthash "ses_test_middle" (list :id "ses_test_middle" :parent-id top :running t) opencode-state--sessions)
+        (puthash child (list :id child :parent-id "ses_test_middle" :running t
+                             :requests (list (list :kind 'permission :id (plist-get permission :id) :time 1.0)))
+                 opencode-state--sessions)
+        (with-current-buffer buffer
+          (should-not (opencode-pending-request-p))
+          (should (equal (opencode--waiting-subagent) child)))
+        (opencode-test-in-place top
+          (opencode-respond-session top nil t)
+          (should (eq (plist-get opencode--permission-transient-state :buffer) child-buffer))
+          (opencode-test-keys "o"))
+        (should (opencode-test-requests-to
+                 'post (format "/api/session/%s/permission/%s/reply" child (plist-get permission :id))))))))
+
+(ert-deftest opencode-test-own-request-before-subagent-in-place ()
+  "Answered in place, a session's own request comes before an older one of its subagent."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "permission"))
+           (child (opencode-test-scenario "subagent-child"))
+           (buffer (opencode-test-open-empty id)))
+      (opencode-test-dispatch-until (opencode-test-events id) "permission.asked")
+      (opencode-test-dispatch-until (opencode-test-events child) "permission.asked")
+      (let ((child-buffer (gethash child opencode-session-buffers))
+            (opencode-state--ready t))
+        (puthash id (list :id id :running t) opencode-state--sessions)
+        (puthash child (list :id child :parent-id id :running t
+                             :requests '((:kind permission :id "per_older" :time 1.0)))
+                 opencode-state--sessions)
+        (with-current-buffer buffer
+          (should (equal (opencode--waiting-subagent) child))
+          (should (equal (plist-get (car (opencode-tree-requests)) :session) id)))
+        (opencode-test-in-place id
+          (opencode-respond-session id nil t)
+          (should (eq (plist-get opencode--permission-transient-state :buffer) buffer))
+          (should-not (eq (plist-get opencode--permission-transient-state :buffer) child-buffer))
+          (opencode-test-keys "C-g"))))))
+
+(ert-deftest opencode-test-nothing-pending-in-place ()
+  "Answered in place, a session whose tree awaits nothing says so."
+  (opencode-test-with-server
+    (let* ((parent (opencode-test-scenario "subagent"))
+           (buffer (opencode-test-open-empty parent)))
+      (opencode-test-dispatch-until (opencode-test-events parent) "session.tool.progress")
+      (with-current-buffer buffer
+        (should-not (opencode-tree-requests))
+        (should-not (opencode--waiting-subagent)))
+      (opencode-test-in-place parent
+        (should (member "No pending OpenCode request"
+                        (opencode-test-capturing-messages
+                          (opencode-respond-session parent nil t))))
+        (should-not (bound-and-true-p transient--prefix))))))
+
+;;;; Key hints
+
+(defun opencode-test-drover-keys (command)
+  "Return keys a package binding COMMAND in its own maps would report, or nil."
+  (alist-get command '((opencode-respond . "C-' A") (opencode-revert-clear . "C-' R")
+                       (opencode-interrupt . "C-' k"))))
 
 (ert-deftest opencode-test-command-keys ()
   "Hints name the keys the function reports, else those of the keymaps, else M-x."

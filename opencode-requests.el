@@ -38,7 +38,9 @@
 ;; background, so its parent looks busy while it actually waits.  The
 ;; parent's block of a waiting subagent is marked the same way and its
 ;; mode line shows the pending state, through every level of nesting;
-;; \\[opencode-respond] there switches to the child and answers it.
+;; \\[opencode-respond] there switches to the child and answers it.  A
+;; subagent run in the background ended its parent's call at once: it
+;; marks no block, yet its parent answers its requests all the same.
 
 ;;; Code:
 
@@ -159,7 +161,9 @@ transient's menu, which then holds the request's context, scrolls."
 (defun opencode-respond ()
   "Answer the request at point, a suspended one, or the oldest pending one.
 On the block of a waiting subagent, or with only subagents waiting,
-switch to the subagent's session and answer there."
+switch to the subagent's session and answer there.  Subagents at any
+depth count, run in the foreground or in the background, the oldest
+request among them first (see `opencode-tree-requests')."
   (interactive)
   (or (seq-some (lambda (provider)
                   (when-let* ((at-point (plist-get (funcall provider) :at-point)))
@@ -175,8 +179,8 @@ switch to the subagent's session and answer there."
                       (funcall (plist-get state :respond))
                       t)))
                 opencode-request-providers)
-      (when opencode--pending-children
-        (opencode--respond-child (car opencode--pending-children))
+      (when-let* ((child (opencode--waiting-subagent)))
+        (opencode-respond-session child)
         t)
       (user-error "No pending OpenCode request")))
 
@@ -212,17 +216,19 @@ a subagent's request is answered in place too."
                         (funcall (plist-get state :respond))
                         t)))
                   opencode-request-providers)
-        (when opencode--pending-children
-          (opencode-respond-session (car opencode--pending-children) nil t)
+        (when-let* ((child (opencode--waiting-subagent)))
+          (opencode-respond-session child nil t)
           t)
         (user-error "No pending OpenCode request"))))
 
 (defun opencode-respond-session (id &optional other-window in-place)
   "Show session ID's buffer, opening it if needed, and answer its request.
 OTHER-WINDOW shows it in another window.  The request answered is the
-one \\[opencode-respond] would answer there.  A buffer opened here
-first loads its transcript and the requests the session waits on, then
-is shown again and answers.
+one \\[opencode-respond] would answer there: the session's own first,
+else the oldest of its subagents', at any depth, which is answered in
+the subagent's buffer.  A buffer opened here, or one awaiting nothing
+yet, first loads its transcript and the requests the session waits on,
+then is shown again and answers.
 
 IN-PLACE answers from the selected window instead, showing no session
 buffer: the request's transient names the session and holds what the
@@ -247,96 +253,192 @@ answered there."
         (opencode-session-open-by-id
          id :other-window other-window :no-display in-place
          :callback (lambda (_info) (opencode--sync-requests #'answer))))
-       ((not in-place)
-        (with-current-buffer (opencode--display buffer nil other-window)
-          (opencode-respond)))
-       ((with-current-buffer buffer (opencode-pending-request-p))
-        (with-current-buffer buffer (opencode--respond-in-place)))
+       ((with-current-buffer buffer
+          (or (opencode-pending-request-p) (opencode--waiting-subagent)))
+        (with-current-buffer buffer
+          (if in-place
+              (opencode--respond-in-place)
+            (with-current-buffer (opencode--display buffer nil other-window)
+              (opencode-respond)))))
        (t (with-current-buffer buffer (opencode--sync-requests #'answer)))))))
+
+;;;; Requests in a session's tree
+
+(defun opencode--session-parent (id)
+  "Return the ID of the parent of session ID, or nil.
+The registry tells it, else the session's buffer."
+  (or (plist-get (opencode-state-get id) :parent-id)
+      (opencode-with-session-buffer id (alist-get 'parentID opencode-session-info))))
+
+(defun opencode--subagent-of-p (id ancestor)
+  "Return non-nil when session ID is a subagent of session ANCESTOR, at any depth."
+  (let ((seen nil)
+        (parent (opencode--session-parent id)))
+    (while (and parent (not (equal parent ancestor)) (not (member parent seen)))
+      (push parent seen)
+      (setq parent (opencode--session-parent parent)))
+    (equal parent ancestor)))
+
+(defun opencode--own-requests ()
+  "Return the requests this session buffer waits on, as `opencode-tree-requests' does."
+  (mapcan (lambda (provider)
+            (let ((state (funcall provider)))
+              (mapcar (lambda (request)
+                        (list :session opencode-session-id :kind (plist-get state :kind)
+                              :id (plist-get request :id)))
+                      (plist-get state :pending))))
+          opencode-request-providers))
+
+(defun opencode-tree-requests ()
+  "Return the requests pending in this session's tree: its own and its subagents'.
+Each is a plist (:session ID :kind KIND :id REQUEST-ID :time TIME),
+KIND being `question' or `permission' and TIME when it was asked, or
+nil when unknown.  The session's own come first, then those of its
+subagents, at any depth, run in the foreground or in the background,
+oldest first.  They come from the buffers of the sessions and from the
+session registry while it follows the service, which also knows the
+subagents that have no buffer."
+  (let ((own nil)
+        (below nil)
+        (known (make-hash-table :test #'equal))
+        (registry (and opencode-session-id (opencode-state-ready-p))))
+    (cl-flet ((add (request)
+                (let ((id (plist-get request :id)))
+                  (unless (gethash id known)
+                    (puthash id t known)
+                    (let ((request (plist-put (copy-sequence request) :time
+                                              (or (plist-get request :time)
+                                                  (opencode-identifier-time id)))))
+                      (if (equal (plist-get request :session) opencode-session-id)
+                          (push request own)
+                        (push request below)))))))
+      (mapc #'add (opencode--own-requests))
+      (when opencode-session-id
+        (let ((session opencode-session-id))
+          (maphash (lambda (id buffer)
+                     (when (and (not (equal id session)) (buffer-live-p buffer)
+                                (opencode--subagent-of-p id session))
+                       (with-current-buffer buffer
+                         (mapc #'add (opencode--own-requests)))))
+                   opencode-session-buffers)))
+      (when registry
+        (dolist (entry (cons (opencode-state-get opencode-session-id)
+                             (opencode-state-descendants opencode-session-id)))
+          (dolist (request (plist-get entry :requests))
+            (add (list :session (plist-get entry :id) :kind (plist-get request :kind)
+                       :id (plist-get request :id) :time (plist-get request :time)))))))
+    (append (nreverse own)
+            (sort (nreverse below)
+                  :key (lambda (request) (or (plist-get request :time) most-positive-fixnum))))))
+
+(defun opencode--waiting-subagent ()
+  "Return the ID of the subagent whose request this session answers first, or nil.
+That is the subagent, at any depth, run in the foreground or in the
+background, asking the oldest of the requests `opencode-tree-requests'
+lists below this session."
+  (plist-get (seq-find (lambda (request)
+                         (not (equal (plist-get request :session) opencode-session-id)))
+                       (opencode-tree-requests))
+             :session))
 
 ;;;; Sending while a request waits
 
 ;; The service delivers a steering prompt or command at the agent's next
 ;; step, and a queued one after the turn; a step waiting on a permission
-;; request or a question ends only once it is answered or dismissed.  A
-;; prompt sent meanwhile thus waits, unread, and is neither an answer nor
-;; a dismissal, so `opencode-send-input' asks first.
+;; request or a question ends only once it is answered or dismissed.  So
+;; does a step running a subagent in the foreground, which ends with the
+;; subagent's turn, itself held up by its own requests and foreground
+;; subagents.  A prompt sent meanwhile thus waits, unread, and is neither
+;; an answer nor a dismissal, so `opencode-send-input' asks first.  A
+;; subagent run in the background ended its call at once: its requests
+;; hold up only itself, and a prompt to its parent is read as usual.
 
-(defun opencode--buffer-requests (&optional seen)
-  "Return the requests this session buffer and its subagents' buffers wait on.
-Each is a plist (:session ID :kind KIND :id REQUEST-ID).  SEEN holds the
-sessions already visited."
-  (let ((seen (or seen (make-hash-table :test #'equal)))
-        (requests nil))
-    (unless (gethash opencode-session-id seen)
-      (puthash opencode-session-id t seen)
-      (dolist (provider opencode-request-providers)
-        (let ((state (funcall provider)))
-          (dolist (request (plist-get state :pending))
-            (push (list :session opencode-session-id :kind (plist-get state :kind)
-                        :id (plist-get request :id))
-                  requests))))
-      (dolist (child opencode--pending-children)
-        (opencode-with-session-buffer child
-          (setq requests (append requests (opencode--buffer-requests seen))))))
-    requests))
+(defun opencode--runs-in-foreground-p (session-id child-id)
+  "Return non-nil when session SESSION-ID waits for its subagent CHILD-ID to end.
+That is while a call of the subagent tool running CHILD-ID in the
+foreground runs in SESSION-ID's buffer; a call running it in the
+background ends at once, still running.  Nil without a buffer of
+SESSION-ID, as nothing then tells how it runs CHILD-ID."
+  (opencode-with-session-buffer session-id
+    (and (seq-some (lambda (overlay)
+                     (equal (plist-get (opencode-block-data overlay) :status) "running"))
+                   (opencode--subagent-blocks child-id))
+         t)))
+
+(defun opencode--holds-up-p (id session-id)
+  "Return non-nil when the requests of session ID hold up the turn of SESSION-ID.
+Those of SESSION-ID itself do; a subagent's do when each session from
+SESSION-ID down to it runs the next one in the foreground (see
+`opencode--runs-in-foreground-p')."
+  (let ((seen nil)
+        (held t))
+    (while (and held (not (equal id session-id)))
+      (let ((parent (opencode--session-parent id)))
+        (setq held (and parent (not (member parent seen))
+                        (opencode--runs-in-foreground-p parent id)))
+        (push parent seen)
+        (setq id parent)))
+    held))
 
 (defun opencode-awaited-requests ()
-  "Return the requests this session and its subagents wait on.
-Each is a plist (:session ID :kind KIND :id REQUEST-ID), KIND being
-`question' or `permission'.  They come from this buffer and those of its
-subagents, and from the session registry while it follows the service,
-which also knows the subagents that have no buffer."
-  (let* ((requests (opencode--buffer-requests))
-         (known (mapcar (lambda (request) (plist-get request :id)) requests)))
-    (when (and opencode-session-id (opencode-state-ready-p))
-      (dolist (entry (cons (opencode-state-get opencode-session-id)
-                           (opencode-state-descendants opencode-session-id)))
-        (dolist (request (plist-get entry :requests))
-          (unless (member (plist-get request :id) known)
-            (push (plist-get request :id) known)
-            (setq requests (append requests
-                                   (list (list :session (plist-get entry :id)
-                                               :kind (plist-get request :kind)
-                                               :id (plist-get request :id)))))))))
-    requests))
+  "Return the requests this session waits on before it reads a prompt.
+They are those of `opencode-tree-requests' that hold up its turn: its
+own, and those of the subagents it runs in the foreground, through
+every level, as their tool calls end only with their turns.  A subagent
+run in the background holds up nothing, its call having ended at once.
+How a session runs a subagent shows in the session's buffer; below a
+subagent that has none, nothing tells, and requests are left out."
+  (let ((session opencode-session-id))
+    (seq-filter (lambda (request) (opencode--holds-up-p (plist-get request :session) session))
+                (opencode-tree-requests))))
 
-(defun opencode--describe-requests (requests)
-  "Return a sentence saying that REQUESTS are pending.
+(defun opencode--describe-awaited (requests)
+  "Return the sentence telling that this session's prompt would wait on REQUESTS.
 REQUESTS are plists as `opencode-awaited-requests' returns them."
-  (if (cdr requests)
-      (format "%d requests are pending" (length requests))
-    (let ((request (car requests)))
-      (format "A %s%s is pending"
-              (if (equal (plist-get request :session) opencode-session-id) "" "subagent's ")
-              (if (eq (plist-get request :kind) 'permission) "permission request" "question")))))
+  (let* ((sessions (delete-dups (mapcar (lambda (request) (plist-get request :session)) requests)))
+         (own (equal sessions (list opencode-session-id)))
+         (one (null (cdr requests)))
+         (kind (if (eq (plist-get (car requests) :kind) 'permission) "permission request" "question")))
+    (format-message
+     "%s for your answer to %s; %s reads the prompt only once %s answered or dismissed."
+     (cond (own "This session waits")
+           ((cdr sessions)
+            (if (member opencode-session-id sessions)
+                "This session and its subagents wait"
+              "Its subagents wait"))
+           (t (format-message "Its subagent `%s' waits"
+                              (or (opencode--session-title (car sessions)) (car sessions)))))
+     (if one (concat "a " kind) (format "%d requests" (length requests)))
+     (if own "it" "this session")
+     (cond ((not one) "they are")
+           ((eq (plist-get (car requests) :kind) 'permission) "the request is")
+           (t "the question is")))))
 
 (defun opencode--answer-awaited (requests)
   "Answer the first of REQUESTS, as `opencode-awaited-requests' returns them.
-This buffer answers its own and its subagents' requests; a request only
-the registry knew of is fetched into its session's buffer first."
-  (if (opencode-pending-request-p)
-      (opencode-respond)
-    (let* ((id (plist-get (car requests) :session))
-           (buffer (gethash id opencode-session-buffers)))
-      (if (buffer-live-p buffer)
-          (with-current-buffer buffer
-            (opencode--sync-requests
-             (lambda ()
-               ;; From a callback, a signal would only print "error in process filter".
-               (condition-case err
-                   (opencode-respond-session id)
-                 (user-error (message "%s" (error-message-string err)))))))
-        (opencode-respond-session id)))))
+A request of this session is answered here, loaded first when only the
+registry knew of it; a subagent's in the subagent's buffer."
+  (let ((id (plist-get (car requests) :session)))
+    (cond
+     ((not (equal id opencode-session-id)) (opencode-respond-session id))
+     ((opencode--own-requests) (opencode-respond))
+     (t (opencode--sync-requests
+         (lambda ()
+           ;; From a callback, a signal would only print "error in process filter".
+           (condition-case err
+               (opencode-respond)
+             (user-error (message "%s" (error-message-string err))))))))))
 
 (defvar opencode--send-cancel-quietly)
 
 (defun opencode-check-pending-requests (request)
   "Ask what to do with input REQUEST while the session waits on the user.
 A send check (see `opencode-send-checks'): a prompt or command that
-steers this session while it, or one of its subagents, waits on a
-permission request or a question would wait unread until that is
-answered or dismissed.  Answering opens the request and keeps the input,
+steers this session while it, or a subagent it runs in the foreground,
+waits on a permission request or a question would wait unread until
+that is answered or dismissed (see `opencode-awaited-requests').  A
+subagent run in the background holds up nothing, so its requests never
+ask.  Answering opens the request and keeps the input,
 as cancelling does; sending anyway sends it to wait.  Queued input
 \(`opencode-queue-input', or `opencode-prompt-delivery' set to `queue')
 waits for the end of the turn anyway, and shell commands run at once,
@@ -346,10 +448,9 @@ through `opencode-session-send', wait the same way."
               ((not (eq opencode-prompt-delivery 'queue)))
               (requests (opencode-awaited-requests)))
     (pcase (car (read-multiple-choice
-                 (format "%s; the agent reads a prompt only once it is answered or dismissed."
-                         (opencode--describe-requests requests))
+                 (opencode--describe-awaited requests)
                  '((?a "answer" "Answer it now; the input stays at the prompt")
-                   (?s "send anyway" "Send now; the agent reads it once the request is settled")
+                   (?s "send anyway" "Send now; this session reads it once the request is settled")
                    (?c "cancel" "Keep the input at the prompt"))))
       (?s nil)
       (?a (opencode--answer-awaited requests)
