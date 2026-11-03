@@ -187,7 +187,9 @@ session is fetched first.")
   "Seconds before the next retry of a failed bootstrap.")
 
 (defvar opencode-state--viewing (make-hash-table :test #'equal)
-  "Session IDs mapped to the idle watermark, in milliseconds, of their view in flight.")
+  "Session IDs mapped to their view in flight, (WATERMARK . CALLBACKS).
+WATERMARK is the idle time it sends, in milliseconds; CALLBACKS are the
+\(THEN . ELSE) pairs awaiting its answer, newest first.")
 
 (defvar opencode-state--caches (make-hash-table :test #'equal)
   "Session IDs mapped to their live prompt-cache expiry, as `opencode-state-cache' returns it.")
@@ -1610,28 +1612,49 @@ While a listing is in flight, the event waits for its answer."
                   ((buffer-live-p buffer)))
         (buffer-local-value 'default-directory buffer))))
 
-(defun opencode-session-view (id &optional idle)
+(defun opencode-session-view (id &optional idle then else)
   "Mark session ID viewed up to IDLE, its last idle time by default.
 IDLE is in float seconds.  Every client then sees the session read.
 Nothing is sent when the session is not unread, nor twice for one
-watermark while the first request is in flight."
-  (when-let* ((entry (opencode-state-get id))
-              ((opencode-state-unread-p entry))
-              (milliseconds (opencode-state--ms (or idle (plist-get entry :idle))))
-              ((not (eql (gethash id opencode-state--viewing) milliseconds))))
-    (puthash id milliseconds opencode-state--viewing)
-    (cl-flet ((settled ()
-                (when (eql (gethash id opencode-state--viewing) milliseconds)
-                  (remhash id opencode-state--viewing))))
-      (opencode-request
-       'post (format "/api/session/%s/view" id)
-       :directory (opencode-state--directory id) :buffer nil
-       :body `((idle . ,milliseconds))
-       :then (lambda (_) (settled))
-       :else (lambda (error)
-               (settled)
-               (message "OpenCode: cannot mark the session viewed: %s"
-                        (opencode-error-describe error)))))))
+watermark while the first request is in flight.  THEN, when given, is
+called with no argument once the session is marked viewed: at once
+when it is not unread, else once the service answered, the request in
+flight for the same watermark serving; ELSE with the `opencode-error'
+of a refusal, which is otherwise told in the echo area.  Either is
+called once, in whatever buffer is current then."
+  (let* ((entry (opencode-state-get id))
+         (milliseconds (and entry (opencode-state-unread-p entry)
+                            (opencode-state--ms (or idle (plist-get entry :idle)))))
+         (flight (and milliseconds (gethash id opencode-state--viewing))))
+    (cond
+     ((null milliseconds)
+      (when then (funcall then)))
+     ((eql (car flight) milliseconds)
+      (when (or then else)
+        (push (cons then else) (cdr flight))))
+     (t
+      (let ((flight (list milliseconds)))
+        (when (or then else)
+          (push (cons then else) (cdr flight)))
+        (puthash id flight opencode-state--viewing)
+        (cl-flet ((settled ()
+                    (when (eq (gethash id opencode-state--viewing) flight)
+                      (remhash id opencode-state--viewing))
+                    (reverse (cdr flight))))
+          (opencode-request
+           'post (format "/api/session/%s/view" id)
+           :directory (opencode-state--directory id) :buffer nil
+           :body `((idle . ,milliseconds))
+           :then (lambda (_)
+                   (pcase-dolist (`(,then . ,_) (settled))
+                     (when then (funcall then))))
+           :else (lambda (error)
+                   (let ((callbacks (settled)))
+                     (if (seq-some #'cdr callbacks)
+                         (pcase-dolist (`(,_ . ,else) callbacks)
+                           (when else (funcall else error)))
+                       (message "OpenCode: cannot mark the session viewed: %s"
+                                (opencode-error-describe error))))))))))))
 
 (provide 'opencode-state)
 ;;; opencode-state.el ends here

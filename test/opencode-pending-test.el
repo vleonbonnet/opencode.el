@@ -364,6 +364,55 @@ cancellation event before answering, `quiet' answers without one,
         (opencode-send-input)
         (should (equal (alist-get 'skills (opencode-test-sent-prompt)) [((id . "skl_review"))]))))))
 
+(ert-deftest opencode-test-pending-counted-and-withdrawn-by-session ()
+  "The pending prompts of a session are counted, and withdrawn, from any buffer.
+Its buffer keeps them, unshown."
+  (opencode-test-with-server
+    (let* ((session (opencode-test-scenario "text"))
+           (opencode-test-routes (opencode-test-cancel-routes session :cancel 'quiet :message 'missing))
+           (buffer (opencode-test-busy-buffer session))
+           (first (with-current-buffer buffer (opencode-test-type-and-send "first")))
+           (second (with-current-buffer buffer (opencode-test-type-and-send "second"))))
+      (with-current-buffer buffer
+        (opencode-test-dispatch (list (opencode-test-enqueued session first "first")
+                                      (opencode-test-enqueued session second "second"))))
+      (with-temp-buffer
+        (should (= (opencode-pending-prompts session) 2))
+        (should (= (opencode-pending-prompts "ses_without_buffer") 0))
+        (should-error (opencode-edit-pending-prompt nil "ses_without_buffer") :type 'user-error)
+        (opencode-edit-pending-prompt first session)
+        (should (= (opencode-pending-prompts session) 1))
+        (should (opencode-test-requests-to 'delete (concat "/inbox/" first))))
+      (with-current-buffer buffer
+        (should (equal (opencode-test-input (current-buffer)) "first"))
+        (opencode-test-dispatch (list (opencode-test-delivered session second)))
+        (should (= (opencode-pending-prompts session) 0))))))
+
+(ert-deftest opencode-test-send-attachments-of-old-input ()
+  "A prompt sent with the attachments its labels carry sends them again."
+  (opencode-test-with-server
+    (let ((session (opencode-test-scenario "text")))
+      (with-current-buffer (opencode-test-open-empty session)
+        (let* ((text (opencode-inbox-payload-text
+                      '((text . "see @notes.txt")
+                        (files ((data . "bm90ZXM=") (mime . "text/plain") (name . "notes.txt")
+                                (source (type . "uri") (uri . "file:///tmp/notes.txt"))
+                                (mention (start . 4) (end . 14) (text . "@notes.txt"))))
+                        (agents ((name . "explore")))
+                        (skills ((id . "skl_review") (name . "review"))))))
+               (attachments (delete-dups
+                             (delq nil (mapcar (lambda (index)
+                                                 (get-text-property index 'opencode-sent-attachment text))
+                                               (number-sequence 0 (1- (length text))))))))
+          (opencode-session-send (substring-no-properties text) :show t :attachments attachments
+                                 :files [((uri . "file:///tmp/other.txt") (name . "other.txt"))])
+          (let ((body (opencode-test-sent-prompt)))
+            (should (equal (alist-get 'text body) "see @notes.txt @explore `review`"))
+            (should (equal (mapcar (lambda (file) (alist-get 'uri file)) (alist-get 'files body))
+                           '("file:///tmp/other.txt" "file:///tmp/notes.txt")))
+            (should (equal (alist-get 'agents body) [((name . "explore"))]))
+            (should (equal (alist-get 'skills body) [((id . "skl_review"))]))))))))
+
 (ert-deftest opencode-test-pending-click-withdraws ()
   "A click on a pending prompt withdraws it."
   (opencode-test-with-server

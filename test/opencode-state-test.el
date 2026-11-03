@@ -2142,6 +2142,86 @@ Until then neither is called, so that a caller acts on the outcome only."
       ;; Without callbacks, a refusal is reported, as before.
       (should-error (opencode-session-archive "ses_refused")))))
 
+;; drover acts on thousands of sessions so, keeping a few requests in flight.
+(ert-deftest opencode-test-actions-tell-their-outcome ()
+  "Interrupting and deleting call back once the service answered, as it answered."
+  (opencode-test-with-server
+    (let* ((outcomes nil)
+           (else (lambda (error) (push (list 'else (opencode-error-status error)) outcomes)))
+           (opencode-test-routes
+            (append (list (list t "\\`/api/session/ses_refused\\(?:/interrupt\\)?\\'"
+                                (lambda (_) '(:error 409 "Session is busy")))
+                          (list 'post "\\`/api/session/\\(ses_[a-z]+\\)/interrupt\\'"
+                                (lambda (request)
+                                  (cons :defer (lambda () `((interrupted . ,(equal (plist-get request :match)
+                                                                                    "ses_running")))))))
+                          (list 'delete "\\`/api/session/\\(ses_[a-z]+\\)\\'"
+                                (lambda (_) (cons :defer (lambda () '((data)))))))
+                    opencode-test-routes))
+           (buffer (generate-new-buffer " *opencode-deleted*")))
+      (puthash "ses_held" buffer opencode-session-buffers)
+      (cl-letf (((symbol-function 'message) (lambda (&rest _) (ert-fail "Told in the echo area"))))
+        (opencode-session-interrupt "ses_running" (lambda (interrupted) (push (list 'interrupted interrupted) outcomes)) else)
+        (opencode-session-interrupt "ses_idle" (lambda (interrupted) (push (list 'interrupted interrupted) outcomes)) else)
+        (opencode-session-delete "ses_held" (lambda ()
+                                              (should-not (buffer-live-p buffer))
+                                              (push '(deleted) outcomes))
+                                 else)
+        (should-not outcomes)
+        (should (buffer-live-p buffer))
+        (while (opencode-test-release))
+        (should (equal (reverse outcomes) '((interrupted t) (interrupted nil) (deleted))))
+        (setq outcomes nil)
+        (opencode-session-interrupt "ses_refused" #'ignore else)
+        (opencode-session-delete "ses_refused" #'ignore else)
+        (should (equal outcomes '((else 409) (else 409)))))
+      ;; Without callbacks, a refusal is reported, as before.
+      (should-error (opencode-session-interrupt "ses_refused"))
+      (should-error (opencode-session-delete "ses_refused")))))
+
+(ert-deftest opencode-test-view-tells-its-outcome ()
+  "Viewing calls back once the session is read: at once when not unread,
+else once the service answered, a request in flight for the same
+watermark serving every caller."
+  (opencode-test-with-state-server
+      (list :sessions (list (opencode-test-state-info "ses_u" :updated 10 :idle 10 :outcome "succeeded")
+                            (opencode-test-state-info "ses_v" :updated 10 :idle 10 :outcome "succeeded")
+                            (opencode-test-state-info "ses_r" :updated 9 :idle 9 :viewed 9)))
+    (opencode-test-state-connect)
+    (setq opencode-test-requests nil)
+    (let* ((outcomes nil)
+           (then (lambda (tag) (lambda () (push (list 'then tag) outcomes))))
+           (else (lambda (tag) (lambda (error) (push (list 'else tag (opencode-error-status error)) outcomes))))
+           (opencode-test-routes
+            (append (list (list 'post "\\`/api/session/ses_v/view\\'"
+                                (lambda (_) (cons :defer (lambda () '(:error 500 "Down")))))
+                          (list 'post "/view\\'" (lambda (_) (cons :defer (lambda () '((data)))))))
+                    opencode-test-routes)))
+      (cl-letf (((symbol-function 'message) (lambda (&rest _) (ert-fail "Told in the echo area"))))
+        (opencode-session-view "ses_r" nil (funcall then 'read) (funcall else 'read))
+        (opencode-session-view "ses_unknown" nil (funcall then 'unknown) (funcall else 'unknown))
+        (should (equal outcomes '((then unknown) (then read))))
+        (setq outcomes nil)
+        (opencode-session-view "ses_u" nil (funcall then 1) (funcall else 1))
+        (opencode-session-view "ses_u")
+        (opencode-session-view "ses_u" nil (funcall then 2) (funcall else 2))
+        (opencode-session-view "ses_v" nil (funcall then 3) (funcall else 3))
+        (should (equal (length opencode-test-requests) 2))
+        (should-not outcomes)
+        (while (opencode-test-release))
+        (should (equal (reverse outcomes) '((then 1) (then 2) (else 3 500))))
+        (should-not (gethash "ses_u" opencode-state--viewing))
+        (should-not (gethash "ses_v" opencode-state--viewing)))
+      ;; Without ELSE, a refusal is told, as before.
+      (setq outcomes nil)
+      (let ((messages nil))
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format &rest arguments) (push (apply #'format format arguments) messages))))
+          (opencode-session-view "ses_v" nil (funcall then 4))
+          (while (opencode-test-release)))
+        (should (string-prefix-p "OpenCode: cannot mark the session viewed" (car messages)))
+        (should-not outcomes)))))
+
 (ert-deftest opencode-test-state-last-reply ()
   "The last reply is the newest assistant text, cut to the length asked."
   (opencode-test-with-state-server

@@ -2691,10 +2691,14 @@ meanwhile is dropped."
            (opencode-state--one-line (opencode-error-describe error)))
    300 nil nil "…"))
 
-(cl-defun opencode-session-send (text &key files agents skills delivery metadata accept-thinking-loss
-                                      show region input then else)
+(cl-defun opencode-session-send (text &key files agents skills attachments delivery metadata
+                                      accept-thinking-loss show region input then else)
   "Send TEXT as a prompt of this session.
-FILES, AGENTS and SKILLS are vectors of attachments; DELIVERY overrides
+FILES, AGENTS and SKILLS are vectors of attachments; ATTACHMENTS, a
+list of attachments as the labels of `opencode-old-input' carry them,
+\(:file URI-ALIST), (:agent NAME) or (:skill ID ...), go after them, so
+that a prompt withdrawn or sent before goes again whole from elsewhere,
+as from drover's prompt.  DELIVERY overrides
 `opencode-prompt-delivery'; METADATA is an alist attached to the
 prompt.  ACCEPT-THINKING-LOSS lets the server replace earlier thinking
 that no longer matches the conversation, which it otherwise refuses to
@@ -2727,6 +2731,17 @@ it."
   (let ((id (opencode-generate-id "msg_"))
         (metadata (opencode-thinking-metadata metadata accept-thinking-loss))
         (delivery (symbol-name (or delivery opencode-prompt-delivery))))
+    (when attachments
+      (setq files (vconcat files (delq nil (mapcar (lambda (attachment) (plist-get attachment :file))
+                                                   attachments)))
+            agents (vconcat agents (delq nil (mapcar (lambda (attachment)
+                                                       (when-let* ((name (plist-get attachment :agent)))
+                                                         `((name . ,name))))
+                                                     attachments)))
+            skills (vconcat skills (delq nil (mapcar (lambda (attachment)
+                                                       (when-let* ((skill (plist-get attachment :skill)))
+                                                         `((id . ,skill))))
+                                                     attachments)))))
     (opencode-dismiss-turn-notifications)
     (unless show
       (puthash id t opencode--own-inputs)
@@ -3721,13 +3736,20 @@ With exactly two agents to choose from, switch to the other one at once."
 
 ;;;; Session commands
 
-(defun opencode-session-interrupt (id)
-  "Interrupt the running turn of session ID, whether or not it has a buffer."
+(defun opencode-session-interrupt (id &optional then else)
+  "Interrupt the running turn of session ID, whether or not it has a buffer.
+THEN, when given, is called once the service answered, with non-nil
+when it interrupted a turn and nil when none ran, which is otherwise
+told in the echo area; ELSE with the `opencode-error' of a refusal,
+which is otherwise reported.  Either is called once, in whatever buffer
+is current then."
   (opencode-request 'post (format "/api/session/%s/interrupt" id)
                     :directory (opencode-state--directory id) :buffer nil
                     :then (lambda (response)
-                            (unless (alist-get 'interrupted response)
-                              (message "Nothing to interrupt")))))
+                            (let ((interrupted (alist-get 'interrupted response)))
+                              (cond (then (funcall then interrupted))
+                                    ((not interrupted) (message "Nothing to interrupt")))))
+                    :else else))
 
 (defun opencode-interrupt ()
   "Interrupt the running turn of this session.
@@ -3922,16 +3944,21 @@ from the current title.  The session needs no buffer."
                       :directory (opencode-state--directory id) :buffer nil
                       :body `((title . ,title)))))
 
-(defun opencode-session-delete (id)
+(defun opencode-session-delete (id &optional then else)
   "Delete session ID for good, without confirmation, and kill its buffer.
-The session needs no buffer."
+The session needs no buffer.  THEN, when given, is called with no
+argument once the service deleted the session and its buffer is killed;
+ELSE with the `opencode-error' of a refusal, which is otherwise
+reported.  Either is called once, in whatever buffer is current then."
   (let ((buffer (gethash id opencode-session-buffers)))
     (opencode-request 'delete (concat "/api/session/" id)
                       :directory (opencode-state--directory id) :buffer nil
                       :then (lambda (_)
                               ;; The deletion event may have unregistered the buffer already.
                               (dolist (buffer (list buffer (gethash id opencode-session-buffers)))
-                                (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+                                (when (buffer-live-p buffer) (kill-buffer buffer)))
+                              (when then (funcall then)))
+                      :else else)))
 
 (defun opencode-delete-session (&optional id)
   "Delete session ID after confirmation.

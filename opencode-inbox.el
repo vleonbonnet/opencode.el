@@ -290,6 +290,19 @@ clients' prompts and commands', and those sent here while a turn ran."
   "Return non-nil when this buffer shows a pending prompt."
   (and (opencode-inbox--shown) t))
 
+(defun opencode-pending-prompts (id)
+  "Return how many pending prompts of session ID can be withdrawn, maybe 0.
+Those are the prompts the buffer of session ID shows as pending, but
+for those being withdrawn already, which `opencode-edit-pending-prompt'
+withdraws.  The buffer keeps the inbox: a session without one counts
+none.  It costs little, for menus telling whether they apply."
+  (if-let* ((buffer (gethash id opencode-session-buffers))
+            ((buffer-live-p buffer)))
+      (with-current-buffer buffer
+        (seq-count (lambda (entry) (not (plist-get (cdr entry) :withdraw)))
+                   (opencode-inbox--shown)))
+    0))
+
 (defun opencode-inbox--label (entry)
   "Return the line heading pending ENTRY."
   (let ((plist (cdr entry)))
@@ -472,7 +485,7 @@ delivered, and never once cancelled."
    (car (split-string (string-trim (substring-no-properties (opencode-inbox--text entry))) "\n"))
    80 nil nil "…"))
 
-(defun opencode-edit-pending-prompt (&optional id)
+(defun opencode-edit-pending-prompt (&optional id session)
   "Withdraw a pending prompt of this session and put it back in the input.
 A pending prompt is one the service took but has not delivered to the
 session yet; the session buffer shows them between the transcript and
@@ -480,10 +493,16 @@ the input.  With several, the one to withdraw is read, the newest by
 default; ID names it.  The service cancels it, and its text and
 attachments go to `opencode-withdrawn-prompt-function', the input by
 default, to be edited and sent again.  A prompt delivered meanwhile
-cannot be withdrawn, which is said.  The session is this buffer's,
-else the last selected one's."
+cannot be withdrawn, which is said.  The session is SESSION, an ID,
+whose buffer keeps its pending prompts and need not be shown; else this
+buffer's, else the last selected one's (see `opencode-pending-prompts')."
   (interactive)
-  (with-current-buffer (opencode--prompt-buffer)
+  (with-current-buffer (if session
+                           (let ((buffer (gethash session opencode-session-buffers)))
+                             (if (buffer-live-p buffer)
+                                 buffer
+                               (user-error "No prompt of this session is pending")))
+                         (opencode--prompt-buffer))
     (let* ((entries (opencode-inbox--shown))
            (entry (cond
                    (id (or (assoc id entries) (user-error "That prompt is no longer pending")))
