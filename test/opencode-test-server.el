@@ -27,6 +27,7 @@
 ;;; Code:
 
 (require 'opencode-test-helpers)
+(require 'url-util)
 
 (cl-defstruct (opencode-test-service (:constructor opencode-test-service--make))
   server port password (pid 4242) registration
@@ -382,6 +383,145 @@ filter binds it."
            (accept-process-output nil 0.05)))
        (opencode-transport-close-idle)
        (delete-directory directory t))))
+
+;;;; A session over sockets
+
+;; The lifecycle and pending tests send prompts to a session the fake
+;; service serves.
+
+(defconst opencode-test-lifecycle-session "ses_lifecycle"
+  "ID of the session the sending tests open.")
+
+(defvar opencode-test-lifecycle-transcript nil
+  "Messages of the session the sending tests open, oldest first, as the service holds them.")
+
+(defun opencode-test-query (request)
+  "Return the query of REQUEST to the fake service, an alist of symbols to strings."
+  (when-let* ((query (cadr (split-string (plist-get request :path) "?"))))
+    (mapcar (lambda (pair) (cons (intern (car pair)) (cadr pair)))
+            (url-parse-query-string query))))
+
+(defun opencode-test-lifecycle-routes ()
+  "Return the routes serving one session and what opening it asks.
+Its transcript is `opencode-test-lifecycle-transcript'."
+  (let ((info `((id . ,opencode-test-lifecycle-session) (title . "Lifecycle") (agent . "build")
+                (time (created . 1792531215759) (updated . 1792531215759))
+                (location (directory . ,(directory-file-name opencode-test-workspace))))))
+    (append
+     (list (cons (concat "/api/session/" opencode-test-lifecycle-session)
+                 (lambda (_) `(200 . ((data . ,info)))))
+           (cons (concat "/api/session/" opencode-test-lifecycle-session "/message")
+                 (lambda (request)
+                   (let ((page (opencode-test-message-page opencode-test-lifecycle-transcript
+                                                           (list :query (opencode-test-query request)))))
+                     (cons 200 `((data . ,(vconcat (alist-get 'data page)))
+                                 (cursor ,@(alist-get 'cursor page)))))))
+           (cons (concat "/api/session/" opencode-test-lifecycle-session "/prompt")
+                 (lambda (request)
+                   (cons 200 `((data (id . ,(alist-get 'id (json-parse-string
+                                                             (plist-get request :body)
+                                                             :object-type 'alist))))))))
+           (cons "/api/session" (lambda (_) '(200 . ((data . [])))))
+           (cons "/api/session/active" (lambda (_) '(200 . ((data . nil))))))
+     (mapcar (lambda (path) (cons path (lambda (_) '(200 . ((data . []))))))
+             (list "/api/agent" "/api/model" "/api/provider" "/api/command"
+                   (concat "/api/session/" opencode-test-lifecycle-session "/permission")
+                   (concat "/api/session/" opencode-test-lifecycle-session "/form"))))))
+
+(defun opencode-test-reply (text)
+  "Run a turn of the open session answering TEXT to the prompt sent last.
+The service's transcript holds the turn before its events go out on the
+stream, as the service appends a message before the event naming it, so
+that the session buffer finds the turn whenever it catches up."
+  (let* ((session opencode-test-lifecycle-session)
+         (prompt (json-parse-string
+                  (plist-get (car (last (opencode-test-requests-on
+                                         (concat "/api/session/" session "/prompt"))))
+                             :body)
+                  :object-type 'alist))
+         (input (alist-get 'id prompt))
+         (base `((sessionID . ,session) (assistantMessageID . "msg_lifecycle_reply") (ordinal . 0))))
+    (setq opencode-test-lifecycle-transcript
+          (append opencode-test-lifecycle-transcript
+                  `(((id . ,input) (type . "user") (text . ,(alist-get 'text prompt)) (time (created . 1)))
+                    ((id . "msg_lifecycle_reply") (type . "assistant") (time (created . 2) (completed . 3))
+                     (content . [((type . "text") (text . ,text))]))
+                    ((id . "msg_lifecycle_idle") (type . "idle") (outcome . "succeeded") (time (created . 4))))))
+    (dolist (event `(((type . "session.execution.started") (data (sessionID . ,session)))
+                     ((type . "session.inbox.delivered") (data (sessionID . ,session) (inboxID . ,input)))
+                     ((type . "session.step.started")
+                      (data (sessionID . ,session) (assistantMessageID . "msg_lifecycle_reply") (started . 2)))
+                     ((type . "session.text.started") (data ,@base))
+                     ((type . "session.text.delta") (data ,@base (delta . ,text)))
+                     ((type . "session.text.ended") (data ,@base (text . ,text)))
+                     ((type . "session.step.ended")
+                      (data (sessionID . ,session) (assistantMessageID . "msg_lifecycle_reply") (finish . "stop")))
+                     ((id . "evt_lifecycle_idle") (type . "session.execution.succeeded")
+                      (data (sessionID . ,session)))))
+      (opencode-test-send-event event))))
+
+(defmacro opencode-test-with-lifecycle-session (buffer &rest body)
+  "Run BODY with BUFFER bound to the open session's buffer, its stream open on both ends."
+  (declare (indent 1) (debug t))
+  `(opencode-test-with-service
+     (setf (opencode-test-service-routes opencode-test-service) (opencode-test-lifecycle-routes))
+     (opencode-test-with-fresh-catalogs
+       (let ((opencode-session-buffers (make-hash-table :test #'equal))
+             (opencode-test-lifecycle-transcript nil)
+             (opencode-send-checks nil)
+             (opencode-before-send-functions nil)
+             (opencode-last-session-buffer nil)
+             (opencode-notify-os-function #'ignore)
+             (,buffer nil))
+         (cl-letf (((symbol-function 'display-buffer) (lambda (&rest _) (ert-fail "Unexpected display"))))
+           (unwind-protect
+               (progn
+                 (opencode-session-open-by-id opencode-test-lifecycle-session :no-display t
+                                              :callback (lambda (_) (setq ,buffer (current-buffer))))
+                 (opencode-test-wait-for (lambda () ,buffer))
+                 ;; Events sent before the service holds the stream would be lost.
+                 (opencode-test-wait-for (lambda ()
+                                           (and (opencode-test-service-streams opencode-test-service)
+                                                (opencode-events-connected-p)
+                                                (eq opencode-events--greeted opencode-events--stream))))
+                 ,@body)
+             (when (buffer-live-p ,buffer) (kill-buffer ,buffer))))))))
+
+(defun opencode-test-type-prompt (buffer text)
+  "Type TEXT at the input of BUFFER and send it as RET does."
+  (with-current-buffer buffer
+    (goto-char (point-max))
+    (insert text)
+    (opencode-send-input)))
+
+(defun opencode-test-wait-caught-up (buffer epoch)
+  "Wait until BUFFER caught up after a reconnection later than EPOCH."
+  (opencode-test-wait-for
+   (lambda ()
+     (and (> opencode--resync-epoch epoch)
+          (null opencode--resync-queue)
+          (null opencode--resync-running)
+          (with-current-buffer buffer
+            (not (or opencode--holding opencode--loading opencode--resync-wanted)))
+          (not (opencode-test-requests-in-flight-p))))))
+
+(defun opencode-test-catch-up (buffer)
+  "Have BUFFER catch up with the service, as when its stream reopens, and wait until it did."
+  (let ((epoch opencode--resync-epoch))
+    (opencode-test-send-event '((type . "server.connected") (data)))
+    (opencode-test-wait-caught-up buffer epoch)))
+
+(defun opencode-test-buffer-count (buffer text)
+  "Return how many times BUFFER shows TEXT."
+  (with-current-buffer buffer
+    (how-many (regexp-quote text) (point-min) (point-max))))
+
+(defun opencode-test-buffer-shows-p (buffer text)
+  "Return non-nil when BUFFER shows TEXT."
+  (with-current-buffer buffer
+    (save-excursion
+      (goto-char (point-min))
+      (search-forward text nil t))))
 
 (provide 'opencode-test-server)
 ;;; opencode-test-server.el ends here

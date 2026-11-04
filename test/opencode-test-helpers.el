@@ -626,5 +626,16 @@ output, an answer in Markdown and the turn's end: six parts."
             messages))
     (nreverse messages)))
 
+(defun opencode-test-input (buffer)
+  "Return the input typed at BUFFER's prompt."
+  (with-current-buffer buffer
+    (buffer-substring-no-properties (opencode-pmark) (point-max))))
+
+(defun opencode-test-sent-id ()
+  "Return the message ID of the latest prompt requested."
+  (alist-get 'id (plist-get (seq-find (lambda (request) (string-suffix-p "/prompt" (plist-get request :path)))
+                                      opencode-test-requests)
+                            :body)))
+
 (provide 'opencode-test-helpers)
 ;;; opencode-test-helpers.el ends here

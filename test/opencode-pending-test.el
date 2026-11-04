@@ -17,8 +17,6 @@
 
 ;;; Code:
 
-;; The lifecycle tests, loaded first, define the session over sockets;
-;; the prompt tests define `opencode-test-input'.
 (require 'opencode-test-helpers)
 (require 'opencode-test-server)
 

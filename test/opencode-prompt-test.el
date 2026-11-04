@@ -25,11 +25,6 @@
       (walk map []))
     (sort keys #'string<)))
 
-(defun opencode-test-input (buffer)
-  "Return the input typed at BUFFER's prompt."
-  (with-current-buffer buffer
-    (buffer-substring-no-properties (opencode-pmark) (point-max))))
-
 (defun opencode-test-sent-requests ()
   "Return the prompts, commands and shell commands requested, newest first."
   (seq-filter (lambda (request)
@@ -477,12 +472,6 @@
   (goto-char (point-max))
   (insert text)
   (opencode-send-input))
-
-(defun opencode-test-sent-id ()
-  "Return the message ID of the latest prompt requested."
-  (alist-get 'id (plist-get (seq-find (lambda (request) (string-suffix-p "/prompt" (plist-get request :path)))
-                                      opencode-test-requests)
-                            :body)))
 
 (ert-deftest opencode-test-typed-prompt-gets-its-id ()
   "A prompt typed and sent gets its message ID once delivered, for revert and fork."
