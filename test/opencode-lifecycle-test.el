@@ -453,7 +453,7 @@ that the session buffer finds the turn whenever it catches up."
     (dolist (event `(((type . "session.execution.started") (data (sessionID . ,session)))
                      ((type . "session.inbox.delivered") (data (sessionID . ,session) (inboxID . ,input)))
                      ((type . "session.step.started")
-                      (data (sessionID . ,session) (assistantMessageID . "msg_lifecycle_reply")))
+                      (data (sessionID . ,session) (assistantMessageID . "msg_lifecycle_reply") (started . 2)))
                      ((type . "session.text.started") (data ,@base))
                      ((type . "session.text.delta") (data ,@base (delta . ,text)))
                      ((type . "session.text.ended") (data ,@base (text . ,text)))
@@ -497,18 +497,22 @@ that the session buffer finds the turn whenever it catches up."
     (insert text)
     (opencode-send-input)))
 
+(defun opencode-test-wait-caught-up (buffer epoch)
+  "Wait until BUFFER caught up after a reconnection later than EPOCH."
+  (opencode-test-wait-for
+   (lambda ()
+     (and (> opencode--resync-epoch epoch)
+          (null opencode--resync-queue)
+          (null opencode--resync-running)
+          (with-current-buffer buffer
+            (not (or opencode--holding opencode--loading opencode--resync-wanted)))
+          (not (opencode-test-requests-in-flight-p))))))
+
 (defun opencode-test-catch-up (buffer)
   "Have BUFFER catch up with the service, as when its stream reopens, and wait until it did."
   (let ((epoch opencode--resync-epoch))
     (opencode-test-send-event '((type . "server.connected") (data)))
-    (opencode-test-wait-for
-     (lambda ()
-       (and (> opencode--resync-epoch epoch)
-            (null opencode--resync-queue)
-            (null opencode--resync-running)
-            (with-current-buffer buffer
-              (not (or opencode--holding opencode--loading opencode--resync-wanted)))
-            (not (opencode-test-requests-in-flight-p)))))))
+    (opencode-test-wait-caught-up buffer epoch)))
 
 (defun opencode-test-buffer-count (buffer text)
   "Return how many times BUFFER shows TEXT."
@@ -603,6 +607,21 @@ The stream, waiting for its long backoff, reopens as soon as the service is back
         ;; As when the stream reopens after the reply: the turn stays.
         (opencode-test-catch-up buffer)
         (should (= (opencode-test-buffer-count buffer "Awake.") 1))))))
+
+(ert-deftest opencode-test-reply-during-catch-up-shows-once ()
+  "A reply whose events arrive while the buffer catches up shows once.
+The transcript the buffer fetches holds the reply already, and its
+events, withheld meanwhile, render nothing again."
+  (opencode-test-with-lifecycle-session buffer
+    (opencode-test-type-prompt buffer "Wake up")
+    (opencode-test-wait-for (lambda () (opencode-test-requests-on
+                                        (concat "/api/session/" opencode-test-lifecycle-session "/prompt"))))
+    (let ((epoch opencode--resync-epoch))
+      ;; Both on the stream before Emacs reads it: the catch-up begins first.
+      (opencode-test-send-event '((type . "server.connected") (data)))
+      (opencode-test-reply "Awake.")
+      (opencode-test-wait-caught-up buffer epoch))
+    (should (= (opencode-test-buffer-count buffer "Awake.") 1))))
 
 (provide 'opencode-lifecycle-test)
 ;;; opencode-lifecycle-test.el ends here

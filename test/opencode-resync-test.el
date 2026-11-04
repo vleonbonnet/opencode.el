@@ -215,6 +215,54 @@ follow it."
         (should (= 1 (with-temp-buffer (insert text) (how-many "Answer 2\\." (point-min) (point-max)))))
         (should (equal text (opencode-test-fresh-text id)))))))
 
+(ert-deftest opencode-test-resync-step-start-applied-once ()
+  "A whole step whose events arrive while a buffer catches up shows once.
+The transcript fetched holds it finished; its start, withheld, started
+when its message was created, and opens nothing again."
+  (opencode-test-with-transcript (opencode-test-turn-messages 1)
+    (let* ((id (opencode-test-session))
+           (buffer (opencode-test-open id))
+           (step '((assistantMessageID . "msg_t02a"))))
+      (setq opencode-test-transcript
+            (append opencode-test-transcript (opencode-test-turn-messages 2)))
+      (let ((opencode-test-routes
+             (cons (list 'get "\\`/api/session/ses_[A-Za-z0-9]+/message\\'"
+                         (lambda (request)
+                           (cons :defer (lambda () (opencode-test-message-page opencode-test-transcript request)))))
+                   opencode-test-routes)))
+        (opencode-test-reconnect)
+        (opencode-test-dispatch
+         (list (opencode-test-event id "session.execution.started" "evt_t02s")
+               (apply #'opencode-test-event id "session.step.started" "evt_x0" '(started . 1) step)
+               (apply #'opencode-test-event id "session.text.started" "evt_x1" '(ordinal . 0) step)
+               (apply #'opencode-test-event id "session.text.delta" "evt_x2" '(ordinal . 0) '(delta . "Answer 2.") step)
+               (apply #'opencode-test-event id "session.text.ended" "evt_x3" '(ordinal . 0) '(text . "Answer 2.") step)
+               (apply #'opencode-test-event id "session.step.ended" "evt_x4" step)
+               (opencode-test-event id "session.execution.succeeded" "evt_t02i")))
+        (while (opencode-test-release)))
+      (with-current-buffer buffer
+        (should-not opencode--holding)
+        (should-not opencode--open-messages)
+        (should (eq opencode-session-status 'idle)))
+      (let ((text (opencode-test-text buffer)))
+        (should (= 1 (with-temp-buffer (insert text) (how-many "Answer 2\\." (point-min) (point-max)))))
+        (should (equal text (opencode-test-fresh-text id)))))))
+
+(ert-deftest opencode-test-step-started-again-reopens ()
+  "A finished step started again later, as after a retry, takes its new events."
+  (opencode-test-with-transcript (append (opencode-test-turn-messages 1) (opencode-test-turn-messages 2))
+    (let* ((id (opencode-test-session))
+           (buffer (opencode-test-open id))
+           (step '((assistantMessageID . "msg_t02a"))))
+      (opencode-test-dispatch
+       (list (opencode-test-event id "session.execution.started" "evt_r0")
+             (apply #'opencode-test-event id "session.step.started" "evt_r1" '(started . 5) step)
+             (apply #'opencode-test-event id "session.text.started" "evt_r2" '(ordinal . 1) step)
+             (apply #'opencode-test-event id "session.text.delta" "evt_r3" '(ordinal . 1) '(delta . "Answer again.") step)))
+      (with-current-buffer buffer
+        (should (member "msg_t02a" opencode--open-messages))
+        (should (string-search "Answer again." (opencode-test-text buffer)))))))
+
 (ert-deftest opencode-test-resync-after-revert-renders-whole ()
   "A buffer whose last message in sync is gone, as after a revert, renders its transcript whole."
   (opencode-test-with-transcript (append (opencode-test-turn-messages 1) (opencode-test-turn-messages 2))

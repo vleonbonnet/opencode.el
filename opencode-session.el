@@ -994,7 +994,9 @@ alone."
 ;; withholds its session's events meanwhile and applies them once the
 ;; answer is written, and a message or part already rendered is never
 ;; rendered again: events appending a known message, or updating a
-;; finished one, change nothing.
+;; finished one, change nothing.  Neither does the start of a finished
+;; step: the service projects it as its message's creation time, and
+;; only a step started again, as after a retry, starts later.
 
 (defvar-local opencode--messages nil
   "Hash table of the IDs of the server messages rendered here.
@@ -1002,6 +1004,12 @@ Each maps to `open' while the message may still change, else `final'.")
 
 (defvar-local opencode--open-messages nil
   "IDs of the rendered messages that are open, newest first.")
+
+(defvar-local opencode--message-starts nil
+  "Hash table of the IDs of the assistant messages rendered here to their steps' start.
+That is the `started' time of the `session.step.started' event of the
+step rendered, which the service projects as the message's creation
+time; a step started again, as after a retry, starts later.")
 
 (defvar-local opencode--open-shells nil
   "Alist of the shell IDs of running shell messages to their message IDs.")
@@ -1081,6 +1089,17 @@ Each is (EVENT . FUNCTION), FUNCTION applying EVENT in this buffer.")
                                  (marker-buffer opencode-last-response-start)
                                  (copy-marker opencode-last-response-start)))))))
 
+(defun opencode--note-message-start (id started)
+  "Note that assistant message ID is rendered from its step started at STARTED."
+  (when (and id started)
+    (puthash id started (or opencode--message-starts
+                            (setq opencode--message-starts (make-hash-table :test #'equal))))))
+
+(defun opencode--rendered-step-p (id started)
+  "Return non-nil when message ID is rendered from its step started at STARTED."
+  (and started (hash-table-p opencode--message-starts)
+       (equal (gethash id opencode--message-starts) started)))
+
 (defun opencode--note-message (id &optional open)
   "Note that message ID is rendered, OPEN while it may still change."
   (when id
@@ -1112,6 +1131,7 @@ Each is (EVENT . FUNCTION), FUNCTION applying EVENT in this buffer.")
 (defun opencode--forget-messages ()
   "Forget which messages are rendered, as the transcript is erased."
   (when (hash-table-p opencode--messages) (clrhash opencode--messages))
+  (when (hash-table-p opencode--message-starts) (clrhash opencode--message-starts))
   (when (hash-table-p opencode--awaited-parts) (clrhash opencode--awaited-parts))
   (when (markerp (plist-get opencode--synced :response))
     (set-marker (plist-get opencode--synced :response) nil))
@@ -1569,6 +1589,7 @@ error face unless the job completed; any other message is a notice."
        (opencode--render-user-prompt (opencode--user-message-text message) id))
       ("assistant"
        (opencode--render-assistant-content message open)
+       (opencode--note-message-start id (alist-get 'created (alist-get 'time message)))
        (when open (setq opencode--current-assistant id)))
       ("synthetic"
        (opencode--render-synthetic id (alist-get 'description message)
@@ -1708,12 +1729,16 @@ While the buffer withholds events, BODY runs once they are released."
   "Handle `session.step.started' EVENT."
   (opencode--on-session-event event
     (let ((id (alist-get 'assistantMessageID data))
+          (started (alist-get 'started data))
           (previous opencode--current-assistant))
       (setq opencode--current-assistant id
             opencode-session-retry nil
             opencode-session-agent (or (alist-get 'agent data) opencode-session-agent)
             opencode-session-model (or (alist-get 'model data) opencode-session-model))
       (pcase (gethash id (opencode--message-table))
+        ;; The step a fetched transcript holds whole, its start withheld
+        ;; meanwhile: its events change nothing.
+        ((and 'final (guard (opencode--rendered-step-p id started))))
         ('final
          ;; Restarted, as after a retry: where it starts is not known,
          ;; so the next reconnection renders the transcript whole.
@@ -1725,6 +1750,7 @@ While the buffer withholds events, BODY runs once they are released."
          (unless (equal previous id)
            (opencode--finish-message previous))
          (opencode--note-message id t)))
+      (opencode--note-message-start id started)
       (force-mode-line-update))))
 
 (defun opencode--live-part-p (data)
