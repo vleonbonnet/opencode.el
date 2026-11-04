@@ -336,10 +336,12 @@ They are those of SERVICE's session buffers, nil for the local one."
 
 (defun opencode-mode-line-title (&optional name)
   "Return the session title in buffer NAME, without the OpenCode wrapper.
-NAME defaults to the current buffer's name; a uniquifying <N> suffix stays."
+NAME defaults to the current buffer's name; a uniquifying <N> suffix
+stays, and the service of a remote session leads, as in \"Core: Title\"."
   (let ((name (or name (buffer-name))))
-    (if (string-match "\\`\\*OpenCode\\(?:@[^:]*\\)?: \\(.*\\)\\*\\(<[0-9]+>\\)?\\'" name)
-        (concat (match-string 1 name) (match-string 2 name))
+    (if (string-match "\\`\\*OpenCode\\(?:@\\([^:]*\\)\\)?: \\(.*\\)\\*\\(<[0-9]+>\\)?\\'" name)
+        (concat (if (match-string 1 name) (concat (match-string 1 name) ": ") "")
+                (match-string 2 name) (match-string 3 name))
       name)))
 
 (defun opencode--mode-line-agent (id)

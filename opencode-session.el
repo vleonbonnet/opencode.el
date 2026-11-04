@@ -3551,12 +3551,114 @@ Point stays where it is when already in the input, else moves to its end."
   "Return a data URI holding TEXT as UTF-8 plain text."
   (concat "data:text/plain;base64," (base64-encode-string (encode-coding-string text 'utf-8) t)))
 
+(declare-function mailcap-file-name-to-mime-type "mailcap" (file-name))
+
+(defcustom opencode-inline-file-limit (* 8 1024 1024)
+  "Bytes at most of a file of this host attached to a remote service's session.
+Such a file goes inline, its contents in the prompt, the service being
+unable to read this host's files."
+  :type 'natnum
+  :group 'opencode)
+
+(defun opencode--file-data-uri (file)
+  "Return a data URI holding the contents of local FILE, typed by its name."
+  (require 'mailcap)
+  (let ((size (file-attribute-size (file-attributes file))))
+    (when (and size (> size opencode-inline-file-limit))
+      (user-error "%s is too large to send to another host's service (%d bytes, at most %d)"
+                  (abbreviate-file-name file) size opencode-inline-file-limit)))
+  (let ((mime (or (mailcap-file-name-to-mime-type file) "text/plain")))
+    (concat "data:" mime ";base64,"
+            (base64-encode-string
+             (with-temp-buffer
+               (set-buffer-multibyte nil)
+               (insert-file-contents-literally file)
+               (buffer-string))
+             t))))
+
 (defun opencode--attach-file (file &optional name)
-  "Attach FILE to the next prompt, shown as NAME."
+  "Attach FILE, a file of this host, to the next prompt, shown as NAME.
+A remote service cannot read it: its contents go inline."
+  (if (opencode-service-files-p)
+      (let ((name (or name (opencode-relative-path-for-display file))))
+        (opencode--insert-attachment
+         name (list :file `((uri . ,(opencode--file-uri file)) (name . ,name))))
+        (insert " "))
+    (when (file-directory-p file)
+      (user-error "A directory of this host cannot go to %s's service" (opencode-service-label)))
+    (let ((name (or name (file-name-nondirectory file))))
+      (opencode--insert-attachment
+       name (list :file `((uri . ,(opencode--file-data-uri file)) (name . ,name))))
+      (insert " "))))
+
+(defun opencode--remote-file-uri (file)
+  "Return the file URI of FILE, a file of the remote service's host."
+  (concat "file://" (if (string-prefix-p "/" file) "" "/")
+          (url-hexify-string file url-path-allowed-chars)))
+
+(defun opencode--attach-remote-file (file &optional name)
+  "Attach FILE, a file of the remote service's host, to the next prompt, shown as NAME.
+The service reads it there."
   (let ((name (or name (opencode-relative-path-for-display file))))
     (opencode--insert-attachment
-     name (list :file `((uri . ,(opencode--file-uri file)) (name . ,name))))
+     name (list :file `((uri . ,(opencode--remote-file-uri file)) (name . ,name))))
     (insert " ")))
+
+(defun opencode--remote-files (service directory query)
+  "Return the files of remote SERVICE's DIRECTORY matching QUERY, its own way.
+They are its host's, found by the service, as names relative to
+DIRECTORY; nil when it does not answer quickly."
+  (unless (string-empty-p query)
+    (opencode-with-service service
+      (condition-case nil
+          (seq-keep (lambda (entry)
+                      (and (equal (alist-get 'type entry) "file")
+                           (stringp (alist-get 'path entry))
+                           (alist-get 'path entry)))
+                    (opencode-request-data
+                     (opencode-request-sync 'get "/api/fs/find" :directory directory
+                                            :query `((query . ,query) (type . "file") (limit . "100"))
+                                            :timeout 5)))
+        (error nil)))))
+
+(defun opencode--remote-query (string)
+  "Return what to ask a remote service's file search for, the input being STRING.
+Completion styles matching anywhere, such as orderless, give tables the
+input's prefix alone: the minibuffer's contents tell more, and its
+longest word is asked for."
+  (let ((input (if (minibufferp) (minibuffer-contents-no-properties) string)))
+    (or (car (sort (split-string input "[ \t]+" t) :key #'length :reverse t)) "")))
+
+(defun opencode--read-remote-attachment (target &optional files-only)
+  "Read a file of the remote service of session buffer TARGET, or a live buffer.
+FILES-ONLY offers files alone.  The service finds its host's files as
+the input names them.  Return (remote-file . NAME), NAME relative to the
+session's directory, (buffer . BUFFER), or nil."
+  (let* ((service (buffer-local-value 'opencode--buffer-service target))
+         (directory (with-current-buffer target (opencode-location)))
+         (buffers (unless files-only
+                    (seq-keep (lambda (buffer)
+                                (unless (or (eq buffer target) (string-prefix-p " " (buffer-name buffer)))
+                                  (cons (concat opencode--attach-buffer-prefix (buffer-name buffer)) buffer)))
+                              (buffer-list))))
+         (found (make-hash-table :test #'equal))
+         (collection
+          (lambda (string predicate action)
+            (if (eq action 'metadata)
+                '(metadata (category . opencode-attachment)
+                           (group-function . opencode--attachment-group))
+              (let* ((query (opencode--remote-query string))
+                     (files (or (gethash query found)
+                                (puthash query (or (opencode--remote-files service directory query) '(""))
+                                         found))))
+                (complete-with-action action (append (mapcar #'car buffers) (delete "" files))
+                                      string predicate)))))
+         (choice (completing-read (format "Attach (%s): " (opencode-service-label service))
+                                  collection nil t)))
+    (cond
+     ((string-empty-p choice) nil)
+     ((assoc choice buffers) (cons 'buffer (cdr (assoc choice buffers))))
+     (t (cons 'remote-file choice)))))
 
 (defun opencode--attach-buffer (buffer target)
   "Attach the text of BUFFER to the next prompt of session buffer TARGET."
@@ -3571,8 +3673,26 @@ Point stays where it is when already in the input, else moves to its end."
 With prefix argument DIRECTORIES, offer project directories.  The prompt
 is this session buffer's, else the last selected session's."
   (interactive (list nil current-prefix-arg))
-  (let* ((target (opencode--prompt-buffer))
-         (project (project-current t))
+  (let ((target (opencode--prompt-buffer)))
+    (if (buffer-local-value 'opencode--buffer-service target)
+        (opencode--add-file-elsewhere target file)
+      (opencode--add-local-file target file directories))))
+
+(defun opencode--add-file-elsewhere (target file)
+  "Attach FILE to the next prompt of TARGET, a remote service's session buffer.
+FILE, a file of this host, goes inline; FILE nil reads a file of the
+service's host, which reads it."
+  (if file
+      (opencode--with-prompt target (opencode--attach-file (expand-file-name file)))
+    (pcase (opencode--read-remote-attachment target t)
+      (`(remote-file . ,name)
+       (opencode--with-prompt target
+         (opencode--attach-remote-file (concat (opencode-location) name) name))))))
+
+(defun opencode--add-local-file (target file directories)
+  "Attach FILE, else a file of the current project, to TARGET's next prompt.
+DIRECTORIES offers project directories."
+  (let* ((project (project-current t))
          (root (project-root project))
          (files (project-files project))
          (file (or file
@@ -3677,8 +3797,13 @@ last selected session's."
   (if (use-region-p)
       (opencode-add-region)
     (let ((target (opencode--prompt-buffer)))
-      (pcase (opencode--read-attachment target)
+      (pcase (if (buffer-local-value 'opencode--buffer-service target)
+                 (opencode--read-remote-attachment target)
+               (opencode--read-attachment target))
         (`(file . ,file) (opencode--with-prompt target (opencode--attach-file file)))
+        (`(remote-file . ,name)
+         (opencode--with-prompt target
+           (opencode--attach-remote-file (concat (opencode-location) name) name)))
         (`(buffer . ,buffer) (opencode--attach-buffer buffer target))))))
 
 (defun opencode--yank-image (type data)

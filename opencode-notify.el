@@ -125,7 +125,11 @@ NOTIFICATION is an alist: `title', `message', `variant' (info, success,
 warning or error), `kind' (a symbol such as `finished', `failed',
 `interrupted', `retry', `permission' or `question'), `session' (its ID)
 and optionally `request' (the permission or form ID).
-Call in the originating session buffer so it owns the dismissal function."
+Call in the originating session buffer so it owns the dismissal function.
+A remote service's notifications name it in their titles."
+  (when-let* ((label (opencode-service-label)))
+    (setq notification (cons (cons 'title (format "%s (%s)" (alist-get 'title notification) label))
+                             notification)))
   (opencode--log-notification notification)
   (let-alist notification
     (when (opencode--notification-allowed-p opencode-notification-messages-filter notification)
