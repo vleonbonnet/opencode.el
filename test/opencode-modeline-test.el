@@ -555,24 +555,51 @@ A tick updates the mode lines of the buffers animated, and only those."
             (opencode-test-run-timers)
             (should-not forced)))))))
 
+(defun opencode-test-mode-line-advance (string)
+  "Return how far STRING moves the text after it inside the mode line, in pixels.
+STRING is drawn in the `mode-line' face between two letters, in a buffer
+the selected window shows."
+  (let ((buffer (generate-new-buffer " *opencode-test-advance*")))
+    (unwind-protect
+        (save-window-excursion
+          (set-window-buffer (selected-window) buffer)
+          (with-current-buffer buffer
+            (insert "x" string "x")
+            (add-face-text-property (point-min) (point-max) 'mode-line t)
+            (redisplay t)
+            (- (car (posn-x-y (posn-at-point (- (point-max) 1))))
+               (car (posn-x-y (posn-at-point (1+ (point-min))))))))
+      (kill-buffer buffer))))
+
 (ert-deftest opencode-test-mode-line-frames-keep-room ()
   "Every frame of an animated icon takes the room of its still string, to the pixel.
-Batch Emacs measures characters, not pixels."
+It does inside the mode line, whose box has no edges there, whatever
+draws the icons: a font, or for a character no font has, a box of its
+code.  Batch Emacs measures characters, not pixels."
   :tags '(gui)
   (skip-unless (display-graphic-p))
   (opencode-test-with-server
     (opencode-test-with-held-timers
       (with-current-buffer (opencode-test-open (opencode-test-scenario "switch"))
-        (dolist (kind '(working retrying))
-          (setq opencode-session-status 'busy
-                opencode-session-retry (and (eq kind 'retrying) '((attempt . 1)))
-                opencode--mode-line-status nil)
-          (let* ((status (opencode--mode-line-status))
-                 (still (opencode--mode-line-measure (plist-get status :still))))
-            (should (= (length (plist-get status :frames))
-                       (length (alist-get kind opencode-session-status-animations))))
-            (dolist (frame (plist-get status :frames))
-              (should (= (opencode--mode-line-measure frame) still)))))))))
+        (cl-flet ((check (kind)
+                    (setq opencode-session-status 'busy
+                          opencode-session-retry (and (eq kind 'retrying) '((attempt . 1)))
+                          opencode--mode-line-status nil)
+                    (let* ((status (opencode--mode-line-status))
+                           (still (plist-get status :still)))
+                      (should (= (length (plist-get status :frames))
+                                 (length (alist-get kind opencode-session-status-animations))))
+                      (dolist (frame (plist-get status :frames))
+                        (should (= (opencode--mode-line-measure frame) (opencode--mode-line-measure still)))
+                        (should (= (opencode-test-mode-line-advance frame)
+                                   (opencode-test-mode-line-advance still)))))))
+          (check 'working)
+          (check 'retrying)
+          ;; Private U+10FFFD is in no font.
+          (let ((opencode-session-status-icons '((working . "o")))
+                (opencode-session-status-animations '((working "o" "\U0010FFFD"))))
+            (should-not (internal-char-font nil #x10FFFD))
+            (check 'working)))))))
 
 (provide 'opencode-modeline-test)
 ;;; opencode-modeline-test.el ends here

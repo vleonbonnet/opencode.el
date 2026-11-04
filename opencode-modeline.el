@@ -164,9 +164,14 @@ registry changed."
     ""))
 
 (defun opencode--mode-line-measure (string)
-  "Return the width in pixels of STRING drawn in the mode line."
+  "Return the width in pixels of STRING drawn inside the mode line.
+A box of the `mode-line' face draws its edges at the ends of the whole
+mode line only, not around STRING within it.  Measured alone, STRING
+would count them, yet not for every glyph: a character a font draws
+gets them, a stretch space or a character no font has does not."
   (let ((copy (copy-sequence string)))
     (add-face-text-property 0 (length copy) 'mode-line t copy)
+    (add-face-text-property 0 (length copy) '(:box nil) nil copy)
     (opencode-mode-line-pixel-width copy)))
 
 (defvar-local opencode--mode-line-status nil
