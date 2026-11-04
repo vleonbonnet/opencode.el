@@ -33,7 +33,9 @@
 ;;
 ;; Working and retrying sessions are animated where icons may move: the
 ;; frames of `opencode-session-status-animations' replace their icon in
-;; turn, every `opencode-session-status-animation-interval' seconds.
+;; turn, every `opencode-session-status-animation-interval' seconds,
+;; slower while Emacs has no focus
+;; (`opencode-session-status-animation-unfocused-interval').
 ;; The frame shown comes from the clock, so that every animated icon,
 ;; in any buffer or package, shows the same frame at the same time.
 
@@ -132,11 +134,14 @@ Working sessions and those waiting to retry show the frames of
 A value of nil shows still icons, those of
 `opencode-session-status-icons'.
 
-Each frame costs a redisplay of what shows an animated icon: a session
-mode line, the few characters of a list.  The default turns the eight
-phases of the moon in 1.2 seconds, quick enough to read as busy rather
-than as a slow blink; a slower pace costs fewer redisplays.  Nothing
-ticks while no animated icon shows."
+Each frame costs a redisplay of what shows an animated icon: the window
+of a session whose mode line animates, which Emacs lays out again
+whole to redraw its mode line, the window of a list, laid out again
+whole unless selected.  The default turns the eight phases of the moon
+in 1.2 seconds, quick enough to read as busy rather than as a slow
+blink; a slower pace costs fewer redisplays.  Nothing ticks while no
+animated icon shows, and while Emacs has no focus, icons move at the
+pace of `opencode-session-status-animation-unfocused-interval'."
   :type '(choice (const :tag "Still icons" nil) (number :tag "Seconds"))
   :group 'opencode)
 
@@ -205,6 +210,90 @@ frame twice nor skips one."
   (let ((interval opencode-session-status-animation-interval)
         (now (or now (float-time))))
     (- (* (+ (floor now interval) 1.5) interval) now)))
+
+(defcustom opencode-session-status-animation-unfocused-interval 1.35
+  "Seconds between two frames of the animated status icons while Emacs has no focus.
+A mode line or a list may show while the user works in another
+application, on another screen or beside it: its icons keep moving
+then, at this slower pace, never quicker than
+`opencode-session-status-animation-interval'.  The frame shown is the
+one of the time, as while Emacs has focus, the same in every list and
+mode line, so that a tick spans a whole number of frames: this many
+seconds rounded up to the next number of frames that shows each
+animation of `opencode-session-status-animations' its next frame, one
+more than a multiple of the frames of each.  The default is nine frames
+of 0.15 s: the eight phases of the moon and the four hours of the clock
+step forward once a tick, where seven frames, a second, showed them
+turning backwards.  When no such number of frames comes within three
+times this many seconds, the tick spans the least number of frames,
+from this many seconds up, showing their next frame to the animations
+of the most frames together.
+
+Once Emacs has focus again, the icons show the frame of the time at
+once, and move at the pace of `opencode-session-status-animation-interval'.
+A value of nil keeps them still while Emacs has no focus.
+
+Emacs has focus while any of its frames has: a mode line or a list in a
+frame other than the one the user works in moves at the full pace."
+  :type '(choice (const :tag "Still while unfocused" nil) (number :tag "Seconds"))
+  :group 'opencode)
+
+(defun opencode-session-status-forward-frames (target counts)
+  "Return how many frames a tick spans to show the next frame of animations.
+TARGET is the frames it should span at least, a number; COUNTS are the
+numbers of frames of the animations.  The frame shown is the clock's:
+spanning one more than a multiple of an animation's frames shows its
+next frame, one less its frame before, as if it turned backwards.  It
+is the least whole number, at least TARGET, that is one more than a
+multiple of every count.  When that is past three times TARGET, it is
+the least from TARGET up to there showing their next frame to the
+animations of the most frames together: the more frames an animation
+has, the more it reads as turning one way."
+  (let* ((least (max 1 (ceiling (- target 1e-9))))
+         (period (apply #'cl-lcm 1 counts))
+         (forward (1+ (* period (ceiling (1- least) period))))
+         (most (max least (floor (+ (* 3 target) 1e-9)))))
+    (if (<= forward most)
+        forward
+      (let ((best least)
+            (stepping -1))
+        (cl-loop for frames from least to most
+                 for weight = (apply #'+ (seq-filter (lambda (count) (= (mod frames count) 1)) counts))
+                 when (> weight stepping)
+                 do (setq best frames stepping weight))
+        best))))
+
+(defun opencode-session-status-frame-pace (focused)
+  "Return the seconds between two frames of animated icons, or nil for none.
+FOCUSED tells whether Emacs has focus (see
+`opencode-session-status-focused-p').  The pace is
+`opencode-session-status-animation-interval' while it has, else
+`opencode-session-status-animation-unfocused-interval' rounded up to a
+whole number of those intervals showing each animation its next frame,
+as `opencode-session-status-forward-frames' counts them: each tick then
+falls in the middle of a frame of the time
+\(`opencode-session-status-frame-delay'), as it does at the full pace,
+and every icon steps forward."
+  (when-let* ((interval opencode-session-status-animation-interval))
+    (if focused
+        interval
+      (let ((slow opencode-session-status-animation-unfocused-interval))
+        (and (numberp slow) (> slow 0)
+             (* interval
+                (opencode-session-status-forward-frames
+                 (/ slow interval)
+                 (seq-filter (lambda (count) (> count 1))
+                             (mapcar (lambda (entry) (length (opencode-session-status-frames (car entry))))
+                                     opencode-session-status-animations)))))))))
+
+(defun opencode-session-status-focused-p ()
+  "Return non-nil unless Emacs is known to have lost focus.
+It has focus while a frame has, or may have, as `frame-focus-state'
+tells; the initial frame of a daemon or of a batch Emacs does not count,
+and without another frame, Emacs is taken to have focus."
+  (let ((frames (seq-remove #'frame-initial-p (frame-list))))
+    (or (null frames)
+        (and (seq-some #'frame-focus-state frames) t))))
 
 ;;;; Subagents and the archive
 

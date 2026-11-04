@@ -253,16 +253,30 @@ its subagents in the middle of a turn and of the archive."
 (defvar opencode--mode-line-animation-pace nil
   "Seconds between the ticks of `opencode--mode-line-animation-timer'.")
 
+(defvar opencode--mode-line-focused t
+  "Non-nil unless Emacs lost focus, as `opencode-session-status-focused-p' told last.")
+
+(defvar opencode--mode-line-focus-timer nil
+  "Timer looking at the focus once its events settled, or nil.")
+
+(defun opencode--mode-line-pace ()
+  "Return the seconds between two frames of animated mode lines now, or nil.
+See `opencode-session-status-frame-pace'."
+  (opencode-session-status-frame-pace opencode--mode-line-focused))
+
 (defun opencode--mode-line-animate ()
-  "Have the mode line of this buffer show the next frame of its icon."
+  "Have the mode line of this buffer show the next frame of its icon.
+The timer ticks at the pace of `opencode--mode-line-pace', slower while
+Emacs has no focus, not at all when that pace is nil: the buffer is
+remembered then, so that its mode line moves again once Emacs has
+focus."
   (unless (memq (current-buffer) opencode--mode-line-animated)
     (push (current-buffer) opencode--mode-line-animated))
   (unless (timerp opencode--mode-line-animation-timer)
-    (setq opencode--mode-line-animation-pace opencode-session-status-animation-interval
-          opencode--mode-line-animation-timer
-          (run-at-time (opencode-session-status-frame-delay)
-                       opencode-session-status-animation-interval
-                       #'opencode--mode-line-tick))))
+    (when-let* ((pace (opencode--mode-line-pace)))
+      (setq opencode--mode-line-animation-pace pace
+            opencode--mode-line-animation-timer
+            (run-at-time (opencode-session-status-frame-delay) pace #'opencode--mode-line-tick)))))
 
 (defun opencode--mode-line-stop-animation ()
   "Stop the timer of the animated icons of mode lines."
@@ -270,6 +284,17 @@ its subagents in the middle of a turn and of the archive."
     (cancel-timer opencode--mode-line-animation-timer))
   (setq opencode--mode-line-animation-timer nil
         opencode--mode-line-animated nil))
+
+(defun opencode--mode-line-restart ()
+  "Stop the timer, and update the mode lines it animated.
+They then show the frame of the time, still icons, or start it anew at
+the pace of `opencode--mode-line-pace'."
+  (let ((buffers opencode--mode-line-animated))
+    (opencode--mode-line-stop-animation)
+    (dolist (buffer buffers)
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (force-mode-line-update))))))
 
 (defun opencode--mode-line-tick ()
   "Show the next frame in the mode lines that animate an icon and show.
@@ -279,15 +304,17 @@ line.  A buffer no longer shown, or no longer animated, is dropped: its
 mode line asks again once drawn animated.  The timer stops once none
 is left.  Animations turned off or set to another pace stop it too, and
 update the mode lines it animated, which then show still icons or start
-it anew at that pace."
+it anew at that pace.
+
+Emacs has no way from Lisp to redraw a mode line alone: forcing it lays
+out its window again, without the shortcuts of redisplay, and forcing
+every mode line instead lays out every window that cannot reuse what it
+drew, which no session window can, as `window-scroll-functions' are set
+there, and none can when another window changed in the same redisplay,
+as a list's animated glyph did (see the design notes)."
   (condition-case err
-      (if (not (eql opencode--mode-line-animation-pace opencode-session-status-animation-interval))
-          (let ((buffers opencode--mode-line-animated))
-            (opencode--mode-line-stop-animation)
-            (dolist (buffer buffers)
-              (when (buffer-live-p buffer)
-                (with-current-buffer buffer
-                  (force-mode-line-update)))))
+      (if (not (eql opencode--mode-line-animation-pace (opencode--mode-line-pace)))
+          (opencode--mode-line-restart)
         (let ((kept nil))
           (dolist (buffer opencode--mode-line-animated)
             (when (and (buffer-live-p buffer)
@@ -302,6 +329,32 @@ it anew at that pace."
     (error
      (opencode--mode-line-stop-animation)
      (message "OpenCode: mode-line animation stopped: %s" (error-message-string err)))))
+
+(defun opencode--mode-line-focus-changed ()
+  "Look at the focus again, once the events moving it settled.
+Moving from one frame to another, Emacs may tell that the first lost
+focus before telling that the other has it.  For
+`after-focus-change-function'."
+  (unless (timerp opencode--mode-line-focus-timer)
+    (setq opencode--mode-line-focus-timer (run-at-time 0 nil #'opencode--mode-line-refocus))))
+
+(defun opencode--mode-line-refocus ()
+  "Follow the focus of Emacs, once its events settled.
+Losing focus, the animated icons of mode lines move at the pace of
+`opencode-session-status-animation-unfocused-interval'; regaining it,
+they show the frame of the time at once, rather than at the next tick,
+and move at the pace of `opencode-session-status-animation-interval'."
+  (setq opencode--mode-line-focus-timer nil)
+  (condition-case err
+      (let ((focused (opencode-session-status-focused-p)))
+        (unless (eq focused opencode--mode-line-focused)
+          (setq opencode--mode-line-focused focused)
+          (when opencode--mode-line-animated
+            (opencode--mode-line-restart))))
+    (error
+     (message "OpenCode: mode-line focus: %s" (error-message-string err)))))
+
+(add-function :after after-focus-change-function #'opencode--mode-line-focus-changed)
 
 (defvar opencode--mode-line-registry-timer nil
   "Timer comparing the mode lines shown with what the registry tells.")

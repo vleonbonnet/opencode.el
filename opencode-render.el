@@ -771,6 +771,73 @@ watches them once it runs this, may hold thousands."
       ;; Not from fontification, which is part of redisplay.
       (run-at-time 0 nil #'opencode--prune-parsers-slice (current-buffer)))))
 
+;; A local parser serves fontification: once its region is fontified,
+;; its faces are text properties, and a region fontified again, as after
+;; `font-lock-flush', gets a parser anew from `treesit-update-ranges'.
+;; Text still written keeps its parsers, which parse it incrementally
+;; as it grows; finished text, before `opencode-synced-end', changes no
+;; more, yet every change of the buffer edits every parser it holds, and
+;; their overlays cost redisplay.  So the parsers of finished text are
+;; deleted once it is fontified or finished, from a timer, a slice at a
+;; time.
+
+(defvar-local opencode--finished-parsers nil
+  "Region of finished text whose parsers are to be deleted, as (START . END), or nil.")
+
+(defvar-local opencode--finished-parsers-timer nil
+  "Timer deleting the parsers of `opencode--finished-parsers', or nil.")
+
+(defvar-local opencode--finished-parsers-checked nil
+  "Non-nil once the parsers of this buffer's finished text were looked for.
+A buffer set up by an earlier version, which kept them, holds hundreds.")
+
+(defun opencode--finished-end ()
+  "Return where the finished text of this buffer ends, or nil when none is."
+  (and (markerp opencode-synced-end)
+       (eq (marker-buffer opencode-synced-end) (current-buffer))
+       (marker-position opencode-synced-end)))
+
+(defun opencode-drop-finished-parsers-later (start end)
+  "Delete the parsers of the finished text from START to END, from a timer.
+Only those of text before `opencode-synced-end' are deleted, those
+whose overlays end there or before."
+  (when-let* ((finished (opencode--finished-end))
+              ((< start (min end finished))))
+    (setq opencode--finished-parsers
+          (if opencode--finished-parsers
+              (cons (min start (car opencode--finished-parsers))
+                    (max end (cdr opencode--finished-parsers)))
+            (cons start end)))
+    (unless (timerp opencode--finished-parsers-timer)
+      (setq opencode--finished-parsers-timer
+            (run-at-time 0 nil #'opencode--drop-finished-parsers (current-buffer))))))
+
+(defun opencode--drop-finished-parsers (buffer)
+  "Delete the parsers of BUFFER's finished text noted, for `opencode--prune-slice' seconds.
+The rest are deleted from a timer, a slice at a time."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq opencode--finished-parsers-timer nil)
+      (when-let* ((region opencode--finished-parsers)
+                  (finished (opencode--finished-end)))
+        (setq opencode--finished-parsers nil)
+        (save-restriction
+          (widen)
+          (let* ((start (max (point-min) (car region)))
+                 (end (min (point-max) (cdr region) finished))
+                 (deadline (+ (float-time) opencode--prune-slice))
+                 (doomed (and (< start end)
+                              (seq-filter (lambda (overlay)
+                                            (and (overlay-get overlay 'treesit-parser-local-p)
+                                                 (<= (overlay-end overlay) finished)))
+                                          (overlays-in start end)))))
+            ;; One at least, so that every slice gets on.
+            (while (progn (when doomed (opencode--delete-parser-overlay (pop doomed)))
+                          (and doomed (< (float-time) deadline))))
+            (when doomed
+              (opencode-drop-finished-parsers-later
+               (apply #'min (mapcar #'overlay-start doomed)) end))))))))
+
 ;;;; Fontification
 
 (defun opencode--fontify-code-block (mode beg end)
@@ -831,7 +898,9 @@ instead of sending the input."
             (setq pos next)))))))
 
 (defun opencode-fontify-markdown (start end &optional loudly)
-  "Fontify START..END as Markdown, LOUDLY, then reassert session properties."
+  "Fontify START..END as Markdown, LOUDLY, then reassert session properties.
+The parsers of the finished text it fontified are deleted after, see
+`opencode-drop-finished-parsers-later'."
   (opencode--check-parsers)
   (let ((collect (symbol-function 'markdown-ts--fontify-non-ts-collect-faces)))
     (cl-letf (((symbol-function 'markdown-ts--fontify-non-ts-collect-faces)
@@ -841,7 +910,11 @@ instead of sending the input."
                    (opencode--fontify-code-block mode beg finish)))))
       (treesit-font-lock-fontify-region start end loudly)))
   (opencode-apply-fontify-properties start end)
-  (opencode--fontify-prompts start end))
+  (opencode--fontify-prompts start end)
+  (if opencode--finished-parsers-checked
+      (opencode-drop-finished-parsers-later start end)
+    (setq opencode--finished-parsers-checked t)
+    (opencode-drop-finished-parsers-later (point-min) (point-max))))
 
 (defun opencode-require-grammar (language)
   "Signal an error unless the tree-sitter grammar of LANGUAGE is available."

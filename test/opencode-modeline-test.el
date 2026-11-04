@@ -524,6 +524,72 @@ A tick updates the mode lines of the buffers animated, and only those."
                     (should-not opencode--mode-line-animation-timer)))))
           (kill-buffer other))))))
 
+(ert-deftest opencode-test-mode-line-unfocused-pace ()
+  "Without focus, the animated mode lines move slower; with it again, at once and at the full pace."
+  (opencode-test-with-server
+    (opencode-test-with-held-timers
+      (let ((one (opencode-test-open (opencode-test-scenario "switch")))
+            (forced nil)
+            (focused t)
+            (opencode-session-status-animation-interval 0.5)
+            (opencode-session-status-animation-unfocused-interval 2)
+            (opencode--mode-line-focused t)
+            (opencode--mode-line-focus-timer nil))
+        (cl-letf (((symbol-function 'force-mode-line-update)
+                   (lambda (&optional all) (push (if all 'all (current-buffer)) forced)))
+                  ((symbol-function 'frame-initial-p) #'ignore)
+                  ((symbol-function 'frame-focus-state) (lambda (&optional _frame) focused)))
+          (save-window-excursion
+            (delete-other-windows)
+            (set-window-buffer (selected-window) one)
+            (cl-flet ((draw ()
+                        (with-selected-window (get-buffer-window one)
+                          (opencode-mode-line))))
+              (with-current-buffer one
+                (setq opencode-session-status 'busy))
+              (draw)
+              (should (timerp opencode--mode-line-animation-timer))
+              (should (= opencode--mode-line-animation-pace 0.5))
+              ;; Focus moves out: looked at once the events settled, the
+              ;; timer stops and the mode line is drawn anew.
+              (setq focused nil)
+              (opencode--mode-line-focus-changed)
+              (should (timerp opencode--mode-line-focus-timer))
+              (setq forced nil)
+              (opencode--mode-line-refocus)
+              (should-not opencode--mode-line-focus-timer)
+              (should-not opencode--mode-line-focused)
+              (should (equal forced (list one)))
+              (should-not opencode--mode-line-animation-timer)
+              ;; Drawn, it ticks every nine frames, each icon's next one.
+              (draw)
+              (should (timerp opencode--mode-line-animation-timer))
+              (should (< (abs (- opencode--mode-line-animation-pace 4.5)) 1e-9))
+              (setq forced nil)
+              (opencode--mode-line-tick)
+              (should (equal forced (list one)))
+              (should (timerp opencode--mode-line-animation-timer))
+              ;; Still while unfocused, it ticks no more, until focus is back.
+              (let ((opencode-session-status-animation-unfocused-interval nil))
+                (opencode--mode-line-tick)
+                (should-not opencode--mode-line-animation-timer)
+                (draw)
+                (should-not opencode--mode-line-animation-timer)
+                (should (equal opencode--mode-line-animated (list one))))
+              ;; Focus back: the frame of the time at once, at the full pace.
+              (setq focused t
+                    forced nil)
+              (opencode--mode-line-refocus)
+              (should opencode--mode-line-focused)
+              (should (equal forced (list one)))
+              (draw)
+              (should (= opencode--mode-line-animation-pace 0.5))
+              ;; Focus moving between frames of Emacs changes nothing.
+              (setq forced nil)
+              (opencode--mode-line-refocus)
+              (should-not forced)
+              (should (timerp opencode--mode-line-animation-timer)))))))))
+
 (ert-deftest opencode-test-mode-line-follows-the-registry ()
   "A registry change updates the mode lines whose icons it changes, and only those."
   (opencode-test-with-server

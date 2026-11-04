@@ -73,6 +73,57 @@
     (let ((opencode-session-status-animation-interval nil))
       (should-not (opencode-session-status-frames 'working)))))
 
+(ert-deftest opencode-test-look-unfocused-pace ()
+  "Without focus, icons tick a whole number of frames, never quicker, each stepping forward.
+With the moon's eight phases and the clock's four hours, nine frames:
+seven, a second, showed them turning backwards."
+  (let ((opencode-session-status-animation-interval 0.15)
+        (opencode-session-status-animations (eval (car (get 'opencode-session-status-animations
+                                                             'standard-value))
+                                                  t))
+        (opencode-session-status-animation-unfocused-interval
+         (eval (car (get 'opencode-session-status-animation-unfocused-interval 'standard-value)) t)))
+    (should (= opencode-session-status-animation-unfocused-interval 1.35))
+    (should (= (opencode-session-status-frame-pace t) 0.15))
+    (should (< (abs (- (opencode-session-status-frame-pace nil) 1.35)) 1e-9))
+    ;; A second, 6.67 frames, rounds up to nine too, not to seven.
+    (let ((opencode-session-status-animation-unfocused-interval 1.0))
+      (should (< (abs (- (opencode-session-status-frame-pace nil) 1.35)) 1e-9)))
+    ;; Past nine frames, seventeen; quicker than a frame, a frame.
+    (let ((opencode-session-status-animation-unfocused-interval 1.4))
+      (should (< (abs (- (opencode-session-status-frame-pace nil) 2.55)) 1e-9)))
+    (let ((opencode-session-status-animation-unfocused-interval 0.05))
+      (should (= (opencode-session-status-frame-pace nil) 0.15)))
+    ;; Without animations, the frames asked, rounded up.
+    (let ((opencode-session-status-animations nil)
+          (opencode-session-status-animation-unfocused-interval 1.0))
+      (should (< (abs (- (opencode-session-status-frame-pace nil) 1.05)) 1e-9)))
+    (let ((opencode-session-status-animation-unfocused-interval nil))
+      (should-not (opencode-session-status-frame-pace nil))
+      (should (= (opencode-session-status-frame-pace t) 0.15)))
+    (let ((opencode-session-status-animation-interval nil))
+      (should-not (opencode-session-status-frame-pace t))
+      (should-not (opencode-session-status-frame-pace nil))))
+  ;; The least spanning one more than a multiple of every count, within
+  ;; three times the target, else the one stepping most frames forward.
+  (should (= (opencode-session-status-forward-frames (/ 1.0 0.15) '(8 4)) 9))
+  (should (= (opencode-session-status-forward-frames (/ 1.0 0.15) '(8 3)) 9))
+  (should (= (opencode-session-status-forward-frames (/ 1.0 0.15) '(5 7 9)) 10))
+  (should (= (opencode-session-status-forward-frames 20 '(5 7 9)) 46))
+  (should (= (opencode-session-status-forward-frames 200 '(5 7 9)) 316))
+  (should (= (opencode-session-status-forward-frames 9.000000000000002 '(8 4)) 9))
+  (should (= (opencode-session-status-forward-frames 0.3 '(8 4)) 1)))
+
+(ert-deftest opencode-test-look-focus ()
+  "Emacs has focus while a frame has, or with no frame but the initial one."
+  (let ((focused nil))
+    (cl-letf (((symbol-function 'frame-focus-state) (lambda (&optional _frame) focused)))
+      (should (opencode-session-status-focused-p))
+      (cl-letf (((symbol-function 'frame-initial-p) #'ignore))
+        (should-not (opencode-session-status-focused-p))
+        (setq focused t)
+        (should (opencode-session-status-focused-p))))))
+
 (ert-deftest opencode-test-look-subagents-and-archive ()
   "Subagents at work and the archive have icons of their own, in the faces of what they tell."
   (let ((waiting (opencode-subagent-glyph 'waiting))

@@ -169,19 +169,20 @@ Sessions look the same wherever they show: the session mode line, the pickers, a
 
 Done and Failed are turns that ended while nobody looked at the session; Needs you a permission request or question waiting for you, in a bold =opencode-attention=. The icons are [[https://www.nerdfonts.com][Nerd Font]] icons, so a Nerd Font must be installed for them to show.
 
-| Option or face                               | What it sets                                                                                                          |
-|----------------------------------------------+-----------------------------------------------------------------------------------------------------------------------|
-| =opencode-session-status-icons=              | the icon of each status                                                                                               |
-| =opencode-session-status-animations=         | the frames of the icons that animate, working and retrying                                                            |
-| =opencode-session-status-animation-interval= | the seconds a frame shows, 0.15 by default (a moon cycle in 1.2 s); =nil= keeps icons still                           |
-| =opencode-subagent-icons=                    | the icons of subagents waiting for you (=nf-md-robot_confused=) or working (=nf-md-robot=), beside a session's status |
-| =opencode-archived-icon=                     | the icon of an archived session (=nf-md-archive=), in =opencode-session-archived=                                     |
-| =opencode-session-open=, =-shown=, =-active= | the title of a session open in a buffer, shown in a window, in the window you work in                                 |
-| =opencode-agent-faces=                       | the faces of agents configuring no colour, bold                                                                       |
-| =opencode-provider-icons=                    | the icons of providers                                                                                                |
-| =opencode-setting-chosen=, =-inherited=      | a variant, or effort, selected, or run by default; drover's prompt uses them for the settings picked or inherited     |
-| =opencode-context-bar=, =-near=, =-over=     | the part of a model's context filled, and a context near or past a long-context price tier                            |
-| =opencode-cache-bar=, =-trough=              | the part of a prompt cache's lifetime left, and gone                                                                  |
+| Option or face                                         | What it sets                                                                                                                                 |
+|--------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------|
+| =opencode-session-status-icons=                        | the icon of each status                                                                                                                      |
+| =opencode-session-status-animations=                   | the frames of the icons that animate, working and retrying                                                                                   |
+| =opencode-session-status-animation-interval=           | the seconds a frame shows, 0.15 by default (a moon cycle in 1.2 s); =nil= keeps icons still                                                  |
+| =opencode-session-status-animation-unfocused-interval= | the seconds between frames while Emacs has no focus, 1.35 by default, rounded so that every icon steps forward; =nil= keeps icons still then |
+| =opencode-subagent-icons=                              | the icons of subagents waiting for you (=nf-md-robot_confused=) or working (=nf-md-robot=), beside a session's status                        |
+| =opencode-archived-icon=                               | the icon of an archived session (=nf-md-archive=), in =opencode-session-archived=                                                            |
+| =opencode-session-open=, =-shown=, =-active=           | the title of a session open in a buffer, shown in a window, in the window you work in                                                        |
+| =opencode-agent-faces=                                 | the faces of agents configuring no colour, bold                                                                                              |
+| =opencode-provider-icons=                              | the icons of providers                                                                                                                       |
+| =opencode-setting-chosen=, =-inherited=                | a variant, or effort, selected, or run by default; drover's prompt uses them for the settings picked or inherited                            |
+| =opencode-context-bar=, =-near=, =-over=               | the part of a model's context filled, and a context near or past a long-context price tier                                                   |
+| =opencode-cache-bar=, =-trough=                        | the part of a prompt cache's lifetime left, and gone                                                                                         |
 
 =opencode-format-duration=, =opencode-format-age= and =opencode-format-tokens= give ages and token counts as every display reads them, such as =5m= and =182k=. The frame an animated icon shows comes from the clock (=opencode-session-status-frame-index=), so that every animated icon shows the same frame at the same time. =opencode-mode-line-agent-faces= is an obsolete alias of =opencode-agent-faces=, and an entry of =opencode-session-status-icons= in its former form, (STATUS ICON FACE), still gives its icon.
 
