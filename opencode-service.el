@@ -265,7 +265,7 @@ Nothing happens once LOOKUP is no longer the latest lookup."
     (opencode-transport-failure-describe failure)))
 
 (defun opencode-service--await-import (lookup connection &optional progress deadline service)
-  "Settle LOOKUP's waiters with CONNECTION once its service imported the earlier sessions.
+  "Settle LOOKUP's waiters with CONNECTION once its service imported old sessions.
 PROGRESS is the progress text last reported, and DEADLINE the time
 after which the import counts as stalled unless it progresses.
 SERVICE, nil for the local one, is the service whose waiters these are."
@@ -463,7 +463,7 @@ that to end.  Return a handle for `opencode-service-cancel'."
     waiter))
 
 (defun opencode-service-cancel (handle)
-  "Stop waiting for a ready service for the call of `opencode-service-ensure' HANDLE.
+  "Stop waiting for a service for the call of `opencode-service-ensure' HANDLE.
 Neither of its functions runs then, and when nothing else waits, a
 service stopped meanwhile is not started again for it."
   (setf (opencode-sv opencode-service--waiters) (delq handle (opencode-sv opencode-service--waiters))))
@@ -526,7 +526,7 @@ answers in tens of milliseconds, which this waits for."
                         (opencode-service-installed-version))))
 
 (defun opencode-service-running-sessions ()
-  "Return the number of sessions running a turn, or nil when the service is unreachable.
+  "Return the number of sessions running a turn, or nil when unreachable.
 That is the local service, which Emacs may restart or stop."
   (when-let* ((connection (or opencode-service-connection (opencode-service-read-registration))))
     (condition-case nil
@@ -560,7 +560,8 @@ never restarts a remote one."
     (opencode-service--restart callback errback)))
 
 (defun opencode-service--restart (callback errback)
-  "Restart the local service, then call CALLBACK, else ERRBACK, as `opencode-service-restart'."
+  "Restart the local service, then call CALLBACK, else ERRBACK.
+As `opencode-service-restart' does."
   (setf (opencode-sv opencode-service-connection) nil)
   (let ((lookup (cl-incf (opencode-sv opencode-service--lookup)))
         (waiter (cons (lambda (connection)

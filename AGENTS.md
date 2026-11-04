@@ -8,6 +8,7 @@ Emacs client for the OpenCode 2 server (`/api/*`, shared background service).
 - Never start, stop or restart the user's OpenCode service from a test. Tests replay recorded events from `test/fixtures/v2/` or talk to the fake service in `test/opencode-test-server.el`.
 - `make compile` must stay free of warnings, and `make lint` (checkdoc, package-lint) clean.
 - The server is authoritative: buffers render what the server reports and keep only UI state locally.
+- Emacs may follow several services (`doc/design.org`, Several services). State a module keeps for a service is declared with `opencode-defvar-service` and read with `opencode-sv`, the local service's in the variables themselves; every timer, callback, filter and handler of a service's machinery binds its service (`opencode-with-service`, `opencode--timer-arguments`), whatever buffer is current when it runs. The local service must keep behaving, and costing, as with one service.
 
 ## Layout
 

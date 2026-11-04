@@ -70,7 +70,7 @@
   :group 'opencode)
 
 (defconst opencode-transport--keep-alive 4
-  "Seconds an idle connection is kept when the service announces no keep-alive timeout.
+  "Seconds an idle connection is kept when the service announces no timeout.
 A connection is kept a second less than the service announces, so that
 a request rarely meets one the service is closing.")
 
@@ -207,7 +207,7 @@ SLOTS are further `opencode-transport-failure' slots."
              value)))
 
 (defun opencode-transport--abandon (exchange)
-  "Detach EXCHANGE from its connection, and close it: its answer cannot be finished.
+  "Detach EXCHANGE from its connection, and close it: its answer cannot finish.
 A relayed exchange is abandoned by its relay."
   (when-let* ((cancel (gethash exchange opencode-transport--relayed)))
     (remhash exchange opencode-transport--relayed)
@@ -584,7 +584,7 @@ answer is complete, nil while it is not."
 ;;;; Answering
 
 (defun opencode-transport--coding (exchange)
-  "Return the coding system of EXCHANGE's answer body, UTF-8 unless it says otherwise."
+  "Return the coding system of EXCHANGE's answer body, UTF-8 unless it says so."
   (or (when-let* ((type (opencode-transport--header exchange "content-type"))
                   ((string-match "charset=\"?\\([^\";[:space:]]+\\)" type))
                   (coding (intern (downcase (match-string 1 type))))

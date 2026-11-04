@@ -161,7 +161,8 @@ local service."
   (opencode-svc-remote (or service (opencode-current-service))))
 
 (defun opencode-service-label (&optional service)
-  "Return how views name SERVICE, the current one by default; nil for the local service."
+  "Return how views name SERVICE, the current one by default.
+Nil for the local service, which views name nowhere."
   (let ((service (or service (opencode-current-service))))
     (and (opencode-svc-remote service)
          (or (opencode-svc-label service) (opencode-svc-name service)))))
@@ -193,8 +194,9 @@ whatever buffer is current when they run."
      ,@body))
 
 (defun opencode-call-with-service (service function &rest arguments)
-  "Call FUNCTION with ARGUMENTS for SERVICE, a service object or nil for the local one.
-For packages compiled without `opencode-with-service'."
+  "Call FUNCTION with ARGUMENTS for SERVICE.
+SERVICE is a service object, or nil for the local one.  For packages
+compiled without `opencode-with-service'."
   (opencode-with-service service
     (apply function arguments)))
 
@@ -217,7 +219,7 @@ For packages compiled without `opencode-with-service'."
     (symbol-value symbol)))
 
 (defun opencode--sv-set (symbol value)
-  "Set the current service's value of SYMBOL, a variable kept per service, to VALUE."
+  "Set the current service's value of SYMBOL, kept per service, to VALUE."
   (if-let* ((service (opencode--remote-service)))
       (puthash symbol value (opencode--service-state service))
     (set symbol value)))
@@ -374,7 +376,7 @@ nothing to another host's service."
     default-directory))
 
 (defun opencode--remote-directory (directory)
-  "Return DIRECTORY, a remote service's, as a directory name spelled as it spells it.
+  "Return DIRECTORY, a remote service's, as a directory name as it spells it.
 Nothing is resolved: the directory is that service's host's.
 Backslashes become slashes and a drive letter is upcased, as OpenCode
 spells directories on Windows."
