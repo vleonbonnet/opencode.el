@@ -776,6 +776,18 @@ non-exclusively."
         (append data '(:exclusive no))
       data)))
 
+(defun opencode-session-display-setup ()
+  "Have the paragraphs of this session buffer read left to right.
+Each paragraph's direction is otherwise found from its first strong
+character, which redisplay looks for by scanning back to the
+paragraph's start for every line it lays out, and brackets are paired
+across scripts: a transcript is mostly English and code, which read
+left to right, and a right-to-left word within a line still reads right
+to left.  Session windows are laid out whole whenever their mode line
+animates (see `opencode--mode-line-tick')."
+  (setq-local bidi-paragraph-direction 'left-to-right
+              bidi-inhibit-bpa t))
+
 (define-derived-mode opencode-session-mode comint-mode "OpenCode"
   "Major mode of an OpenCode session buffer.
 \\<opencode-session-mode-map>
@@ -796,6 +808,7 @@ interrupt the turn or are refused (`opencode-comint-unsupported'), and
               comint-highlight-input nil
               revert-buffer-function #'opencode--session-revert
               left-margin-width (1+ left-margin-width))
+  (opencode-session-display-setup)
   ;; Output never prompts for a password.
   (setq-local comint-output-filter-functions
               (remove #'comint-watch-for-password-prompt comint-output-filter-functions))
@@ -1125,10 +1138,13 @@ Each is (EVENT . FUNCTION), FUNCTION applying EVENT in this buffer.")
              (get-buffer-process (current-buffer)))
     ;; Before the idle prompt, which is rewritten after any new message.
     (let ((end (if (opencode-prompt-shown-p) (marker-position opencode--prompt-start) (opencode-pmark)))
+          (before (opencode--finished-end))
           (response (plist-get opencode--synced :response)))
       (if (markerp opencode-synced-end)
           (set-marker opencode-synced-end end)
         (setq opencode-synced-end (copy-marker end)))
+      ;; What the message finished was fontified as it was written.
+      (opencode-drop-finished-parsers-later (min (or before (point-min)) end) end)
       (when (markerp response) (set-marker response nil))
       (setq opencode--synced
             (list :id opencode--newest-message
@@ -4527,6 +4543,7 @@ keep their own."
     (with-current-buffer buffer
       (with-demoted-errors "OpenCode: cannot update the look of a session buffer: %S"
         (opencode--unhighlight-sent-prompts)
+        (opencode-session-display-setup)
         (opencode-blocks-upgrade)
         (opencode-read-only-upgrade)))))
 

@@ -168,6 +168,46 @@ fontification puts it back."
           (opencode-test-check-parsers)
           (should (equal (treesit-parser-list nil nil 'embedded) parsers)))))))
 
+(defun opencode-test-finished-parsers ()
+  "Return how many local parsers parse the finished text, before `opencode-synced-end'."
+  (seq-count (lambda (overlay) (<= (overlay-end overlay) opencode-synced-end))
+             (opencode-test-parser-overlays)))
+
+(ert-deftest opencode-test-parsers-dropped-when-finished ()
+  "The parsers of finished text are deleted once it is fontified; its faces stay.
+Those of a message still written stay until it ends, and those of text
+fontified again are deleted again."
+  (opencode-test-with-held-timers
+    (opencode-test-with-parsed-session (opencode-test-long-transcript 3)
+      (let ((session opencode-session-id))
+        (should (> (opencode-test-finished-parsers) 0))
+        (opencode-test-run-timers)
+        (should (= (opencode-test-finished-parsers) 0))
+        (should (opencode-test-face-at "notes.txt" 'markdown-ts-code-span))
+        ;; A turn being written keeps the parsers of its text.
+        (opencode-test-dispatch (opencode-test-inbox-events session "msg_f00u" "Next **one**"))
+        (opencode-test-turn session "started")
+        (let ((ending (opencode-test-stream-fontified session "msg_f00a" "Part *one*.\n\nSee `y`.")))
+          (opencode-test-run-timers)
+          (let ((finished (marker-position opencode-synced-end)))
+            (should (seq-some (lambda (overlay) (> (overlay-end overlay) finished))
+                              (opencode-test-parser-overlays))))
+          (should (= (opencode-test-finished-parsers) 0))
+          (opencode-test-dispatch ending)
+          (opencode-test-turn session "succeeded"))
+        (opencode-test-run-timers)
+        (should (= (opencode-test-finished-parsers) 0))
+        (should (opencode-test-face-at "one*." 'markdown-ts-emphasis))
+        (should (opencode-test-face-at "y`" 'markdown-ts-code-span))
+        ;; Fontified again, the text gets parsers anew, deleted again.
+        (font-lock-flush)
+        (font-lock-ensure)
+        (should (> (opencode-test-finished-parsers) 0))
+        (should (opencode-test-face-at "one*." 'markdown-ts-emphasis))
+        (opencode-test-run-timers)
+        (should (= (opencode-test-finished-parsers) 0))
+        (opencode-test-check-parsers t)))))
+
 (ert-deftest opencode-test-parsers-follow-deleted-text ()
   "Deleting text deletes the parsers of the regions it held; changing its properties does not."
   (opencode-test-with-parsed-session (opencode-test-long-transcript 2)
@@ -212,7 +252,10 @@ there were."
         (should (opencode-test-face-at "notes.txt" 'markdown-ts-code-span))
         (font-lock-flush)
         (font-lock-ensure)
-        (should (= (opencode-test-run-timers) 0))))))
+        ;; Fontified again, it deletes the parsers of its finished text
+        ;; anew, and prunes nothing.
+        (should-not (seq-some (lambda (timer) (eq (timer--function timer) #'opencode--prune-parsers-slice))
+                              opencode-test-timers))))))
 
 (ert-deftest opencode-test-parsers-pruned-by-command ()
   "`opencode-session-prune-parsers' deletes the orphan parsers and says how many."
@@ -234,6 +277,50 @@ there were."
         (opencode-session-reload)
         (opencode-test-run-timers)
         (should (= (opencode-test-check-parsers) count))))))
+
+(ert-deftest opencode-test-parsers-dropped-on-screen ()
+  "Redisplay fontifies what windows show, and the parsers of finished text then go.
+The text keeps its faces and its layout, scrolled to or fontified anew."
+  :tags '(gui)
+  (skip-unless (display-graphic-p))
+  (opencode-test-with-transcript (opencode-test-long-transcript 30)
+    (let ((buffer (opencode-test-open (opencode-test-session)))
+          (window (selected-window)))
+      (save-window-excursion
+        (set-window-buffer window buffer)
+        (with-current-buffer buffer
+          (cl-flet ((settle ()
+                      (redisplay t)
+                      ;; The timers deleting parsers run.
+                      (sit-for 0.1)
+                      (redisplay t))
+                    (layout ()
+                      (save-excursion
+                        (goto-char (window-start window))
+                        (search-forward "notes.txt")
+                        (list (posn-x-y (posn-at-point (match-beginning 0) window))
+                              (opencode-test-face-at "notes.txt" 'markdown-ts-code-span)))))
+            (set-window-point window (point-max))
+            (settle)
+            (let ((shown (layout)))
+              (should (cadr shown))
+              (should (= (opencode-test-finished-parsers) 0))
+              (should (equal (layout) shown))
+              (font-lock-flush)
+              (redisplay t)
+              (should (> (opencode-test-finished-parsers) 0))
+              (should (equal (layout) shown))
+              (settle)
+              (should (= (opencode-test-finished-parsers) 0))
+              (should (equal (layout) shown)))
+            ;; Scrolled through, the transcript fontifies and drops them.
+            (goto-char (point-min))
+            (while (progn (set-window-start window (point))
+                          (settle)
+                          (zerop (forward-line (window-body-height window)))))
+            (should (= (opencode-test-finished-parsers) 0))
+            (should (opencode-test-face-at "notes.txt" 'markdown-ts-code-span))
+            (opencode-test-check-parsers t)))))))
 
 (ert-deftest opencode-test-parsers-redisplayed ()
   "Redisplay, which fontifies what windows show, leaves one parser per region it parsed.

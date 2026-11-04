@@ -29,6 +29,22 @@
       (should (string-match-p "Reply with exactly the words: hello fixture" text))
       (should (string-match-p "hello fixture" text)))))
 
+(ert-deftest opencode-test-session-reads-left-to-right ()
+  "Session paragraphs read left to right, brackets unpaired across scripts.
+Redisplay then neither looks for each paragraph's direction nor pairs
+brackets, in windows laid out whole at every frame of an animated mode
+line.  A buffer of an earlier version gets them as this one loads."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open (opencode-test-scenario "text"))
+      (should (eq bidi-paragraph-direction 'left-to-right))
+      (should (eq bidi-inhibit-bpa t))
+      (should bidi-display-reordering)
+      (kill-local-variable 'bidi-paragraph-direction)
+      (kill-local-variable 'bidi-inhibit-bpa)
+      (load "opencode-session" nil t)
+      (should (eq bidi-paragraph-direction 'left-to-right))
+      (should (eq bidi-inhibit-bpa t)))))
+
 (ert-deftest opencode-test-replay-tools ()
   "Tool calls become collapsed summaries with their v2 names."
   (opencode-test-with-server
