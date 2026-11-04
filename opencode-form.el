@@ -654,7 +654,7 @@ A question transient suspended from this buffer is resumed instead."
   (let* ((form (alist-get 'form (alist-get 'data event)))
          (session (alist-get 'sessionID form)))
     (unless (equal session "global")
-      (if-let* ((buffer (gethash session opencode-session-buffers))
+      (if-let* ((buffer (gethash session (opencode-sv opencode-session-buffers)))
                 ((buffer-live-p buffer)))
           (with-current-buffer buffer (opencode-form-queue form))
         (opencode-session-open-by-id session :no-display t

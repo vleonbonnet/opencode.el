@@ -381,9 +381,11 @@ INPUT and METADATA are the call's; FILE is relative to the session."
 
 (defun opencode--edits-tool-finished (overlay)
   "Run the edit hooks for the files the finished tool call of OVERLAY changed.
-Only a live turn's calls count: a replayed transcript's never do."
+Only a live turn's calls count: a replayed transcript's never do; and
+only the local files' sessions: another host's files are not here."
   (let ((data (opencode-block-data overlay)))
-    (when (and (equal (plist-get data :status) "completed")
+    (when (and (opencode-service-files-p)
+               (equal (plist-get data :status) "completed")
                (eq opencode-session-status 'busy)
                (not opencode--replaying))
       (dolist (entry (opencode-tool-edited-files (plist-get data :tool) (plist-get data :input)
@@ -558,11 +560,13 @@ DIRECTORY shortens the file names in the report."
 ;;;; Session roots
 
 (defun opencode-session-roots ()
-  "Return the directories of the live session buffers."
+  "Return the directories of the live session buffers of this host's files."
   (delete-dups
    (seq-keep (lambda (buffer)
                (with-current-buffer buffer
-                 (and (derived-mode-p 'opencode-session-mode) default-directory)))
+                 (and (derived-mode-p 'opencode-session-mode)
+                      (opencode-service-files-p (or opencode--buffer-service opencode--local-service))
+                      default-directory)))
              (buffer-list))))
 
 (defvar opencode--session-roots-timer nil

@@ -82,13 +82,13 @@ Each function receives the service's version and the installed one."
 (defvar opencode-service-ready-functions nil
   "Abnormal hook run with the connection each time a service is ready for Emacs.")
 
-(defvar opencode-service-connection nil
+(opencode-defvar-service opencode-service-connection nil
   "Plist (:url :password :pid :version :id) of the service Emacs uses.")
 
-(defvar opencode-service--waiters nil
+(opencode-defvar-service opencode-service--waiters nil
   "Callbacks (SUCCESS . FAILURE) waiting for the running `opencode-service-ensure'.")
 
-(defvar opencode-service--lookup 0
+(opencode-defvar-service opencode-service--lookup 0
   "Count of the lookups for a ready service; only the latest settles the waiters.
 A restart or a stop counts as a new one, so that a lookup in flight,
 which may have found the service going away, settles nothing.")
@@ -100,11 +100,52 @@ While it runs, the waiters wait for it rather than look for a service.")
 (defvar opencode-service--installed-version nil
   "Cons ((EXECUTABLE . MTIME) . VERSION) of the last `opencode --version' result.")
 
-(defvar opencode-service--import-checked nil
+(opencode-defvar-service opencode-service--import-checked nil
   "Cons (ID . PID) of the service whose import Emacs no longer waits for.")
 
 (defvar opencode-service--import-interval 1
   "Seconds between two import status requests.")
+
+;;;; Remote services
+
+(defvar opencode-service-registered-functions nil
+  "Abnormal hook run with a remote service as it is registered, for it.")
+
+(cl-defun opencode-service-register (name &key label connect files)
+  "Register the remote OpenCode service NAME, a string, and return it.
+CONNECT is a function of two arguments, CALLBACK and ERRBACK, telling
+how to reach the service: it calls CALLBACK, now or later, with a
+connection plist (:url URL :password PASSWORD :id ID :version VERSION),
+URL being an http URL or a relay's, relay://NAME (see
+`opencode-transport-register-relay'), or ERRBACK with a line telling
+why it cannot.  It is asked again whenever the service cannot be
+reached or refuses the password.  LABEL names the service in buffer
+names, mode lines and messages, NAME by default.  FILES non-nil says
+the files its sessions name are this host's, which they are not by
+default: Emacs then neither visits, processes nor links them.
+
+Emacs never starts, restarts nor stops a remote service.  Its session
+buffers follow it through an event stream of its own, open while any
+is; its registry holds their sessions and those around them, not every
+session of the service.  Registering NAME again updates it, and opens
+it again once unregistered (see `opencode-service-unregister'), its
+buffers following it anew."
+  (unless (and (stringp name) (string-match-p "\\`[A-Za-z0-9][A-Za-z0-9._-]*\\'" name)
+               (not (equal name "local")))
+    (error "Invalid name of an OpenCode service: %S" name))
+  (unless (functionp connect)
+    (error "OpenCode service %s needs a function telling how to reach it" name))
+  (let ((service (or (gethash name opencode--services)
+                     (puthash name (opencode-svc--make :name name :remote t) opencode--services))))
+    (setf (opencode-svc-label service) label
+          (opencode-svc-connect service) connect
+          (opencode-svc-files service) files
+          (opencode-svc-closed service) nil)
+    ;; Asked anew: its provider may know another way now.
+    (opencode-with-service service
+      (setf (opencode-sv opencode-service-connection) nil)
+      (run-hook-with-args 'opencode-service-registered-functions service))
+    service))
 
 (defun opencode-service-registration-file ()
   "Return the service registration file name."
@@ -146,33 +187,37 @@ While it runs, the waiters wait for it rather than look for a service.")
 (defun opencode-service--probe (connection callback)
   "Probe CONNECTION's `/api/info' and call CALLBACK with the outcome.
 The outcome is `ready' when the registered process answers, `starting'
-while it boots, and nil when nothing usable answers."
-  (condition-case nil
-      (opencode-transport-request
-       'get (concat (plist-get connection :url) "/api/info")
-       :headers `(("Authorization" . ,(opencode-service-authorization connection)))
-       :as (lambda () (json-parse-buffer :object-type 'alist :null-object nil
-                                         :false-object nil))
-       :connect-timeout 2 :timeout 5
-       :then (lambda (info)
-               (funcall callback
-                        (if (or (null (plist-get connection :pid))
-                                (equal (alist-get 'pid info) (plist-get connection :pid)))
-                            'ready
-                          nil)))
-       :else (lambda (failure)
-               (funcall callback
-                        (and (eql (opencode-transport-failure-status failure) 503) 'starting))))
-    (error (funcall callback nil))))
+while it boots, and nil when nothing usable answers.  CALLBACK runs for
+the current service."
+  (let ((service (opencode--remote-service)))
+    (condition-case nil
+        (opencode-transport-request
+         'get (concat (plist-get connection :url) "/api/info")
+         :headers `(("Authorization" . ,(opencode-service-authorization connection)))
+         :as (lambda () (json-parse-buffer :object-type 'alist :null-object nil
+                                           :false-object nil))
+         :connect-timeout 2 :timeout (if service 15 5)
+         :then (lambda (info)
+                 (opencode-with-service service
+                   (funcall callback
+                            (if (or (null (plist-get connection :pid))
+                                    (equal (alist-get 'pid info) (plist-get connection :pid)))
+                                'ready
+                              nil))))
+         :else (lambda (failure)
+                 (opencode-with-service service
+                   (funcall callback
+                            (and (eql (opencode-transport-failure-status failure) 503) 'starting)))))
+      (error (funcall callback nil)))))
 
 (defun opencode-service--finish (lookup connection error)
   "Settle every waiter with CONNECTION, or with ERROR when CONNECTION is nil.
 Nothing happens once LOOKUP is no longer the latest lookup."
-  (when (eql lookup opencode-service--lookup)
-    (let ((waiters (nreverse opencode-service--waiters)))
-      (setq opencode-service--waiters nil)
+  (when (eql lookup (opencode-sv opencode-service--lookup))
+    (let ((waiters (nreverse (opencode-sv opencode-service--waiters))))
+      (setf (opencode-sv opencode-service--waiters) nil)
       (when connection
-        (setq opencode-service-connection connection))
+        (setf (opencode-sv opencode-service-connection) connection))
       (dolist (waiter waiters)
         (condition-case err
             (if connection
@@ -181,17 +226,18 @@ Nothing happens once LOOKUP is no longer the latest lookup."
           (error (message "OpenCode: %s" (error-message-string err)))))
       (when connection
         (run-hook-with-args 'opencode-service-ready-functions connection)
-        (opencode-service-check-version connection)))))
+        (unless (opencode--remote-service)
+          (opencode-service-check-version connection))))))
 
 (defun opencode-service--withdraw (waiter lookup error)
   "Fail WAITER alone with ERROR, then look for a service for the others.
 Nothing happens once LOOKUP is no longer the latest lookup."
-  (when (eql lookup opencode-service--lookup)
-    (setq opencode-service--waiters (delq waiter opencode-service--waiters))
+  (when (eql lookup (opencode-sv opencode-service--lookup))
+    (setf (opencode-sv opencode-service--waiters) (delq waiter (opencode-sv opencode-service--waiters)))
     (condition-case err
         (when (cdr waiter) (funcall (cdr waiter) error))
       (error (message "OpenCode: %s" (error-message-string err))))
-    (when opencode-service--waiters
+    (when (opencode-sv opencode-service--waiters)
       (opencode-service--find))))
 
 (defun opencode-service--import-key (connection)
@@ -209,7 +255,7 @@ Nothing happens once LOOKUP is no longer the latest lookup."
 
 (defun opencode-service--import-done (lookup connection)
   "Stop waiting for the import of CONNECTION's service and settle LOOKUP's waiters."
-  (setq opencode-service--import-checked (opencode-service--import-key connection))
+  (setf (opencode-sv opencode-service--import-checked) (opencode-service--import-key connection))
   (opencode-service--finish lookup connection nil))
 
 (defun opencode-service--failure-text (failure)
@@ -218,13 +264,20 @@ Nothing happens once LOOKUP is no longer the latest lookup."
       (format "HTTP %d" status)
     (opencode-transport-failure-describe failure)))
 
-(defun opencode-service--await-import (lookup connection &optional progress deadline)
-  "Settle LOOKUP's waiters with CONNECTION once its service imported the earlier sessions.
+(defun opencode-service--await-import (lookup connection &optional progress deadline service)
+  "Settle LOOKUP's waiters with CONNECTION once its service imported old sessions.
 PROGRESS is the progress text last reported, and DEADLINE the time
-after which the import counts as stalled unless it progresses."
+after which the import counts as stalled unless it progresses.
+SERVICE, nil for the local one, is the service whose waiters these are."
+  (opencode-with-service service
+    (opencode-service--await-import-1 lookup connection progress deadline)))
+
+(defun opencode-service--await-import-1 (lookup connection progress deadline)
+  "Do the work of `opencode-service--await-import' for the current service.
+LOOKUP, CONNECTION, PROGRESS and DEADLINE are as there."
   (cond
-   ((not (eql lookup opencode-service--lookup)))
-   ((equal opencode-service--import-checked (opencode-service--import-key connection))
+   ((not (eql lookup (opencode-sv opencode-service--lookup))))
+   ((equal (opencode-sv opencode-service--import-checked) (opencode-service--import-key connection))
     (opencode-service--finish lookup connection nil))
    (t
     (let ((deadline (or deadline (+ (float-time) opencode-service-import-stall-timeout))))
@@ -258,9 +311,10 @@ after which the import counts as stalled unless it progresses."
                          (format "The OpenCode service's import of earlier sessions made no progress for %s s; sessions it has yet to import look deleted"
                                  opencode-service-import-stall-timeout))
                         (opencode-service--import-done lookup connection))
-                    (run-at-time opencode-service--import-interval nil
+                    (apply #'run-at-time opencode-service--import-interval nil
                                  #'opencode-service--await-import
-                                 lookup connection current deadline))))))
+                                 lookup connection current deadline
+                                 (opencode--timer-arguments)))))))
            :else
            (lambda (failure)
              (if (eql 404 (opencode-transport-failure-status failure))
@@ -298,12 +352,20 @@ Output goes to a hidden buffer that is killed afterwards."
                  (kill-buffer (process-buffer process))
                  (when (eq opencode-service--starter process)
                    (setq opencode-service--starter nil))
-                 (funcall on-exit (process-exit-status process) output))))))))
+                 ;; The CLI changes the local service only.
+                 (opencode-with-service nil
+                   (funcall on-exit (process-exit-status process) output)))))))))
 
 (defun opencode-service--await (lookup deadline)
   "Poll the registration until its service is ready or DEADLINE passes.
-The service then settles LOOKUP's waiters."
-  (when (eql lookup opencode-service--lookup)
+The service then settles LOOKUP's waiters.  Only the local service has
+a registration."
+  (opencode-with-service nil
+    (opencode-service--await-1 lookup deadline)))
+
+(defun opencode-service--await-1 (lookup deadline)
+  "Do the work of `opencode-service--await' for LOOKUP and DEADLINE."
+  (when (eql lookup (opencode-sv opencode-service--lookup))
     (let ((connection (opencode-service-read-registration)))
       (if (not connection)
           (if (> (float-time) deadline)
@@ -332,40 +394,79 @@ The service then settles LOOKUP's waiters."
       (error (opencode-service--finish
               lookup nil (format "Cannot run %s: %s" opencode-command (error-message-string err)))))))
 
+(defun opencode-service--find-remote (service lookup)
+  "Ask remote SERVICE's provider for its connection, then settle LOOKUP's waiters.
+The waiters get the connection once its service answers; a remote
+service is never started nor waited for to import anything."
+  (let ((label (opencode-service-label service)))
+    (cl-flet ((fail (text)
+                ;; Never before `opencode-service-ensure' returns.
+                (run-at-time 0 nil (lambda ()
+                                     (opencode-with-service service
+                                       (opencode-service--finish lookup nil text))))))
+      (condition-case err
+          (if (opencode-svc-closed service)
+              (fail (format "The OpenCode service of %s is closed" label))
+            (funcall (opencode-svc-connect service)
+                   (lambda (connection)
+                     (opencode-with-service service
+                       (cond
+                        ((not (eql lookup (opencode-sv opencode-service--lookup))))
+                        ((not (and (consp connection) (stringp (plist-get connection :url))))
+                         (fail (format "No OpenCode service of %s to connect to" label)))
+                        (t
+                         (opencode-service--probe
+                          connection
+                          (lambda (outcome)
+                            (if (eq outcome 'ready)
+                                (opencode-service--finish lookup connection nil)
+                              (fail (format "The OpenCode service of %s does not answer" label)))))))))
+                   (lambda (text)
+                     (fail (format "Cannot reach the OpenCode service of %s: %s" label text)))))
+        (error (fail (format "Cannot reach the OpenCode service of %s: %s"
+                             label (error-message-string err))))))))
+
 (defun opencode-service--find ()
-  "Look for a ready service for the waiters, starting one when none answers."
-  (let ((lookup (cl-incf opencode-service--lookup))
-        (connection (opencode-service-read-registration)))
-    (if (not connection)
-        (opencode-service--start lookup)
-      (opencode-service--probe
-       connection
-       (lambda (outcome)
-         (when (eql lookup opencode-service--lookup)
-           (pcase outcome
-             ('ready (opencode-service--await-import lookup connection))
-             ('starting
-              (opencode-service--await lookup (+ (float-time) opencode-service-start-timeout)))
-             (_ (opencode-service--start lookup)))))))))
+  "Look for a ready service for the waiters, starting one when none answers.
+A remote service is asked of its provider (see `opencode-service-register')."
+  (let ((lookup (cl-incf (opencode-sv opencode-service--lookup)))
+        (connection (and (not (opencode--remote-service)) (opencode-service-read-registration))))
+    (if-let* ((service (opencode--remote-service)))
+        (opencode-service--find-remote service lookup)
+      (opencode-service--find-local lookup connection))))
+
+(defun opencode-service--find-local (lookup connection)
+  "Settle LOOKUP's waiters with the local service, CONNECTION registered or nil."
+  (if (not connection)
+      (opencode-service--start lookup)
+    (opencode-service--probe
+     connection
+     (lambda (outcome)
+       (when (eql lookup (opencode-sv opencode-service--lookup))
+         (pcase outcome
+           ('ready (opencode-service--await-import lookup connection))
+           ('starting
+            (opencode-service--await lookup (+ (float-time) opencode-service-start-timeout)))
+           (_ (opencode-service--start lookup))))))))
 
 (defun opencode-service-ensure (callback &optional errback)
   "Call CALLBACK with the connection of a ready service, starting one if needed.
 ERRBACK, when given, receives an error message instead on failure.
 While Emacs starts, restarts or stops the service, CALLBACK waits for
 that to end.  Return a handle for `opencode-service-cancel'."
-  (let ((first (null opencode-service--waiters))
+  (let ((first (null (opencode-sv opencode-service--waiters)))
         (waiter (cons callback errback)))
-    (push waiter opencode-service--waiters)
+    (push waiter (opencode-sv opencode-service--waiters))
     ;; The CLI changing the service settles the waiters once it exits.
-    (when (and first (not (process-live-p opencode-service--starter)))
+    (when (and first (or (opencode--remote-service) (not (process-live-p opencode-service--starter))))
       (opencode-service--find))
     waiter))
 
 (defun opencode-service-cancel (handle)
-  "Stop waiting for a ready service for the call of `opencode-service-ensure' HANDLE.
+  "Stop waiting for a service for the call of `opencode-service-ensure' HANDLE.
 Neither of its functions runs then, and when nothing else waits, a
 service stopped meanwhile is not started again for it."
-  (setq opencode-service--waiters (delq handle opencode-service--waiters)))
+  (setf (opencode-sv opencode-service--waiters) (delq handle (opencode-sv opencode-service--waiters))))
 
 (defconst opencode-service--version-line
   (rx bos (* blank)
@@ -413,7 +514,7 @@ answers in tens of milliseconds, which this waits for."
 
 (defun opencode-service-stale-p (&optional connection)
   "Return non-nil when CONNECTION's service runs another version than the CLI."
-  (let ((service (plist-get (or connection opencode-service-connection) :version))
+  (let ((service (plist-get (or connection (opencode-sv opencode-service-connection)) :version))
         (installed (opencode-service-installed-version)))
     (and service installed (not (equal service installed)))))
 
@@ -425,7 +526,8 @@ answers in tens of milliseconds, which this waits for."
                         (opencode-service-installed-version))))
 
 (defun opencode-service-running-sessions ()
-  "Return the number of sessions running a turn, or nil when the service is unreachable."
+  "Return the number of sessions running a turn, or nil when unreachable.
+That is the local service, which Emacs may restart or stop."
   (when-let* ((connection (or opencode-service-connection (opencode-service-read-registration))))
     (condition-case nil
         (let ((response (opencode-transport-request-sync
@@ -443,7 +545,8 @@ ERRBACK, when given, receives an error message instead on failure.
 Requests made meanwhile wait for the restarted service.  Every client
 reconnects by itself; running turns resume after the restart, though
 their current step starts over, so interactively this asks first while
-any runs."
+any runs.  It is the local service, whatever the current buffer: Emacs
+never restarts a remote one."
   (interactive)
   (when (process-live-p opencode-service--starter)
     (user-error "An OpenCode service start, restart or stop is already running"))
@@ -453,8 +556,14 @@ any runs."
     (unless (yes-or-no-p (format "%d OpenCode session%s running a turn; restart the service anyway? "
                                  running (if (= running 1) " is" "s are")))
       (user-error "Restart cancelled")))
-  (setq opencode-service-connection nil)
-  (let ((lookup (cl-incf opencode-service--lookup))
+  (opencode-with-service nil
+    (opencode-service--restart callback errback)))
+
+(defun opencode-service--restart (callback errback)
+  "Restart the local service, then call CALLBACK, else ERRBACK.
+As `opencode-service-restart' does."
+  (setf (opencode-sv opencode-service-connection) nil)
+  (let ((lookup (cl-incf (opencode-sv opencode-service--lookup)))
         (waiter (cons (lambda (connection)
                         (message "OpenCode service restarted (%s)" (plist-get connection :version))
                         (when callback (funcall callback connection)))
@@ -463,7 +572,7 @@ any runs."
     ;; The waiters, and requests made until the restarted service is
     ;; ready, would otherwise find the service going away, or start
     ;; another one beside the CLI.
-    (push waiter opencode-service--waiters)
+    (push waiter (opencode-sv opencode-service--waiters))
     (condition-case err
         (opencode-service--run-cli
          '("service" "restart")
@@ -478,12 +587,18 @@ any runs."
 (defun opencode-service--stop (on-exit)
   "Run `opencode service stop', then call ON-EXIT with its exit status and output.
 Requests made meanwhile, and those waiting already, wait for the stop
-to end, then look for a service again, which starts one."
-  (setq opencode-service-connection nil)
+to end, then look for a service again, which starts one.  The service
+is the local one."
+  (opencode-with-service nil
+    (opencode-service--stop-1 on-exit)))
+
+(defun opencode-service--stop-1 (on-exit)
+  "Stop the local service, then call ON-EXIT, as `opencode-service--stop'."
+  (setf (opencode-sv opencode-service-connection) nil)
   ;; A lookup in flight may have found the service being stopped.
-  (cl-incf opencode-service--lookup)
+  (cl-incf (opencode-sv opencode-service--lookup))
   (cl-flet ((resume ()
-              (when (and opencode-service--waiters
+              (when (and (opencode-sv opencode-service--waiters)
                          (not (process-live-p opencode-service--starter)))
                 (opencode-service--find))))
     (condition-case err

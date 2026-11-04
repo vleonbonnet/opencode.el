@@ -296,7 +296,7 @@ Those are the prompts the buffer of session ID shows as pending, but
 for those being withdrawn already, which `opencode-edit-pending-prompt'
 withdraws.  The buffer keeps the inbox: a session without one counts
 none.  It costs little, for menus telling whether they apply."
-  (if-let* ((buffer (gethash id opencode-session-buffers))
+  (if-let* ((buffer (gethash id (opencode-sv opencode-session-buffers)))
             ((buffer-live-p buffer)))
       (with-current-buffer buffer
         (seq-count (lambda (entry) (not (plist-get (cdr entry) :withdraw)))
@@ -500,7 +500,7 @@ whose buffer keeps its pending prompts and need not be shown; else this
 buffer's, else the last selected one's (see `opencode-pending-prompts')."
   (interactive)
   (with-current-buffer (if session
-                           (let ((buffer (gethash session opencode-session-buffers)))
+                           (let ((buffer (gethash session (opencode-sv opencode-session-buffers))))
                              (if (buffer-live-p buffer)
                                  buffer
                                (user-error "No prompt of this session is pending")))

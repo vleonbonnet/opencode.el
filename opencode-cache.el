@@ -114,7 +114,7 @@ as `unsupported' and not asked again."
     :else (lambda (error)
             (if (and (eql (opencode-error-status error) 404) (null (opencode-error-tag error)))
                 (progn
-                  (push (plist-get opencode-service-connection :id) opencode-cache--unsupported)
+                  (push (plist-get (opencode-sv opencode-service-connection) :id) opencode-cache--unsupported)
                   (message "OpenCode: this service cannot preflight the prompt cache; the cache guard is off for it")
                   '((data (status . "unsupported"))))
               `((data (status . "unknown")
@@ -207,7 +207,7 @@ it can; else LOSS, the turn as it stands, is the closest estimate."
   "Check the prompt cache before input REQUEST starts a turn.
 Return nil to send, `cancel' to keep the input, or the consent metadata."
   (when-let* (((and opencode-cache-guard (eq opencode-session-status 'idle)))
-              ((not (member (plist-get opencode-service-connection :id) opencode-cache--unsupported)))
+              ((not (member (plist-get (opencode-sv opencode-service-connection) :id) opencode-cache--unsupported)))
               (body (opencode-cache-preflight-body request)))
     (let* ((report (opencode-cache-preflight body))
            (loss (opencode-cache-loss report)))

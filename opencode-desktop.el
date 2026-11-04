@@ -70,6 +70,12 @@ following output, to be restored at the end of the transcript then."
                 (list :follow t)))))
 
 (defun opencode--desktop-track ()
+  "Save this buffer with the desktop, unless its session is a remote service's.
+Such a buffer opens through its host's peer, not from a desktop."
+  (unless opencode--buffer-service
+    (opencode--desktop-track-1)))
+
+(defun opencode--desktop-track-1 ()
   "Save this buffer with the desktop."
   (setq-local desktop-save-buffer #'opencode-desktop-save)
   (add-hook 'kill-buffer-hook #'opencode--desktop-stop nil t))
@@ -157,7 +163,7 @@ BODY runs only while ATTEMPT is the buffer's restore attempt in progress."
                   (opencode-error-describe error))))
        :then (opencode--desktop-current attempt (response)
                (let ((info (opencode-request-data response))
-                     (open (gethash id opencode-session-buffers)))
+                     (open (gethash id (opencode-sv opencode-session-buffers))))
                  (cond
                   ((not (equal (alist-get 'id info) id))
                    (opencode--desktop-fail "The service returned another session"))
@@ -205,7 +211,7 @@ A buffer of the session already open is returned instead."
                  (stringp id) (string-match-p "\\`ses_[[:alnum:]_-]+\\'" id)
                  (stringp directory) (not (file-remote-p directory)))
       (error "Invalid OpenCode desktop entry"))
-    (or (let ((buffer (gethash id opencode-session-buffers)))
+    (or (let ((buffer (gethash id (opencode-sv opencode-session-buffers))))
           (and (buffer-live-p buffer) buffer))
         (seq-find (lambda (buffer)
                     (equal id (plist-get (buffer-local-value 'opencode--desktop-data buffer) :session-id)))

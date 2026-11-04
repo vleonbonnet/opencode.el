@@ -59,8 +59,12 @@ Each is a plist (:id :action :resources :save :metadata :source :reasons
 ;;;; Titles
 
 (defun opencode--permission-path (path)
-  "Return PATH for display: relative inside the session directory, else abbreviated."
-  (when (and path (not (string-empty-p path)))
+  "Return PATH for display: relative inside the session directory, else abbreviated.
+A remote service's path is its host's, made relative as a string."
+  (when (and path (not (string-empty-p path)) (not (opencode-service-files-p)))
+    (setq path (let ((relative (opencode-relative-path-for-display path)))
+                 (if (equal relative "") "." relative))))
+  (when (and path (not (string-empty-p path)) (opencode-service-files-p))
     (let* ((expanded (expand-file-name path))
            (relative (file-relative-name expanded default-directory)))
       (if (string-prefix-p ".." relative)
@@ -593,7 +597,7 @@ A session without a buffer gets one in the background, so the request has
 somewhere to wait."
   (let* ((request (alist-get 'data event))
          (session (alist-get 'sessionID request)))
-    (if-let* ((buffer (gethash session opencode-session-buffers))
+    (if-let* ((buffer (gethash session (opencode-sv opencode-session-buffers)))
               ((buffer-live-p buffer)))
         (with-current-buffer buffer (opencode-permission-queue request))
       (opencode-session-open-by-id

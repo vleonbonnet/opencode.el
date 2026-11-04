@@ -37,6 +37,10 @@ Nothing that happened while the stream was down is sent again, so every open ses
 
 On its first start, the service imports the sessions of OpenCode 1 in the background while it already answers, and a session it has yet to import looks deleted. Emacs therefore waits for the import before sending anything, showing its progress in the echo area; an import that fails, or makes no progress for =opencode-service-import-stall-timeout= seconds, is reported as a warning and no longer waited for.
 
+** Other services
+
+Emacs may follow other OpenCode services beside the local one, such as another host's, each with its own event stream, registry, catalogs and session buffers. =opencode-service-register= names one and tells how to reach it: a function calling back with its URL and password, or with a relay's URL, =relay://NAME=, whose requests a function registered with =opencode-transport-register-relay= carries, as [[https://github.com/vleonbonnet/drover][drover]] carries them to another host's drover, which adds the credentials there. Code runs for the service =opencode-with-service= binds, else for the current buffer's, else for the local service: open a session of another service with =(opencode-with-service (opencode-service-get "core") (opencode-session-open-by-id ID))=. Its buffer is named after it, =*OpenCode@Core: Title*=, stays in this host's home, and neither links nor processes the files its session names, which are its host's; files of this host attach inline, its host's by reference. Emacs never starts, restarts nor stops another service; =opencode-service-unregister= closes Emacs's link to it, its buffers saying so until it is registered again.
+
 * Sessions
 
 =M-x opencode= offers the sessions of the current project, including those of its worktrees, newest first, after an entry starting a new session there; in a project without sessions, it starts one at once. Subagent and archived sessions are left out. =opencode-select-project= first picks a project the service knows, most recently active first, then does the same there. =opencode-select-session= is another name for =opencode=.

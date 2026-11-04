@@ -44,6 +44,13 @@
 ;; returns.  ELSE receives an `opencode-transport-failure'.  A request
 ;; given a FILTER is a stream: its body goes to FILTER as it arrives.
 ;; Every connection's buffer dies with its connection.
+;;
+;; A URL relay://NAME/... goes to the relay registered as NAME
+;; (`opencode-transport-register-relay'), a function carrying requests
+;; to a service Emacs reaches otherwise, such as another host's,
+;; through a link of its own; it answers through
+;; `opencode-transport-relay-answer' and its kin, and the request
+;; settles as any other.
 
 ;;; Code:
 
@@ -63,7 +70,7 @@
   :group 'opencode)
 
 (defconst opencode-transport--keep-alive 4
-  "Seconds an idle connection is kept when the service announces no keep-alive timeout.
+  "Seconds an idle connection is kept when the service announces no timeout.
 A connection is kept a second less than the service announces, so that
 a request rarely meets one the service is closing.")
 
@@ -72,6 +79,12 @@ a request rarely meets one the service is closing.")
 
 (defvar opencode-transport--idle (make-hash-table :test #'equal)
   "Idle connections kept for later requests, by \"HOST:PORT\", the latest first.")
+
+(defvar opencode-transport--relays (make-hash-table :test #'equal)
+  "Functions relaying the requests of URLs relay://NAME, by NAME.")
+
+(defvar opencode-transport--relayed (make-hash-table :test #'eq :weakness 'key)
+  "Exchanges a relay carries, mapped to the function abandoning each, or t.")
 
 (cl-defstruct (opencode-transport-failure (:constructor opencode-transport-failure--make)
                                           (:copier nil))
@@ -194,7 +207,15 @@ SLOTS are further `opencode-transport-failure' slots."
              value)))
 
 (defun opencode-transport--abandon (exchange)
-  "Detach EXCHANGE from its connection, and close it: its answer cannot be finished."
+  "Detach EXCHANGE from its connection, and close it: its answer cannot finish.
+A relayed exchange is abandoned by its relay."
+  (when-let* ((cancel (gethash exchange opencode-transport--relayed)))
+    (remhash exchange opencode-transport--relayed)
+    (when (functionp cancel)
+      (condition-case err
+          (funcall cancel)
+        (error (message "OpenCode: a relay failed to abandon a request: %s"
+                        (error-message-string err))))))
   (when-let* ((connection (opencode-transport-exchange-connection exchange)))
     (setf (opencode-transport-exchange-connection exchange) nil)
     (when (eq (process-get connection 'opencode-transport-exchange) exchange)
@@ -563,7 +584,7 @@ answer is complete, nil while it is not."
 ;;;; Answering
 
 (defun opencode-transport--coding (exchange)
-  "Return the coding system of EXCHANGE's answer body, UTF-8 unless it says otherwise."
+  "Return the coding system of EXCHANGE's answer body, UTF-8 unless it says so."
   (or (when-let* ((type (opencode-transport--header exchange "content-type"))
                   ((string-match "charset=\"?\\([^\";[:space:]]+\\)" type))
                   (coding (intern (downcase (match-string 1 type))))
@@ -653,6 +674,86 @@ HEADERS is an alist of names and values; BODY, a string, or nil."
       'utf-8)
      body)))
 
+(defun opencode-transport-register-relay (name function)
+  "Have FUNCTION carry the requests of URLs relay://NAME/....
+FUNCTION is called with the exchange, the method, a symbol, the path
+with its query, the headers, an alist, and the body, bytes or nil; it
+returns a function of no argument abandoning the request, or nil.  It
+settles the exchange once, later, with `opencode-transport-relay-answer'
+or `opencode-transport-relay-fail'; a stream, an exchange given a
+filter, gets its body through `opencode-transport-relay-chunk' first
+and ends with `opencode-transport-relay-end'.  Registering NAME again
+replaces its function."
+  (puthash name function opencode-transport--relays))
+
+(defun opencode-transport-unregister-relay (name)
+  "Forget the relay NAME: requests of its URLs fail, refused."
+  (remhash name opencode-transport--relays))
+
+(defun opencode-transport--relay (exchange name method path headers body)
+  "Hand EXCHANGE, METHOD on PATH with HEADERS and BODY, to the relay NAME."
+  (if-let* ((relay (gethash name opencode-transport--relays)))
+      (progn
+        (puthash exchange t opencode-transport--relayed)
+        (setf (opencode-transport-exchange-sent exchange) t)
+        (condition-case err
+            (let ((cancel (funcall relay exchange method path headers body)))
+              (when (and (functionp cancel) (gethash exchange opencode-transport--relayed))
+                (puthash exchange cancel opencode-transport--relayed)))
+          (error
+           (remhash exchange opencode-transport--relayed)
+           (run-at-time 0 nil #'opencode-transport--fail exchange 'refused
+                        (format "relay %s failed: %s" name (error-message-string err))))))
+    (run-at-time 0 nil #'opencode-transport--fail exchange 'refused (format "no relay %s" name))))
+
+(defun opencode-transport-relay-answer (exchange status body &optional headers)
+  "Settle relayed EXCHANGE with its answer: STATUS, BODY, a string, and HEADERS.
+HEADERS is an alist of downcased names and values.  A 2xx answer goes
+to its THEN, through its AS when it has one, others to its ELSE as an
+`http' failure, as for any request."
+  (when (opencode-transport-live-p exchange)
+    (remhash exchange opencode-transport--relayed)
+    (let ((as (opencode-transport-exchange-as exchange))
+          (text (or body "")))
+      (pcase-let ((`(,ok . ,value)
+                   (condition-case err
+                       (cond
+                        ((not (and (integerp status) (<= 200 status 299))) (cons 'http text))
+                        ((opencode-transport-exchange-filter exchange) (cons t nil))
+                        ((functionp as)
+                         (cons t (with-temp-buffer
+                                   (insert text)
+                                   (goto-char (point-min))
+                                   (funcall as))))
+                        (t (cons t text)))
+                     (error (cons nil (error-message-string err))))))
+        (pcase ok
+          ('t (opencode-transport--settle exchange t value))
+          ('http (opencode-transport--fail exchange 'http (format "HTTP %s" status)
+                                           :status status :body value :headers headers))
+          (_ (opencode-transport--fail exchange 'unreadable (format "unreadable response: %s" value)
+                                       :status status :headers headers)))))))
+
+(defun opencode-transport-relay-chunk (exchange bytes)
+  "Give relayed stream EXCHANGE the next piece of its body, BYTES."
+  (when-let* (((opencode-transport-live-p exchange))
+              (filter (opencode-transport-exchange-filter exchange)))
+    (setf (opencode-transport-exchange-received exchange) t)
+    (funcall filter exchange bytes)))
+
+(defun opencode-transport-relay-end (exchange)
+  "End relayed stream EXCHANGE: its body is whole."
+  (when (opencode-transport-live-p exchange)
+    (remhash exchange opencode-transport--relayed)
+    (opencode-transport--settle exchange t nil)))
+
+(defun opencode-transport-relay-fail (exchange reason message &optional status body)
+  "Fail relayed EXCHANGE for REASON, a symbol as `opencode-transport-failure' has.
+MESSAGE tells why; STATUS and BODY are those of an answer, if any."
+  (when (opencode-transport-live-p exchange)
+    (remhash exchange opencode-transport--relayed)
+    (opencode-transport--fail exchange reason message :status status :body body)))
+
 (cl-defun opencode-transport-request (method url &key headers body as (then #'ignore) (else #'ignore)
                                              timeout (connect-timeout opencode-transport-connect-timeout)
                                              filter fresh)
@@ -684,8 +785,10 @@ arrives, and THEN receives nil once the body ends.
                     :method method :key (format "%s:%s" host port) :host host :port port
                     :as as :then then :else else :filter filter
                     :timeout timeout :connect-timeout connect-timeout))
+         (relay (and (equal (url-type parsed) "relay") host))
          (problem
           (cond
+           (relay nil)
            ((not (equal (url-type parsed) "http")) (format "unsupported URL %s" url))
            ((string-empty-p host) (format "no host in %s" url))
            (t (condition-case err
@@ -694,12 +797,19 @@ arrives, and THEN receives nil once the body ends.
                           (opencode-transport--request-bytes method host port path headers body))
                     nil)
                 (error (error-message-string err)))))))
-    (if problem
-        (run-at-time 0 nil #'opencode-transport--fail exchange 'protocol problem)
+    (cond
+     (problem
+      (run-at-time 0 nil #'opencode-transport--fail exchange 'protocol problem))
+     (t
       (when timeout
         (setf (opencode-transport-exchange-timer exchange)
               (run-at-time timeout nil #'opencode-transport--expire exchange nil)))
-      (opencode-transport--dispatch exchange fresh))
+      (if relay
+          (opencode-transport--relay exchange relay method path headers
+                                     (cond ((null body) nil)
+                                           ((multibyte-string-p body) (encode-coding-string body 'utf-8))
+                                           (t body)))
+        (opencode-transport--dispatch exchange fresh))))
     exchange))
 
 (defun opencode-transport-request-sync (method url &rest arguments)
