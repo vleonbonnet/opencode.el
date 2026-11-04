@@ -411,5 +411,36 @@ Return the two buffers, local first."
         (opencode-test-wait-for (lambda () again))
         (opencode-test-wait-for (lambda () (opencode-with-service service (opencode-events-connected-p))))))))
 
+(ert-deftest opencode-test-stream-callbacks-find-their-service ()
+  "A stream's filter and end find their service without a binding, as one opened before services."
+  (opencode-test-with-remote (service fake)
+    (pcase-let ((`(,local ,remote) (opencode-test-open-local-and-remote service fake)))
+      (opencode-test-both-streams service)
+      (let ((stream-buffer (seq-find (lambda (buffer)
+                                       (and (string-prefix-p " *opencode-events*" (buffer-name buffer))
+                                            (null (buffer-local-value 'opencode-events--buffer-service buffer))))
+                                     (buffer-list))))
+        (should stream-buffer)
+        ;; As the filter of a stream opened by an earlier version calls it,
+        ;; binding nothing, with the remote buffer current: the local
+        ;; service's event, for the local buffer.
+        (with-current-buffer remote
+          (opencode-events--filter
+           stream-buffer
+           (encode-coding-string
+            (concat "data: " (json-serialize '((type . "session.renamed")
+                                               (data (sessionID . "ses_both") (title . "Unbound"))))
+                    "\n\n")
+            'utf-8)))
+        (opencode-test-wait-for (lambda () (equal (buffer-name local) "*OpenCode: Unbound*")))
+        (should (equal (buffer-name remote) "*OpenCode@Core: There*"))
+        ;; Its end, told without a binding, is the local stream's.
+        (let ((stream opencode-events--stream))
+          (with-current-buffer remote
+            (opencode-events--closed stream))
+          (should-not opencode-events--stream)
+          (should (timerp opencode-events--reconnect-timer))
+          (should (opencode-with-service service (opencode-events-connected-p))))))))
+
 (provide 'opencode-services-test)
 ;;; opencode-services-test.el ends here

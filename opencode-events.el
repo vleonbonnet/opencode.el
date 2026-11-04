@@ -127,6 +127,9 @@ Silence before it is no evidence that the stream died.")
 (defvar-local opencode-events--scanned 1
   "Position up to which the stream buffer holds no frame terminator.")
 
+(defvar-local opencode-events--buffer-service nil
+  "The remote service whose event stream this stream buffer reads, or nil.")
+
 (defun opencode-events-register (type function)
   "Call FUNCTION with every event of TYPE, a string or t for all events.
 FUNCTION receives the event alist with members `type', `data', `id',
@@ -181,7 +184,16 @@ FUNCTION receives the event alist with members `type', `data', `id',
         (error (message "OpenCode: undecodable event: %s" (error-message-string err)))))))
 
 (defun opencode-events--filter (buffer output)
-  "Append OUTPUT, bytes of the stream's body, to BUFFER and queue every complete frame."
+  "Append OUTPUT, bytes of the stream's body, to BUFFER and queue every complete frame.
+The frames are for the service whose stream BUFFER reads, whatever the
+caller bound: a stream opened by an earlier version of this package,
+before services, binds none, and is the local service's."
+  (opencode-with-service (and (buffer-live-p buffer)
+                              (buffer-local-value 'opencode-events--buffer-service buffer))
+    (opencode-events--filter-1 buffer output)))
+
+(defun opencode-events--filter-1 (buffer output)
+  "Read OUTPUT into BUFFER for the current service, as `opencode-events--filter'."
   (setf (opencode-sv opencode-events--last-output) (float-time))
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
@@ -267,8 +279,23 @@ That is a client of `opencode-events-wanted-functions'."
                              (opencode-events--open))))))
     (setf (opencode-sv opencode-events--backoff) (min 30 (* 2 (opencode-sv opencode-events--backoff))))))
 
+(defun opencode-events--service-of (stream)
+  "Return the service whose event stream STREAM is, the local one by default."
+  (or (seq-find (lambda (service)
+                  (opencode-with-service service
+                    (eq stream (opencode-sv opencode-events--stream))))
+                (cdr (opencode-services)))
+      opencode--local-service))
+
 (defun opencode-events--closed (stream)
-  "Handle the end of STREAM."
+  "Handle the end of STREAM, of whichever service it is.
+A stream opened by an earlier version of this package, before services,
+tells it ended without binding its service."
+  (opencode-with-service (opencode-events--service-of stream)
+    (opencode-events--closed-1 stream)))
+
+(defun opencode-events--closed-1 (stream)
+  "Handle the end of the current service's STREAM, as `opencode-events--closed'."
   (when (eq stream (opencode-sv opencode-events--stream))
     (setf (opencode-sv opencode-events--stream) nil)
     (opencode-events--schedule-reconnect)))
@@ -329,7 +356,8 @@ session buffers stale.  SERVICE, nil for the local one, owns the stream."
           (service (opencode--remote-service))
           stream)
       (with-current-buffer buffer
-        (set-buffer-multibyte nil))
+        (set-buffer-multibyte nil)
+        (setq opencode-events--buffer-service service))
       (cl-flet ((closed ()
                   (when (buffer-live-p buffer) (kill-buffer buffer))
                   (opencode-with-service service
