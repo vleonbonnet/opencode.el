@@ -755,6 +755,10 @@ For `kill-buffer-hook': whatever kills it, its own service's registration."
     (remhash opencode-session-id (opencode-sv opencode-session-buffers))
     (run-hook-with-args 'opencode-session-buffer-functions opencode-session-id))
   (opencode--resync-forget (current-buffer))
+  (when (and (opencode--remote-service) (not (opencode--session-buffers-open-p)))
+    ;; Nothing follows a remote service's sessions any more: its stream
+    ;; costs its host a connection, and reopens with its next buffer.
+    (opencode-disconnect))
   (when-let* ((process (get-buffer-process (current-buffer))))
     (delete-process process))
   (mapc (lambda (file) (ignore-errors (delete-file file))) opencode--temp-files)

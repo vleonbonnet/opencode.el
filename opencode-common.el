@@ -192,6 +192,12 @@ whatever buffer is current when they run."
   `(let ((opencode--service (or ,service opencode--local-service)))
      ,@body))
 
+(defun opencode-call-with-service (service function &rest arguments)
+  "Call FUNCTION with ARGUMENTS for SERVICE, a service object or nil for the local one.
+For packages compiled without `opencode-with-service'."
+  (opencode-with-service service
+    (apply function arguments)))
+
 (defun opencode--service-state (service)
   "Return the table of the variables of remote SERVICE, made on first use."
   (let ((name (opencode-svc-name service)))

@@ -393,5 +393,23 @@ Return the two buffers, local first."
         (should (equal (mapcar (lambda (notification) (alist-get 'title notification)) logged)
                        '("OpenCode finished" "OpenCode finished (Core)")))))))
 
+(ert-deftest opencode-test-remote-stream-follows-buffers ()
+  "A remote service's stream closes with its last buffer, and opens with its next."
+  (opencode-test-with-remote (service fake)
+    (pcase-let ((`(,local ,remote) (opencode-test-open-local-and-remote service fake)))
+      (opencode-test-both-streams service)
+      (kill-buffer remote)
+      (should-not (opencode-with-service service (opencode-events-connected-p)))
+      (opencode-test-wait-for (lambda () (let ((opencode-test-service fake))
+                                           (not (seq-some #'process-live-p
+                                                          (opencode-test-service-streams fake))))))
+      (should (opencode-events-connected-p))
+      (should (buffer-live-p local))
+      (let (again)
+        (opencode-with-service service
+          (opencode-session-open-by-id "ses_both" :no-display t :callback (lambda (_) (setq again (current-buffer)))))
+        (opencode-test-wait-for (lambda () again))
+        (opencode-test-wait-for (lambda () (opencode-with-service service (opencode-events-connected-p))))))))
+
 (provide 'opencode-services-test)
 ;;; opencode-services-test.el ends here
