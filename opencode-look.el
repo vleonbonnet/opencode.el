@@ -278,7 +278,7 @@ the selected window or, while the minibuffer is selected, the one
 selected before; `shown' when a window of a visible frame shows it;
 `open' when it has a buffer no such window shows; nil without a buffer.
 See `opencode-session-place-face'."
-  (when-let* ((buffer (gethash id opencode-session-buffers))
+  (when-let* ((buffer (gethash id (opencode-sv opencode-session-buffers)))
               ((buffer-live-p buffer)))
     (cond ((eq (window-buffer (or (minibuffer-selected-window) (selected-window))) buffer) 'active)
           ((get-buffer-window buffer 'visible) 'shown)

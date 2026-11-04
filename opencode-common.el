@@ -86,9 +86,150 @@ The arrows are absent from many programming fonts; naming a font that has
 them avoids an expensive fallback search on every redisplay."
   :group 'opencode-faces)
 
+;;;; Services
+
+;; Emacs may talk to several OpenCode services: the local one, which
+;; it finds and starts, and remote ones, registered by name with
+;; `opencode-service-register', such as another host's reached through
+;; a tunnel.  What a module keeps per service, its registry, event
+;; stream, catalogs, session buffers, is declared with
+;; `opencode-defvar-service' and read with `opencode-sv'.  The local
+;; service keeps it in the variables themselves, as before services
+;; existed, so that code and tests reading them see the local
+;; service's; a remote service keeps it in a table of its own.  Which
+;; service code works for is `opencode-current-service': the one bound
+;; by `opencode-with-service', which every timer, callback and event
+;; handler run for a service binds, else the current buffer's, which
+;; session buffers of remote services set, else the local service.
+
+(cl-defstruct (opencode-svc (:constructor opencode-svc--make)
+                            (:copier nil))
+  "An OpenCode service Emacs talks to.
+Its state lives apart (`opencode--service-states'), so that the object
+prints in proportion to itself wherever it goes."
+  (name nil :documentation "Its name: \"local\", or the name it was registered under.")
+  (label nil :documentation "How buffers and messages name it, or nil for the local service.")
+  (remote nil :documentation "Non-nil for a service registered by name, which Emacs never starts.")
+  (connect nil :documentation "Function of (CALLBACK ERRBACK) calling CALLBACK with a connection plist.")
+  (files nil :documentation "Non-nil when the files its sessions name are this host's files.")
+  (closed nil :documentation "Non-nil once unregistered, until registered again."))
+
+(defvar opencode--local-service
+  (opencode-svc--make :name "local" :files t)
+  "The local service, which Emacs finds through its registration and starts.")
+
+(defvar opencode--services (make-hash-table :test #'equal)
+  "The remote services, by name, registered or closed since.")
+
+(defvar opencode--service-states (make-hash-table :test #'equal)
+  "The state of each remote service, by name: a hash table of variables.")
+
+(defvar opencode--service-variables nil
+  "Variables kept per service, as (SYMBOL . INIT), INIT making a fresh value.")
+
+(defvar opencode--service nil
+  "The service bound for the code running, or nil; see `opencode-current-service'.")
+
+(defvar-local opencode--buffer-service nil
+  "The remote service of this session buffer, or nil for the local service.")
+(put 'opencode--buffer-service 'permanent-local t)
+
+(defmacro opencode-defvar-service (symbol value &optional docstring)
+  "Define SYMBOL as a variable kept per service, VALUE the initial value of each.
+DOCSTRING documents it.  The variable holds the local service's value;
+`opencode-sv' reads the current service's."
+  (declare (indent defun) (doc-string 3))
+  `(progn
+     (defvar ,symbol ,value ,docstring)
+     (setf (alist-get ',symbol opencode--service-variables) (lambda () ,value))
+     ',symbol))
+
+(defun opencode-current-service ()
+  "Return the service the running code works for.
+That is the service `opencode-with-service' bound, else the current
+buffer's when it is a session buffer of a remote service, else the
+local service."
+  (or opencode--service opencode--buffer-service opencode--local-service))
+
+(defsubst opencode--remote-service ()
+  "Return the current service when it is remote, else nil."
+  (let ((service (or opencode--service opencode--buffer-service)))
+    (and service (opencode-svc-remote service) service)))
+
+(defun opencode-service-remote-p (&optional service)
+  "Return non-nil when SERVICE, the current service by default, is remote."
+  (opencode-svc-remote (or service (opencode-current-service))))
+
+(defun opencode-service-label (&optional service)
+  "Return how views name SERVICE, the current one by default; nil for the local service."
+  (let ((service (or service (opencode-current-service))))
+    (and (opencode-svc-remote service)
+         (or (opencode-svc-label service) (opencode-svc-name service)))))
+
+(defun opencode-service-get (name)
+  "Return the service called NAME, \"local\" or a registered one, or nil."
+  (if (member name '(nil "local"))
+      opencode--local-service
+    (gethash name opencode--services)))
+
+(defun opencode-services ()
+  "Return the services: the local one, then the remote ones registered."
+  (cons opencode--local-service
+        (seq-remove #'opencode-svc-closed (hash-table-values opencode--services))))
+
+(defun opencode-service-files-p (&optional service)
+  "Return non-nil when the files SERVICE's sessions name are this host's.
+SERVICE is the current one by default.  The files of a remote service
+are its host's, unless it was registered saying otherwise: Emacs
+neither visits nor processes them."
+  (opencode-svc-files (or service (opencode-current-service))))
+
+(defmacro opencode-with-service (service &rest body)
+  "Run BODY for SERVICE, a service object, or nil for the local service.
+Timers, callbacks and event handlers run for a service bind it so,
+whatever buffer is current when they run."
+  (declare (indent 1) (debug t))
+  `(let ((opencode--service (or ,service opencode--local-service)))
+     ,@body))
+
+(defun opencode--service-state (service)
+  "Return the table of the variables of remote SERVICE, made on first use."
+  (let ((name (opencode-svc-name service)))
+    (or (gethash name opencode--service-states)
+        (puthash name (make-hash-table :test #'eq) opencode--service-states))))
+
+(defun opencode--sv (symbol)
+  "Return the current service's value of SYMBOL, a variable kept per service."
+  (if-let* ((service (opencode--remote-service)))
+      (let* ((state (opencode--service-state service))
+             (value (gethash symbol state 'opencode--unset)))
+        (if (eq value 'opencode--unset)
+            (puthash symbol (funcall (or (alist-get symbol opencode--service-variables)
+                                         (error "%s is not kept per service" symbol)))
+                     state)
+          value))
+    (symbol-value symbol)))
+
+(defun opencode--sv-set (symbol value)
+  "Set the current service's value of SYMBOL, a variable kept per service, to VALUE."
+  (if-let* ((service (opencode--remote-service)))
+      (puthash symbol value (opencode--service-state service))
+    (set symbol value)))
+
+(gv-define-simple-setter opencode--sv opencode--sv-set)
+
+(defmacro opencode-sv (symbol)
+  "Return the current service's value of SYMBOL, a variable kept per service.
+A place: `setf', `push' and `cl-incf' set it."
+  `(opencode--sv ',symbol))
+
+(defun opencode--service-reset (service)
+  "Forget the state of remote SERVICE, for one registered anew under its name."
+  (remhash (opencode-svc-name service) opencode--service-states))
+
 ;;;; Shared state
 
-(defvar opencode-session-buffers (make-hash-table :test #'equal)
+(opencode-defvar-service opencode-session-buffers (make-hash-table :test #'equal)
   "Session IDs mapped to their live session buffers.")
 
 (defvar opencode-session-buffer-functions nil
@@ -108,7 +249,7 @@ They run in the session buffer, after it is registered or unregistered.")
   "Run BODY in the live session buffer of SESSION-ID, if any."
   (declare (indent 1) (debug t))
   (let ((buffer (make-symbol "buffer")))
-    `(when-let* ((,buffer (gethash ,session-id opencode-session-buffers))
+    `(when-let* ((,buffer (gethash ,session-id (opencode-sv opencode-session-buffers)))
                  ((buffer-live-p ,buffer)))
        (with-current-buffer ,buffer
          ,@body))))

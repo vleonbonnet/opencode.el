@@ -128,7 +128,7 @@ its last turn ended unseen, else nil; SUBAGENTS, the kinds of
 `opencode-subagent-icons' its subagents are in, `waiting' first; and
 ARCHIVED, non-nil when it is archived.  It is made again only when the
 registry changed."
-  (let ((key (cons opencode-session-id opencode-state--revision)))
+  (let ((key (cons opencode-session-id (opencode-sv opencode-state--revision))))
     (if (equal key (car opencode--mode-line-registry))
         (cdr opencode--mode-line-registry)
       (let* ((entry (and opencode-session-id (opencode-state-get opencode-session-id)))
@@ -303,7 +303,7 @@ it anew at that pace."
      (opencode--mode-line-stop-animation)
      (message "OpenCode: mode-line animation stopped: %s" (error-message-string err)))))
 
-(defvar opencode--mode-line-registry-timer nil
+(opencode-defvar-service opencode--mode-line-registry-timer nil
   "Timer comparing the mode lines shown with what the registry tells.")
 
 (defun opencode--mode-line-registry-changed (&rest _)
@@ -311,20 +311,20 @@ it anew at that pace."
 For `opencode-state-updated-functions': a turn ending unseen, a session
 viewed, a subagent starting or ending a turn, or a session archived
 show in the mode line, without the session buffer itself changing."
-  (unless (timerp opencode--mode-line-registry-timer)
-    (setq opencode--mode-line-registry-timer
+  (unless (timerp (opencode-sv opencode--mode-line-registry-timer))
+    (setf (opencode-sv opencode--mode-line-registry-timer)
           (run-at-time 0 nil #'opencode--mode-line-registry-check))))
 
 (defun opencode--mode-line-registry-check ()
   "Update the mode lines shown whose part from the registry changed."
-  (setq opencode--mode-line-registry-timer nil)
+  (setf (opencode-sv opencode--mode-line-registry-timer) nil)
   (maphash (lambda (_id buffer)
              (when (and (buffer-live-p buffer) (get-buffer-window buffer t))
                (with-current-buffer buffer
                  (let ((drawn (cdr opencode--mode-line-registry)))
                    (unless (equal drawn (opencode--mode-line-registry-part))
                      (force-mode-line-update))))))
-           opencode-session-buffers))
+           (opencode-sv opencode-session-buffers)))
 
 (add-hook 'opencode-state-updated-functions #'opencode--mode-line-registry-changed)
 
@@ -371,7 +371,7 @@ after each reconnection, so that the displays ask again for the
 catalogs it left stale (see `opencode-catalog-ensure')."
   (let ((key (list opencode-session-agent opencode-session-model opencode-session-tokens
                    opencode-session-tokens-estimated default-directory
-                   (opencode-catalog-location-generation) opencode--catalog-epoch
+                   (opencode-catalog-location-generation) (opencode-sv opencode--catalog-epoch)
                    opencode-provider-icons opencode-agent-faces opencode-default-variant-function
                    opencode-long-context-tiers opencode-long-context-near)))
     (if (equal key (car opencode--mode-line-segments))

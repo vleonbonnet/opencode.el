@@ -239,7 +239,7 @@ without the request yet, or none at all, is opened in the background,
 without display, and loads the session's requests first.  The answer
 goes to the session asking, whose buffer shows it answered as when
 answered there."
-  (let ((buffer (gethash id opencode-session-buffers)))
+  (let ((buffer (gethash id (opencode-sv opencode-session-buffers))))
     (cl-flet ((answer ()
                 ;; From a callback, a signal would only print "error in process filter".
                 (condition-case err
@@ -320,7 +320,7 @@ subagents that have no buffer."
                                 (opencode--subagent-of-p id session))
                        (with-current-buffer buffer
                          (mapc #'add (opencode--own-requests)))))
-                   opencode-session-buffers)))
+                   (opencode-sv opencode-session-buffers))))
       (when registry
         (dolist (entry (cons (opencode-state-get opencode-session-id)
                              (opencode-state-descendants opencode-session-id)))
@@ -464,32 +464,32 @@ through `opencode-session-send', wait the same way."
 
 ;;;; Subagent requests in their parents
 
-(defvar opencode--sync-sessions nil
+(opencode-defvar-service opencode--sync-sessions nil
   "Session IDs whose pending state must reach their parents.")
 
-(defvar opencode--sync-timer nil
+(opencode-defvar-service opencode--sync-timer nil
   "Timer flushing `opencode--sync-sessions'.")
 
 (defun opencode-request-state-changed (&optional session-id)
   "Propagate the pending state of SESSION-ID, this buffer's by default, to its parents.
 Changes are gathered into one timer; each sync recomputes the state."
   (when-let* ((session-id (or session-id opencode-session-id)))
-    (cl-pushnew session-id opencode--sync-sessions :test #'equal)
-    (unless (timerp opencode--sync-timer)
-      (setq opencode--sync-timer (run-at-time 0 nil #'opencode--flush-sync)))))
+    (cl-pushnew session-id (opencode-sv opencode--sync-sessions) :test #'equal)
+    (unless (timerp (opencode-sv opencode--sync-timer))
+      (setf (opencode-sv opencode--sync-timer) (run-at-time 0 nil #'opencode--flush-sync)))))
 
 (defun opencode--flush-sync ()
   "Propagate every changed session's pending state to its parents."
-  (setq opencode--sync-timer nil)
-  (let ((sessions (reverse opencode--sync-sessions)))
-    (setq opencode--sync-sessions nil)
+  (setf (opencode-sv opencode--sync-timer) nil)
+  (let ((sessions (reverse (opencode-sv opencode--sync-sessions))))
+    (setf (opencode-sv opencode--sync-sessions) nil)
     (dolist (session-id sessions)
       (with-demoted-errors "OpenCode subagent request sync: %S"
         (opencode--sync-parents session-id)))))
 
 (defun opencode--child-pending-p (session-id)
   "Return non-nil when the open buffer of SESSION-ID awaits an answer."
-  (when-let* ((buffer (gethash session-id opencode-session-buffers)))
+  (when-let* ((buffer (gethash session-id (opencode-sv opencode-session-buffers))))
     (and (buffer-live-p buffer)
          (with-current-buffer buffer (opencode-pending-request-p))
          t)))
@@ -535,7 +535,7 @@ A request of the subagent call itself keeps precedence."
                      (dolist (overlay overlays)
                        (opencode--set-child-waiting overlay pending))
                      (opencode--update-pending-child session-id)))))
-             opencode-session-buffers)))
+             (opencode-sv opencode-session-buffers))))
 
 (defun opencode--attach-child (overlay)
   "Show whether the subagent run by OVERLAY's block awaits the user."
@@ -554,7 +554,7 @@ A request of the subagent call itself keeps precedence."
 
 (defun opencode--respond-child (session-id)
   "Show child SESSION-ID in the selected window and answer its oldest request."
-  (let ((buffer (gethash session-id opencode-session-buffers)))
+  (let ((buffer (gethash session-id (opencode-sv opencode-session-buffers))))
     (unless (buffer-live-p buffer)
       (user-error "The subagent session is no longer open"))
     (pop-to-buffer-same-window buffer)

@@ -154,7 +154,7 @@ RETRIED is internal."
                   (when (buffer-live-p origin)
                     (with-current-buffer origin
                       (funcall function value))))))
-      (if (not opencode-service-connection)
+      (if (not (opencode-sv opencode-service-connection))
           (opencode-service-ensure
            (lambda (_connection)
              (opencode-request method path :query query :body body :directory directory
@@ -163,7 +163,7 @@ RETRIED is internal."
            (lambda (message)
              (let ((error (opencode-error--make :method method :path path :message message)))
                (if else (deliver else error) (opencode-report-error (opencode-error-describe error))))))
-        (let* ((connection opencode-service-connection)
+        (let* ((connection (opencode-sv opencode-service-connection))
                (url (opencode-request--url connection path query))
                (payload (and body (json-serialize body :null-object :null :false-object :false))))
           (opencode-request--log "%s %s%s" method url (if payload (concat " " payload) ""))
@@ -187,7 +187,7 @@ RETRIED is internal."
                                       (opencode-request--retryable failure connection))))
                      (if reason
                          (progn
-                           (setq opencode-service-connection nil)
+                           (setf (opencode-sv opencode-service-connection) nil)
                            (opencode-request method path :query query :body body
                                              :directory directory :then then :else else
                                              :timeout timeout :buffer buffer :retried t))

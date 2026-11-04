@@ -60,7 +60,7 @@
 
 ;;;; Server data
 
-(defvar opencode--projects nil
+(opencode-defvar-service opencode--projects nil
   "The projects `opencode-fetch-projects' last received, naming sessions in pickers.")
 
 (defun opencode-fetch-projects (callback &optional else)
@@ -68,7 +68,7 @@
 ELSE, when given, receives the `opencode-error' of a failed request."
   (opencode-request 'get "/api/project" :buffer nil :else else
                     :then (lambda (response)
-                            (setq opencode--projects response)
+                            (setf (opencode-sv opencode--projects) response)
                             (funcall callback response))))
 
 (defun opencode-project-for-directory (projects directory)
@@ -200,7 +200,7 @@ settled."
          (origin (current-buffer))
          (cancelled nil)
          (exchange nil)
-         (service (plist-get opencode-service-connection :id))
+         (service (plist-get (opencode-sv opencode-service-connection) :id))
          (query-alist
           `((q . ,query)
             ,@(when (plist-member arguments :archived)
@@ -229,7 +229,7 @@ settled."
           ;; Known to lack the route: fail as it would, after returning.
           (run-at-time 0 nil (lambda ()
                                (apply #'deliver (fail 'unsupported "this OpenCode service cannot search sessions"))))
-        (setq exchange
+        (setf exchange
               (opencode-request
                'get "/api/experimental/session/search" :directory nil :buffer nil :query query-alist
                :then (lambda (response)
@@ -246,7 +246,7 @@ settled."
                                 (cond
                                  ;; An unknown route answers a 404 without an error tag.
                                  ((and (eql status 404) (null (opencode-error-tag error)))
-                                  (when-let* ((id (plist-get opencode-service-connection :id)))
+                                  (when-let* ((id (plist-get (opencode-sv opencode-service-connection) :id)))
                                     (cl-pushnew id opencode-search--unsupported :test #'equal))
                                   (fail 'unsupported "this OpenCode service cannot search sessions"))
                                  ((eql status 400) (fail 'invalid (opencode-error-describe error)))
@@ -309,8 +309,8 @@ directory."
   (let ((id (plist-get entry :project-id))
         (directory (plist-get entry :directory)))
     (when-let* ((project (or (and id (seq-find (lambda (project) (equal (alist-get 'id project) id))
-                                               opencode--projects))
-                             (and directory (opencode-project-for-directory opencode--projects directory))))
+                                               (opencode-sv opencode--projects)))
+                             (and directory (opencode-project-for-directory (opencode-sv opencode--projects) directory))))
                 ;; `opencode-project-name' needs one of them.
                 ((or (alist-get 'name project) (stringp (alist-get 'canonical project))))
                 (name (opencode-project-name project))
@@ -369,7 +369,7 @@ and choosing it returns the symbol `new'.  Return nil when nothing is
 chosen."
   ;; Statuses come from the registry, which needs the event stream.
   (opencode-state-ensure)
-  (unless opencode--projects
+  (unless (opencode-sv opencode--projects)
     ;; Project names only decorate the sessions.
     (with-demoted-errors "OpenCode: cannot name the projects: %S"
       (opencode-wait #'opencode-fetch-projects)))
@@ -478,11 +478,11 @@ chosen."
                (when-let* (((buffer-live-p buffer))
                            (info (buffer-local-value 'opencode-session-info buffer)))
                  (push info infos)))
-             opencode-session-buffers)
+             (opencode-sv opencode-session-buffers))
     (if (null infos)
         (message "No open sessions")
       (when-let* ((info (opencode-read-session "Open session: " infos))
-                  (buffer (gethash (alist-get 'id info) opencode-session-buffers))
+                  (buffer (gethash (alist-get 'id info) (opencode-sv opencode-session-buffers)))
                   ((buffer-live-p buffer)))
         (switch-to-buffer buffer)))))
 

@@ -157,7 +157,7 @@ BODY runs only while ATTEMPT is the buffer's restore attempt in progress."
                   (opencode-error-describe error))))
        :then (opencode--desktop-current attempt (response)
                (let ((info (opencode-request-data response))
-                     (open (gethash id opencode-session-buffers)))
+                     (open (gethash id (opencode-sv opencode-session-buffers))))
                  (cond
                   ((not (equal (alist-get 'id info) id))
                    (opencode--desktop-fail "The service returned another session"))
@@ -205,7 +205,7 @@ A buffer of the session already open is returned instead."
                  (stringp id) (string-match-p "\\`ses_[[:alnum:]_-]+\\'" id)
                  (stringp directory) (not (file-remote-p directory)))
       (error "Invalid OpenCode desktop entry"))
-    (or (let ((buffer (gethash id opencode-session-buffers)))
+    (or (let ((buffer (gethash id (opencode-sv opencode-session-buffers))))
           (and (buffer-live-p buffer) buffer))
         (seq-find (lambda (buffer)
                     (equal id (plist-get (buffer-local-value 'opencode--desktop-data buffer) :session-id)))

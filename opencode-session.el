@@ -254,43 +254,43 @@ See `opencode-catalog-ensure'."
   :type 'natnum
   :group 'opencode)
 
-(defvar opencode--catalogs (make-hash-table :test #'equal)
+(opencode-defvar-service opencode--catalogs (make-hash-table :test #'equal)
   "Location catalogs, keyed by (DIRECTORY . KIND).
 Stale ones, which `opencode--catalog-stale' holds, are included.")
 
-(defvar opencode--catalog-stale (make-hash-table :test #'equal)
+(opencode-defvar-service opencode--catalog-stale (make-hash-table :test #'equal)
   "Keys of the cached catalogs to fetch again before trusting them, mapped to t.")
 
-(defvar opencode--catalog-waiters (make-hash-table :test #'equal)
+(opencode-defvar-service opencode--catalog-waiters (make-hash-table :test #'equal)
   "Callbacks waiting for a catalog fetch in flight, keyed like `opencode--catalogs'.
 Each is (CALLBACK . ELSE); a key is present exactly while its fetch runs.")
 
-(defvar opencode--catalog-scheduled (make-hash-table :test #'equal)
+(opencode-defvar-service opencode--catalog-scheduled (make-hash-table :test #'equal)
   "Keys, like those of `opencode--catalogs', queued in `opencode--catalog-queue'.")
 
-(defvar opencode--catalog-queue nil
+(opencode-defvar-service opencode--catalog-queue nil
   "Keys of the catalogs displays asked for that wait to be fetched, oldest first.")
 
-(defvar opencode--catalog-timer nil
+(opencode-defvar-service opencode--catalog-timer nil
   "Timer starting the queued catalog fetches.")
 
-(defvar opencode--catalog-failed (make-hash-table :test #'equal)
+(opencode-defvar-service opencode--catalog-failed (make-hash-table :test #'equal)
   "Keys whose fetch failed since the stream opened, mapped to t.
 Displays ask at every redisplay, so they do not fetch these again until
 the stream reopens or an event says the catalog changed.")
 
-(defvar opencode--catalog-refetch (make-hash-table :test #'equal)
+(opencode-defvar-service opencode--catalog-refetch (make-hash-table :test #'equal)
   "Keys an event said changed while their fetch ran, mapped to t.
 That fetch may answer from before the change, so another follows it.")
 
-(defvar opencode--missing-locations (make-hash-table :test #'equal)
+(opencode-defvar-service opencode--missing-locations (make-hash-table :test #'equal)
   "Normalized directories the service said do not exist.
 Each maps to t, or to `recheck' once the stream reopened, when displays
 ask for its catalogs once more.  Their catalogs are not asked for again
 until then, or until an event of theirs says a catalog changed; displays
 show identifiers meanwhile.")
 
-(defvar opencode--missing-reported (make-hash-table :test #'equal)
+(opencode-defvar-service opencode--missing-reported (make-hash-table :test #'equal)
   "Normalized directories whose absence was logged, mapped to t, so it is once.")
 
 (defun opencode-location-missing-p (&optional directory)
@@ -298,7 +298,7 @@ show identifiers meanwhile.")
 DIRECTORY defaults to `default-directory'.  Displays reading its
 catalogs show identifiers instead; see `opencode-catalog-ensure'."
   (gethash (opencode-normalize-directory (or directory default-directory))
-           opencode--missing-locations))
+           (opencode-sv opencode--missing-locations)))
 
 (defun opencode-location-not-found-p (error)
   "Return non-nil when request ERROR says its location does not exist.
@@ -309,11 +309,11 @@ such as a session's worktree deleted since."
            (and (eql (opencode-error-status error) 404)
                 (string-prefix-p "Location not found" (or (opencode-error-message error) ""))))))
 
-(defvar opencode--catalog-epoch 0
+(opencode-defvar-service opencode--catalog-epoch 0
   "Count of stream openings.
 A catalog fetched by a request begun before the latest one stays stale.")
 
-(defvar opencode--catalog-generations (make-hash-table :test #'equal)
+(opencode-defvar-service opencode--catalog-generations (make-hash-table :test #'equal)
   "Normalized directories mapped to the count of their catalogs' changes.")
 
 (defvar opencode-catalog-generation 0
@@ -345,11 +345,11 @@ afterwards."
   "Return the cached KIND catalog of DIRECTORY, or nil when not fetched.
 A catalog the stream's reopening left stale is returned too, being most
 likely still current; see `opencode-catalog-ensure'."
-  (gethash (opencode--catalog-key kind directory) opencode--catalogs))
+  (gethash (opencode--catalog-key kind directory) (opencode-sv opencode--catalogs)))
 
 (defun opencode-catalog-cached-p (kind &optional directory)
   "Return non-nil when the KIND catalog of DIRECTORY is cached, even empty or stale."
-  (not (eq (gethash (opencode--catalog-key kind directory) opencode--catalogs 'missing)
+  (not (eq (gethash (opencode--catalog-key kind directory) (opencode-sv opencode--catalogs) 'missing)
            'missing)))
 
 (defun opencode-catalog-location-generation (&optional directory)
@@ -358,26 +358,26 @@ It grows whenever `opencode-catalog-changed-functions' run for
 DIRECTORY, so that values derived from one location's catalogs need not
 be computed again when another location's change."
   (gethash (opencode-normalize-directory (or directory default-directory))
-           opencode--catalog-generations 0))
+           (opencode-sv opencode--catalog-generations) 0))
 
 (defun opencode--catalog-missing-p (key)
   "Return non-nil when catalog KEY is not cached."
-  (eq (gethash key opencode--catalogs 'missing) 'missing))
+  (eq (gethash key (opencode-sv opencode--catalogs) 'missing) 'missing))
 
 (defun opencode--catalog-wanted-p (key)
   "Return non-nil when catalog KEY should be fetched for displays.
 It should when it is missing or stale, and neither fetched, queued, nor
 failed on this stream, and its location exists."
-  (and (or (opencode--catalog-missing-p key) (gethash key opencode--catalog-stale))
-       (not (gethash key opencode--catalog-failed))
-       (not (gethash key opencode--catalog-waiters))
-       (not (gethash key opencode--catalog-scheduled))
-       (not (eq (gethash (car key) opencode--missing-locations) t))))
+  (and (or (opencode--catalog-missing-p key) (gethash key (opencode-sv opencode--catalog-stale)))
+       (not (gethash key (opencode-sv opencode--catalog-failed)))
+       (not (gethash key (opencode-sv opencode--catalog-waiters)))
+       (not (gethash key (opencode-sv opencode--catalog-scheduled)))
+       (not (eq (gethash (car key) (opencode-sv opencode--missing-locations)) t))))
 
-(defvar opencode--mode-line-directories nil
+(opencode-defvar-service opencode--mode-line-directories nil
   "Directories of the session buffers whose mode lines wait to be updated, or t for all.")
 
-(defvar opencode--mode-line-timer nil
+(opencode-defvar-service opencode--mode-line-timer nil
   "Timer updating the mode lines `opencode--mode-line-directories' names.")
 
 (defun opencode--update-mode-lines (&optional directory)
@@ -385,40 +385,40 @@ failed on this stream, and its location exists."
 Only those shown are redrawn, once however many calls a tick makes:
 forcing every mode line of every frame instead costs tens of
 milliseconds with many frames, and so did each catalog arriving."
-  (cond ((null directory) (setq opencode--mode-line-directories t))
-        ((listp opencode--mode-line-directories)
-         (cl-pushnew (opencode-normalize-directory directory) opencode--mode-line-directories
+  (cond ((null directory) (setf (opencode-sv opencode--mode-line-directories) t))
+        ((listp (opencode-sv opencode--mode-line-directories))
+         (cl-pushnew (opencode-normalize-directory directory) (opencode-sv opencode--mode-line-directories)
                      :test #'equal)))
-  (unless (timerp opencode--mode-line-timer)
-    (setq opencode--mode-line-timer (run-at-time 0 nil #'opencode--update-mode-lines-now))))
+  (unless (timerp (opencode-sv opencode--mode-line-timer))
+    (setf (opencode-sv opencode--mode-line-timer) (run-at-time 0 nil #'opencode--update-mode-lines-now))))
 
 (defun opencode--update-mode-lines-now ()
   "Update the mode lines `opencode--update-mode-lines' was asked for."
-  (let ((directories opencode--mode-line-directories))
-    (setq opencode--mode-line-timer nil
-          opencode--mode-line-directories nil)
+  (let ((directories (opencode-sv opencode--mode-line-directories)))
+    (setf (opencode-sv opencode--mode-line-timer) nil
+          (opencode-sv opencode--mode-line-directories) nil)
     (maphash (lambda (_id buffer)
                (when (and (buffer-live-p buffer) (get-buffer-window buffer t))
                  (with-current-buffer buffer
                    (when (or (eq directories t)
                              (member (opencode-normalize-directory default-directory) directories))
                      (force-mode-line-update)))))
-             opencode-session-buffers)))
+             (opencode-sv opencode-session-buffers))))
 
 (defun opencode--catalog-store (key data epoch)
   "Cache DATA as catalog KEY, fetched since stream opening EPOCH.
 Return non-nil when it changed, after updating the mode lines that may
 show it.  DATA stays stale when the stream reopened since the fetch
 began, as the service may have changed meanwhile."
-  (let ((changed (not (equal (gethash key opencode--catalogs 'missing) data))))
-    (puthash key data opencode--catalogs)
-    (remhash key opencode--catalog-failed)
-    (if (= epoch opencode--catalog-epoch)
-        (remhash key opencode--catalog-stale)
-      (puthash key t opencode--catalog-stale))
+  (let ((changed (not (equal (gethash key (opencode-sv opencode--catalogs) 'missing) data))))
+    (puthash key data (opencode-sv opencode--catalogs))
+    (remhash key (opencode-sv opencode--catalog-failed))
+    (if (= epoch (opencode-sv opencode--catalog-epoch))
+        (remhash key (opencode-sv opencode--catalog-stale))
+      (puthash key t (opencode-sv opencode--catalog-stale)))
     (when changed
       (cl-incf opencode-catalog-generation)
-      (cl-incf (gethash (car key) opencode--catalog-generations 0))
+      (cl-incf (gethash (car key) (opencode-sv opencode--catalog-generations) 0))
       (opencode--update-mode-lines (car key)))
     changed))
 
@@ -427,26 +427,26 @@ began, as the service may have changed meanwhile."
 Return non-nil when it was not known.  Its absence is logged once,
 without showing in the echo area, and the displays of its catalogs,
 which show identifiers now, are redrawn."
-  (let ((newly (null (gethash directory opencode--missing-locations))))
-    (puthash directory t opencode--missing-locations)
+  (let ((newly (null (gethash directory (opencode-sv opencode--missing-locations)))))
+    (puthash directory t (opencode-sv opencode--missing-locations))
     (when newly
-      (unless (gethash directory opencode--missing-reported)
-        (puthash directory t opencode--missing-reported)
+      (unless (gethash directory (opencode-sv opencode--missing-reported))
+        (puthash directory t (opencode-sv opencode--missing-reported))
         (let ((inhibit-message t))
           (message "OpenCode: %s does not exist; its sessions show identifiers (%s)"
                    directory (opencode-error-describe error))))
       (cl-incf opencode-catalog-generation)
-      (cl-incf (gethash directory opencode--catalog-generations 0))
+      (cl-incf (gethash directory (opencode-sv opencode--catalog-generations) 0))
       (opencode--update-mode-lines directory))
     newly))
 
 (defun opencode--location-back (directory)
   "Forget that DIRECTORY, normalized, does not exist, as it answered.
 The displays of its catalogs, which showed identifiers, are redrawn."
-  (when (gethash directory opencode--missing-locations)
-    (remhash directory opencode--missing-locations)
+  (when (gethash directory (opencode-sv opencode--missing-locations))
+    (remhash directory (opencode-sv opencode--missing-locations))
     (cl-incf opencode-catalog-generation)
-    (cl-incf (gethash directory opencode--catalog-generations 0))
+    (cl-incf (gethash directory (opencode-sv opencode--catalog-generations) 0))
     (opencode--update-mode-lines directory)))
 
 (defun opencode--catalog-start (key)
@@ -456,12 +456,12 @@ empty answer is asked again before being cached.  A location the
 service says does not exist is remembered (see
 `opencode-location-missing-p'): displays waiting are not told, and no
 display asks for its catalogs again until the stream reopens."
-  (let ((epoch opencode--catalog-epoch)
+  (let ((epoch (opencode-sv opencode--catalog-epoch))
         (directory (car key))
         (kind (cdr key)))
     (cl-labels ((settle (function)
-                  (let ((waiters (nreverse (gethash key opencode--catalog-waiters))))
-                    (remhash key opencode--catalog-waiters)
+                  (let ((waiters (nreverse (gethash key (opencode-sv opencode--catalog-waiters)))))
+                    (remhash key (opencode-sv opencode--catalog-waiters))
                     ;; Its slot is free for the fetches queued.
                     (opencode--catalog-schedule)
                     (funcall function waiters)))
@@ -475,9 +475,9 @@ display asks for its catalogs again until the stream reopens."
                                  (run-at-time 0.5 nil #'fetch (1- retries))
                                (opencode--location-back directory)
                                (let ((changed (opencode--catalog-store key data epoch)))
-                                 (when (gethash key opencode--catalog-refetch)
-                                   (remhash key opencode--catalog-refetch)
-                                   (puthash key t opencode--catalog-stale)
+                                 (when (gethash key (opencode-sv opencode--catalog-refetch))
+                                   (remhash key (opencode-sv opencode--catalog-refetch))
+                                   (puthash key t (opencode-sv opencode--catalog-stale))
                                    (opencode--catalog-enqueue key))
                                  (settle (lambda (waiters)
                                            (dolist (waiter waiters)
@@ -488,8 +488,8 @@ display asks for its catalogs again until the stream reopens."
                    :else (lambda (error)
                            (let* ((gone (opencode-location-not-found-p error))
                                   (newly (and gone (opencode--location-missing directory error))))
-                             (remhash key opencode--catalog-refetch)
-                             (puthash key t opencode--catalog-failed)
+                             (remhash key (opencode-sv opencode--catalog-refetch))
+                             (puthash key t (opencode-sv opencode--catalog-failed))
                              (settle (lambda (waiters)
                                        ;; Displays (`ignore') show identifiers for a location gone.
                                        (when (seq-some (lambda (waiter)
@@ -507,8 +507,8 @@ display asks for its catalogs again until the stream reopens."
 (defun opencode--catalog-join (key callback else)
   "Have the fetch of catalog KEY call CALLBACK, or ELSE when it fails.
 The fetch starts unless one runs."
-  (let ((running (gethash key opencode--catalog-waiters)))
-    (push (cons callback else) (gethash key opencode--catalog-waiters))
+  (let ((running (gethash key (opencode-sv opencode--catalog-waiters))))
+    (push (cons callback else) (gethash key (opencode-sv opencode--catalog-waiters)))
     (unless running
       (opencode--catalog-start key))))
 
@@ -518,8 +518,8 @@ ELSE, when given, receives the `opencode-error' of a failed fetch, which
 is otherwise reported.  A stale catalog is fetched again first, so that
 commands act on the service's current one."
   (let* ((key (opencode--catalog-key kind directory))
-         (cached (gethash key opencode--catalogs 'missing)))
-    (if (or (eq cached 'missing) (gethash key opencode--catalog-stale))
+         (cached (gethash key (opencode-sv opencode--catalogs) 'missing)))
+    (if (or (eq cached 'missing) (gethash key (opencode-sv opencode--catalog-stale)))
         (opencode--catalog-join key callback else)
       (funcall callback cached))))
 
@@ -530,31 +530,31 @@ For commands that prompt with it; see `opencode-wait'."
 
 (defun opencode--catalog-enqueue (key)
   "Queue the fetch of catalog KEY for displays."
-  (unless (gethash key opencode--catalog-scheduled)
-    (puthash key t opencode--catalog-scheduled)
-    (setq opencode--catalog-queue (nconc opencode--catalog-queue (list key))))
+  (unless (gethash key (opencode-sv opencode--catalog-scheduled))
+    (puthash key t (opencode-sv opencode--catalog-scheduled))
+    (setf (opencode-sv opencode--catalog-queue) (nconc (opencode-sv opencode--catalog-queue) (list key))))
   (opencode--catalog-schedule))
 
 (defun opencode--catalog-schedule ()
   "Start the queued catalog fetches from a timer.
 Displays ask at redisplay, and a timer also lets one redisplay's asks
 queue up before any starts."
-  (when (and opencode--catalog-queue (not (timerp opencode--catalog-timer)))
-    (setq opencode--catalog-timer (run-at-time 0 nil #'opencode--catalog-pump))))
+  (when (and (opencode-sv opencode--catalog-queue) (not (timerp (opencode-sv opencode--catalog-timer))))
+    (setf (opencode-sv opencode--catalog-timer) (run-at-time 0 nil #'opencode--catalog-pump))))
 
 (defun opencode--catalog-pump ()
   "Start queued catalog fetches while fewer than `opencode-catalog-requests' run.
 Those of catalogs not cached go first: displays show identifiers until
 they arrive, and a stale catalog meanwhile."
-  (setq opencode--catalog-timer nil)
-  (setq opencode--catalog-queue
-        (append (seq-filter #'opencode--catalog-missing-p opencode--catalog-queue)
-                (seq-remove #'opencode--catalog-missing-p opencode--catalog-queue)))
-  (while (and opencode--catalog-queue
-              (< (hash-table-count opencode--catalog-waiters) (max 1 opencode-catalog-requests)))
-    (let* ((key (pop opencode--catalog-queue))
+  (setf (opencode-sv opencode--catalog-timer) nil)
+  (setf (opencode-sv opencode--catalog-queue)
+        (append (seq-filter #'opencode--catalog-missing-p (opencode-sv opencode--catalog-queue))
+                (seq-remove #'opencode--catalog-missing-p (opencode-sv opencode--catalog-queue))))
+  (while (and (opencode-sv opencode--catalog-queue)
+              (< (hash-table-count (opencode-sv opencode--catalog-waiters)) (max 1 opencode-catalog-requests)))
+    (let* ((key (pop (opencode-sv opencode--catalog-queue)))
            (missing (opencode--catalog-missing-p key)))
-      (remhash key opencode--catalog-scheduled)
+      (remhash key (opencode-sv opencode--catalog-scheduled))
       (when (opencode--catalog-wanted-p key)
         ;; Displays have the stale catalog meanwhile, so failing to
         ;; renew it is not worth a report.
@@ -570,7 +570,7 @@ session buffers are updated and `opencode-catalog-changed-functions'
 run.  A failed fetch is not tried again before the stream reopens or
 an event says the catalog changed."
   (let* ((key (opencode--catalog-key kind directory))
-         (cached (gethash key opencode--catalogs 'missing)))
+         (cached (gethash key (opencode-sv opencode--catalogs) 'missing)))
     (when (opencode--catalog-wanted-p key)
       (opencode--catalog-enqueue key))
     (unless (eq cached 'missing) cached)))
@@ -586,13 +586,13 @@ running may answer from before the change, so another follows it."
                        ("command.updated" '(command)))))
     (dolist (kind kinds)
       (let ((key (cons directory kind)))
-        (remhash key opencode--catalog-failed)
+        (remhash key (opencode-sv opencode--catalog-failed))
         (opencode--location-back directory)
-        (when (gethash key opencode--catalog-waiters)
-          (puthash key t opencode--catalog-refetch))
+        (when (gethash key (opencode-sv opencode--catalog-waiters))
+          (puthash key t (opencode-sv opencode--catalog-refetch)))
         (unless (opencode--catalog-missing-p key)
-          (puthash key t opencode--catalog-stale)
-          (unless (gethash key opencode--catalog-waiters)
+          (puthash key t (opencode-sv opencode--catalog-stale))
+          (unless (gethash key (opencode-sv opencode--catalog-waiters))
             (opencode--catalog-enqueue key)))))))
 
 (defun opencode--catalogs-connected (_event)
@@ -601,11 +601,11 @@ Displays keep showing them, and the first asking for one again fetches
 it, so that a reconnection costs only the requests of the catalogs in
 use, and redraws only for those that changed.  A location said not to
 exist is asked once again, its absence no longer logged."
-  (cl-incf opencode--catalog-epoch)
-  (clrhash opencode--catalog-failed)
-  (maphash (lambda (directory _) (puthash directory 'recheck opencode--missing-locations))
-           opencode--missing-locations)
-  (maphash (lambda (key _) (puthash key t opencode--catalog-stale)) opencode--catalogs))
+  (cl-incf (opencode-sv opencode--catalog-epoch))
+  (clrhash (opencode-sv opencode--catalog-failed))
+  (maphash (lambda (directory _) (puthash directory 'recheck (opencode-sv opencode--missing-locations)))
+           (opencode-sv opencode--missing-locations))
+  (maphash (lambda (key _) (puthash key t (opencode-sv opencode--catalog-stale))) (opencode-sv opencode--catalogs)))
 
 (dolist (type '("agent.updated" "model.updated" "provider.updated" "integration.updated"
                 "command.updated"))
@@ -725,8 +725,8 @@ the server."
   "Release this buffer's process, registration and temporary files."
   (opencode-dismiss-notifications)
   (when (and opencode-session-id
-             (eq (gethash opencode-session-id opencode-session-buffers) (current-buffer)))
-    (remhash opencode-session-id opencode-session-buffers)
+             (eq (gethash opencode-session-id (opencode-sv opencode-session-buffers)) (current-buffer)))
+    (remhash opencode-session-id (opencode-sv opencode-session-buffers))
     (run-hook-with-args 'opencode-session-buffer-functions opencode-session-id))
   (opencode--resync-forget (current-buffer))
   (when-let* ((process (get-buffer-process (current-buffer))))
@@ -869,7 +869,7 @@ is not, since a session buffer follows its session through it.  Return
 the buffer."
   (opencode-events-connect)
   (let* ((id (alist-get 'id info))
-         (existing (gethash id opencode-session-buffers)))
+         (existing (gethash id (opencode-sv opencode-session-buffers))))
     (if (buffer-live-p existing)
         (progn
           (when callback (with-current-buffer existing (funcall callback info)))
@@ -889,7 +889,7 @@ the buffer."
           (setq opencode-session-id id)
           (opencode--adopt-info info)
           (hack-dir-local-variables-non-file-buffer)
-          (puthash id buffer opencode-session-buffers)
+          (puthash id buffer (opencode-sv opencode-session-buffers))
           (opencode--make-process buffer)
           (run-hook-with-args 'opencode-session-buffer-functions id)
           (opencode-session-load
@@ -908,7 +908,7 @@ ELSE, when given, receives the `opencode-error' of a failed request."
 (cl-defun opencode-session-open-by-id (id &key no-display (other-window t) callback else)
   "Open session ID like `opencode-session-open' with NO-DISPLAY, OTHER-WINDOW, CALLBACK.
 ELSE receives the `opencode-error' of a failed request."
-  (if-let* ((buffer (gethash id opencode-session-buffers))
+  (if-let* ((buffer (gethash id (opencode-sv opencode-session-buffers)))
             ((buffer-live-p buffer)))
       (progn
         (when callback (with-current-buffer buffer (funcall callback opencode-session-info)))
@@ -1376,7 +1376,7 @@ reloads."
   (let ((count 0))
     (dolist (buffer (if (and opencode-session-id (not all))
                         (list (current-buffer))
-                      (hash-table-values opencode-session-buffers)))
+                      (hash-table-values (opencode-sv opencode-session-buffers))))
       (when (buffer-live-p buffer)
         (with-current-buffer buffer
           (cl-incf count (opencode-prune-parsers)))))
@@ -2163,7 +2163,7 @@ compaction the transcript fetched meanwhile shows finished already."
        (opencode-with-session-buffer id
          (opencode-dismiss-notifications)
          (opencode-output-notice "This session was deleted" 'error)
-         (remhash id opencode-session-buffers)
+         (remhash id (opencode-sv opencode-session-buffers))
          (run-hook-with-args 'opencode-session-buffer-functions id)))
       ("session.renamed"
        (opencode-with-session-buffer id
@@ -2284,17 +2284,17 @@ and writes it, the buffers shown in a window first."
   "Sizes of the pages of newest messages fetched to find where a buffer is in sync.
 Most buffers missed nothing or a turn, which the small first page finds.")
 
-(defvar opencode--resync-epoch 0
+(opencode-defvar-service opencode--resync-epoch 0
   "Count of the reconnections that had open buffers catch up.
 A catch-up begun before the latest one is abandoned.")
 
-(defvar opencode--resync-queue nil
+(opencode-defvar-service opencode--resync-queue nil
   "Session buffers waiting to catch up, in order.")
 
-(defvar opencode--resync-running nil
+(opencode-defvar-service opencode--resync-running nil
   "Session buffers catching up.")
 
-(defvar opencode--resync-active nil
+(opencode-defvar-service opencode--resync-active nil
   "(EPOCH . DATA): the running sessions as asked once for reconnection EPOCH.
 DATA is the `/api/session/active' data, or `:unknown' when that failed.")
 
@@ -2345,8 +2345,8 @@ now.  CALLBACK receives `:unknown' when the request fails."
   (let ((id opencode-session-id))
     (cl-flet ((answer (data)
                 (funcall callback (if (eq data :unknown) :unknown (assq (intern id) data)))))
-      (if (eql (car opencode--resync-active) epoch)
-          (answer (cdr opencode--resync-active))
+      (if (eql (car (opencode-sv opencode--resync-active)) epoch)
+          (answer (cdr (opencode-sv opencode--resync-active)))
         (opencode-request 'get "/api/session/active" :directory nil
                           :then (lambda (response) (answer (opencode-request-data response)))
                           :else (lambda (_) (answer :unknown)))))))
@@ -2405,12 +2405,12 @@ there; when that one is gone, the whole transcript is.  A catch-up
 begun before another reconnection gives up, without calling THEN."
   (let ((buffer (current-buffer))
         (id opencode-session-id)
-        (epoch opencode--resync-epoch)
+        (epoch (opencode-sv opencode--resync-epoch))
         (location-generation opencode--location-generation)
         (anchor (plist-get opencode--synced :id)))
     (opencode--hold)
     (cl-labels ((current-p ()
-                  (and (buffer-live-p buffer) (= epoch opencode--resync-epoch)))
+                  (and (buffer-live-p buffer) (= epoch (opencode-sv opencode--resync-epoch))))
                 (finish ()
                   (when then (funcall then)))
                 (settle (active rendered)
@@ -2463,32 +2463,32 @@ begun before another reconnection gives up, without calling THEN."
 
 (defun opencode--resync-pump ()
   "Start the queued catch-ups while fewer than `opencode-resync-requests' run."
-  (while (and opencode--resync-queue
-              (< (length opencode--resync-running) (max 1 opencode-resync-requests)))
-    (let ((buffer (pop opencode--resync-queue))
-          (epoch opencode--resync-epoch))
+  (while (and (opencode-sv opencode--resync-queue)
+              (< (length (opencode-sv opencode--resync-running)) (max 1 opencode-resync-requests)))
+    (let ((buffer (pop (opencode-sv opencode--resync-queue)))
+          (epoch (opencode-sv opencode--resync-epoch)))
       (when (buffer-live-p buffer)
-        (push buffer opencode--resync-running)
+        (push buffer (opencode-sv opencode--resync-running))
         (with-current-buffer buffer
           (opencode--resync-buffer
            (lambda ()
-             (when (= epoch opencode--resync-epoch)
-               (setq opencode--resync-running (delq buffer opencode--resync-running))
+             (when (= epoch (opencode-sv opencode--resync-epoch))
+               (setf (opencode-sv opencode--resync-running) (delq buffer (opencode-sv opencode--resync-running)))
                (opencode--resync-pump)))))))))
 
 (defun opencode--resync-enqueue (buffer)
   "Have session BUFFER catch up, after those queued."
   (with-current-buffer buffer
     (opencode--hold))
-  (unless (or (memq buffer opencode--resync-queue) (memq buffer opencode--resync-running))
-    (setq opencode--resync-queue (append opencode--resync-queue (list buffer))))
+  (unless (or (memq buffer (opencode-sv opencode--resync-queue)) (memq buffer (opencode-sv opencode--resync-running)))
+    (setf (opencode-sv opencode--resync-queue) (append (opencode-sv opencode--resync-queue) (list buffer))))
   (opencode--resync-pump))
 
 (defun opencode--resync-forget (buffer)
   "Forget killed BUFFER's catch-up, letting a queued one start."
-  (setq opencode--resync-queue (delq buffer opencode--resync-queue))
-  (when (memq buffer opencode--resync-running)
-    (setq opencode--resync-running (delq buffer opencode--resync-running))
+  (setf (opencode-sv opencode--resync-queue) (delq buffer (opencode-sv opencode--resync-queue)))
+  (when (memq buffer (opencode-sv opencode--resync-running))
+    (setf (opencode-sv opencode--resync-running) (delq buffer (opencode-sv opencode--resync-running)))
     (opencode--resync-pump)))
 
 (defun opencode--resync-all ()
@@ -2496,18 +2496,18 @@ begun before another reconnection gives up, without calling THEN."
 Catch-ups of an earlier reconnection are abandoned and begun again.
 Buffers shown in a window go first; a buffer loading its transcript
 catches up once it is loaded, as it may have been fetched before."
-  (cl-incf opencode--resync-epoch)
+  (cl-incf (opencode-sv opencode--resync-epoch))
   ;; A catch-up loading a whole transcript finishes loading, then
   ;; catches up again; any other stops writing.
-  (dolist (buffer opencode--resync-running)
+  (dolist (buffer (opencode-sv opencode--resync-running))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (unless opencode--loading
           (cl-incf opencode--render-generation)))))
-  (setq opencode--resync-running nil
-        opencode--resync-queue nil
-        opencode--resync-active nil)
-  (let ((epoch opencode--resync-epoch)
+  (setf (opencode-sv opencode--resync-running) nil
+        (opencode-sv opencode--resync-queue) nil
+        (opencode-sv opencode--resync-active) nil)
+  (let ((epoch (opencode-sv opencode--resync-epoch))
         (shown nil)
         (hidden nil))
     (maphash (lambda (_id buffer)
@@ -2517,35 +2517,35 @@ catches up once it is loaded, as it may have been fetched before."
                    (cond (opencode--loading (setq opencode--resync-wanted t))
                          ((get-buffer-window buffer t) (push buffer shown))
                          (t (push buffer hidden))))))
-             opencode-session-buffers)
-    (setq opencode--resync-queue (nconc (nreverse shown) (nreverse hidden)))
-    (when opencode--resync-queue
+             (opencode-sv opencode-session-buffers))
+    (setf (opencode-sv opencode--resync-queue) (nconc (nreverse shown) (nreverse hidden)))
+    (when (opencode-sv opencode--resync-queue)
       ;; Asked once for every buffer; the withheld events correct it.
       (opencode-request
        'get "/api/session/active" :directory nil :buffer nil
        :then (lambda (response)
-               (when (= epoch opencode--resync-epoch)
-                 (setq opencode--resync-active (cons epoch (opencode-request-data response)))
+               (when (= epoch (opencode-sv opencode--resync-epoch))
+                 (setf (opencode-sv opencode--resync-active) (cons epoch (opencode-request-data response)))
                  (opencode--resync-pump)))
        :else (lambda (_)
-               (when (= epoch opencode--resync-epoch)
-                 (setq opencode--resync-active (cons epoch :unknown))
+               (when (= epoch (opencode-sv opencode--resync-epoch))
+                 (setf (opencode-sv opencode--resync-active) (cons epoch :unknown))
                  (opencode--resync-pump)))))))
 
-(defvar opencode--stream-seen nil
+(opencode-defvar-service opencode--stream-seen nil
   "Non-nil once a stream opened in this Emacs; later openings resynchronize.")
 
 (defun opencode--on-connected ()
   "Resynchronize open sessions when a stream reopens."
-  (if opencode--stream-seen
+  (if (opencode-sv opencode--stream-seen)
       (opencode--resync-all)
-    (setq opencode--stream-seen t)))
+    (setf (opencode-sv opencode--stream-seen) t)))
 
 (add-hook 'opencode-events-connected-hook #'opencode--on-connected)
 
 (defun opencode--session-buffers-open-p ()
   "Return non-nil while a session buffer is open, which follows its session on the stream."
-  (seq-some #'buffer-live-p (hash-table-values opencode-session-buffers)))
+  (seq-some #'buffer-live-p (hash-table-values (opencode-sv opencode-session-buffers))))
 
 (add-hook 'opencode-events-wanted-functions #'opencode--session-buffers-open-p)
 
@@ -2702,7 +2702,7 @@ those blocks with their text.  Services without my fork ignore the key."
 ;; Whether it is archived is known locally, so other sessions send as
 ;; before, without a request more.
 
-(defvar opencode--restores (make-hash-table :test #'equal)
+(opencode-defvar-service opencode--restores (make-hash-table :test #'equal)
   "Sessions being restored from the archive for input sent to them.
 Each ID maps to the sends waiting for the restore, newest first, as
 \(BUFFER THEN ELSE); see `opencode--after-restore'.")
@@ -2721,7 +2721,7 @@ buffer opened on an archived session the registry has not fetched yet."
       (when-let* ((buffer (seq-find (lambda (buffer)
                                       (and (buffer-live-p buffer)
                                            (equal (buffer-local-value 'opencode-session-id buffer) id)))
-                                    (list (gethash id opencode-session-buffers) (current-buffer)))))
+                                    (list (gethash id (opencode-sv opencode-session-buffers)) (current-buffer)))))
         (and (alist-get 'archived (alist-get 'time (buffer-local-value 'opencode-session-info buffer)))
              t)))))
 
@@ -2736,15 +2736,15 @@ meanwhile is dropped."
   (let ((id opencode-session-id)
         (waiter (list (current-buffer) then else)))
     (cond
-     ((gethash id opencode--restores)
-      (push waiter (gethash id opencode--restores)))
+     ((gethash id (opencode-sv opencode--restores))
+      (push waiter (gethash id (opencode-sv opencode--restores))))
      ((not (opencode-session-archived-p id))
       (funcall then))
      (t
-      (puthash id (list waiter) opencode--restores)
+      (puthash id (list waiter) (opencode-sv opencode--restores))
       (cl-flet ((settle (restored &rest arguments)
-                  (let ((waiters (reverse (gethash id opencode--restores))))
-                    (remhash id opencode--restores)
+                  (let ((waiters (reverse (gethash id (opencode-sv opencode--restores)))))
+                    (remhash id (opencode-sv opencode--restores))
                     (pcase-dolist (`(,buffer ,then ,else) waiters)
                       (when (buffer-live-p buffer)
                         (with-current-buffer buffer
@@ -2754,7 +2754,7 @@ meanwhile is dropped."
             (opencode-session-archive id t
                                       (lambda (_info) (settle t))
                                       (lambda (error) (settle nil error)))
-          (error (remhash id opencode--restores)
+          (error (remhash id (opencode-sv opencode--restores))
                  (signal (car error) (cdr error)))))))))
 
 (defun opencode--restore-failure (error)
@@ -4032,7 +4032,7 @@ requests that failed, newest first."
 (defun opencode--session-title (id)
   "Return the title of session ID as the registry or its buffer knows it, or nil."
   (or (plist-get (opencode-state-get id) :title)
-      (when-let* ((buffer (gethash id opencode-session-buffers))
+      (when-let* ((buffer (gethash id (opencode-sv opencode-session-buffers)))
                   ((buffer-live-p buffer)))
         (alist-get 'title (buffer-local-value 'opencode-session-info buffer)))))
 
@@ -4056,12 +4056,12 @@ The session needs no buffer.  THEN, when given, is called with no
 argument once the service deleted the session and its buffer is killed;
 ELSE with the `opencode-error' of a refusal, which is otherwise
 reported.  Either is called once, in whatever buffer is current then."
-  (let ((buffer (gethash id opencode-session-buffers)))
+  (let ((buffer (gethash id (opencode-sv opencode-session-buffers))))
     (opencode-request 'delete (concat "/api/session/" id)
                       :directory (opencode-state--directory id) :buffer nil
                       :then (lambda (_)
                               ;; The deletion event may have unregistered the buffer already.
-                              (dolist (buffer (list buffer (gethash id opencode-session-buffers)))
+                              (dolist (buffer (list buffer (gethash id (opencode-sv opencode-session-buffers))))
                                 (when (buffer-live-p buffer) (kill-buffer buffer)))
                               (when then (funcall then)))
                       :else else)))
@@ -4266,7 +4266,7 @@ The session shown in the selected window is marked viewed."
 (defun opencode--view-finished-turn (id _old new)
   "Mark session ID viewed when its turn ended, NEW, while its buffer is active."
   (when-let* (((memq new '(done failed)))
-              (buffer (gethash id opencode-session-buffers))
+              (buffer (gethash id (opencode-sv opencode-session-buffers)))
               ((buffer-live-p buffer))
               ((opencode-buffer-active-p buffer)))
     (opencode-session-view id)))

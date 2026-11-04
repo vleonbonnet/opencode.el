@@ -593,7 +593,7 @@ A session without a buffer gets one in the background, so the request has
 somewhere to wait."
   (let* ((request (alist-get 'data event))
          (session (alist-get 'sessionID request)))
-    (if-let* ((buffer (gethash session opencode-session-buffers))
+    (if-let* ((buffer (gethash session (opencode-sv opencode-session-buffers)))
               ((buffer-live-p buffer)))
         (with-current-buffer buffer (opencode-permission-queue request))
       (opencode-session-open-by-id
