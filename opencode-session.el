@@ -135,7 +135,13 @@ They run before `opencode-session-idle-functions'.")
 Each receives the session info fetched from the server.")
 
 (defvar opencode-last-model nil
-  "Model reference (alist id, providerID, variant) of the last prompt sent.")
+  "Model reference (alist id, providerID, variant) chosen last for a session.
+A model is chosen by switching a session to it (`opencode-switch-model',
+which switching to an agent pinning a model does too) or by creating a
+session on it (`opencode-session-create' given a MODEL).  Sending a
+prompt chooses nothing: a session keeps its model, and its prompts,
+however many, must not make that model the one new sessions start on.
+See `opencode-new-session-model'.")
 (add-to-list 'savehist-additional-variables 'opencode-last-model)
 
 (defvar-local opencode-session-info nil
@@ -619,6 +625,14 @@ exist is asked once again, its absence no longer logged."
                      (equal (alist-get 'providerID entry) .providerID)))
               (opencode-catalog 'model directory))))
 
+(defun opencode-model-unavailable-p (model &optional directory)
+  "Return non-nil when the model catalog of DIRECTORY proves MODEL unavailable.
+MODEL is a model reference.  The catalog proves it once fetched, not
+empty, and without MODEL, as when its provider is down or no longer
+configured; a catalog not fetched or empty proves nothing."
+  (and (opencode-catalog 'model directory)
+       (not (opencode-model-info model directory))))
+
 (defun opencode-provider-info (provider &optional directory)
   "Return the catalog entry of PROVIDER, a provider ID, in DIRECTORY, if fetched."
   (seq-find (lambda (entry) (equal (alist-get 'id entry) provider))
@@ -909,39 +923,54 @@ ELSE receives the `opencode-error' of a failed request."
   "Return the model reference a new session of AGENT in DIRECTORY starts on.
 AGENT nil stands for DIRECTORY's default agent.  The model the agent
 pins comes first, as switching to that agent would select it, then
-`opencode-last-model'; nil leaves the choice to the service.  Agents
-are read from the cached catalog."
+`opencode-last-model', the model chosen last, unless the model catalog
+proves it unavailable (`opencode-model-unavailable-p'), as while its
+provider is down: it is kept, to apply again once the provider is back.
+Nil leaves the choice to the service.  Agents and models are read from
+the cached catalogs."
   (or (alist-get 'model (opencode-agent-info (or agent (opencode-default-agent directory))
                                              directory))
-      opencode-last-model))
+      (and opencode-last-model
+           (not (opencode-model-unavailable-p opencode-last-model directory))
+           opencode-last-model)))
 
 (cl-defun opencode-session-create (&key (directory default-directory) title agent model
                                         callback else no-display)
   "Create a session in DIRECTORY and open it.
 TITLE, AGENT and MODEL (a model reference) are optional; MODEL defaults
-to `opencode-new-session-model'.  CALLBACK runs in the new buffer with
-its info; ELSE receives the `opencode-error' of a failed request, which
-is otherwise reported.  NO-DISPLAY leaves every window alone."
+to `opencode-new-session-model'.  A MODEL given is chosen: once the
+session exists, it becomes `opencode-last-model'.  CALLBACK runs in the
+new buffer with its info; ELSE receives the `opencode-error' of a failed
+request, which is otherwise reported.  NO-DISPLAY leaves every window
+alone."
   (let ((directory (opencode-normalize-directory directory))
         (else (or else (lambda (error) (opencode-report-error (opencode-error-describe error))))))
     (cl-flet ((create ()
-                (let ((model (or model (opencode-new-session-model agent directory))))
+                (let ((runs (or model (opencode-new-session-model agent directory))))
                   (opencode-request
                    'post "/api/session" :directory directory :buffer nil
                    :body `((location . ((directory . ,(opencode-directory-name directory))))
                            ,@(when title `((title . ,title)))
                            ,@(when agent `((agent . ,agent)))
-                           ,@(when model `((model . ,model))))
+                           ,@(when runs `((model . ,runs))))
                    :then (lambda (response)
+                           (when model
+                             (setq opencode-last-model model))
                            (opencode-session-open (opencode-request-data response)
                                                   :no-display no-display
                                                   :callback callback :else else))
                    :else else))))
       (if model
           (create)
-        ;; The pins live in the agent catalog; without it, the last model still applies.
-        (opencode-catalog-fetch 'agent (lambda (_) (create)) directory
-                                (lambda (_) (create)))))))
+        ;; The pins live in the agent catalog, what is available in the
+        ;; model catalog; without them, the last model still applies.
+        (opencode-catalog-fetch
+         'agent
+         (lambda (_)
+           (opencode-catalog-fetch 'model (lambda (_) (create)) directory
+                                   (lambda (_) (create))))
+         directory
+         (lambda (_) (create)))))))
 
 (defun opencode-new-session (&optional title)
   "Create a session in the current project, prompting for TITLE with a prefix."
@@ -2773,8 +2802,6 @@ it."
                             (mapcar (lambda (agent) (list (list :agent (alist-get 'name agent)))) agents)
                             (mapcar (lambda (skill) (list (list :skill (alist-get 'id skill)))) skills))))
        delivery (and input t)))
-    (when opencode-session-model
-      (setq opencode-last-model opencode-session-model))
     ;; The turn shows only through the stream.
     (opencode-events-reopen)
     (let ((path (format "/api/session/%s/prompt" opencode-session-id))

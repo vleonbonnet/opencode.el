@@ -456,16 +456,63 @@ an agent of mode `all'."
                   (kill-buffer (gethash (alist-get 'id info) opencode-session-buffers))
                   (alist-get 'model (car (opencode-test-requests-to 'post "/api/session")))))
         (should (equal (created-model :agent "plan") opencode-test-pinned-model))
-        (should (equal (created-model :agent "plan" :model explicit) explicit))
-        (should (equal (created-model :agent "review") opencode-last-model))
+        (should (equal (created-model :agent "review") '((id . "gpt-6-luna") (providerID . "openai"))))
         ;; Without an agent, the default agent's pin decides.
-        (should (equal (created-model) opencode-last-model))
+        (should (equal (created-model) '((id . "gpt-6-luna") (providerID . "openai"))))
+        ;; A model given is chosen: new sessions start on it from then on.
+        (should (equal (created-model :agent "plan" :model explicit) explicit))
+        (should (equal opencode-last-model explicit))
+        (should (equal (created-model :agent "review") explicit))
         (let ((opencode-test-routes
                (opencode-test-agent-routes
                 `(((id . "plan") (mode . "primary") (model . ,opencode-test-pinned-model))
                   ((id . "build") (mode . "primary"))))))
           (clrhash opencode--catalogs)
           (should (equal (created-model) opencode-test-pinned-model)))))))
+
+(ert-deftest opencode-test-create-skips-unavailable-last-model ()
+  "A last pick the model catalog lacks, its provider down, leaves the model to the service.
+The pick is kept, to apply again once the catalog has it; a catalog that
+cannot be fetched proves nothing."
+  (opencode-test-with-server
+    (let* ((info (alist-get 'data (opencode-test-fixture
+                                   (format "session-%s.json" (opencode-test-scenario "text")))))
+           (gone '((id . "claude-opus-5-5") (providerID . "ai-gateway-anthropic")))
+           (opencode-last-model gone)
+           (opencode-test-routes
+            (cons (list 'post "\\`/api/session\\'" (lambda (_) `((data . ,info))))
+                  (opencode-test-agent-routes))))
+      (cl-flet ((created-body ()
+                  (setq opencode-test-requests nil)
+                  (opencode-session-create :directory opencode-test-workspace :agent "review"
+                                           :no-display t)
+                  (kill-buffer (gethash (alist-get 'id info) opencode-session-buffers))
+                  (car (opencode-test-requests-to 'post "/api/session"))))
+        (should-not (assq 'model (created-body)))
+        (should (opencode-model-unavailable-p gone opencode-test-workspace))
+        (should (equal opencode-last-model gone))
+        (clrhash opencode--catalogs)
+        (let ((opencode-test-routes
+               (cons (list 'get "\\`/api/model\\'" (lambda (_) '(:error 500 "Broken")))
+                     opencode-test-routes)))
+          (should (equal (alist-get 'model (created-body)) gone)))))))
+
+(ert-deftest opencode-test-send-keeps-last-model ()
+  "Sending a prompt chooses no model: new sessions keep starting on the last pick.
+Prompts of a session running another model, as a reply in an older
+session or a scheduled prompt, leave `opencode-last-model' alone; a
+switch of model changes it."
+  (opencode-test-with-server
+    (let ((picked '((id . "gpt-6-luna") (providerID . "openai")))
+          (other '((id . "claude-opus-5-5") (providerID . "ai-gateway-anthropic") (variant . "high"))))
+      (let ((opencode-last-model picked))
+        (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
+          (setq opencode-session-model other)
+          (opencode-session-send "hello")
+          (opencode-session-send "scheduled check" :show t :accept-thinking-loss t)
+          (should (equal opencode-last-model picked))
+          (opencode-switch-model '((id . "gpt-6-sol") (providerID . "openai")) :then #'ignore)
+          (should (equal opencode-last-model '((id . "gpt-6-sol") (providerID . "openai")))))))))
 
 (ert-deftest opencode-test-create-capital-drive ()
   "A session is created in its directory spelled with a capital drive letter."
