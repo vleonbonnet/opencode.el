@@ -8,7 +8,8 @@
 # the results are written to.  The fake service runs in a batch Emacs of
 # its own, from this checkout's tests; the measured GUI Emacs talks to
 # it alone.  Each Emacs runs under a timeout, and both are killed when
-# either grows past 2 GB.
+# either grows past 2 GB.  The GUI Emacs starts through test/gui-emacs.sh,
+# out of the user's sight and focus.
 #
 # BENCH_FRAMES (22), BENCH_OPEN (26), BENCH_RECONNECTS (3) and
 # BENCH_DEADLINE (560 s) shape the run, BENCH_GC_THRESHOLD (100 MiB) the
@@ -39,24 +40,21 @@ while [ ! -s "$root/service.json" ]; do
   sleep 0.2
 done
 
-# A Mac application that quit unexpectedly asks at its next start, in a
-# modal dialog, whether to reopen its windows; the switch skips that.
-timeout -k 10 600 "$emacs" -Q -L "$sources" -L "$deps/plz" -L "$deps/transient" -L "$deps/cond-let" -L "$deps/compat" -L "$deps/llama" \
-  --eval '(push (cons "-ApplePersistenceIgnoreState" (lambda (_) (pop command-line-args-left))) command-switch-alist)' \
-  -ApplePersistenceIgnoreState YES \
+# gui-emacs.sh kills the client past 2 GB, and 600 s.
+"$here/test/gui-emacs.sh" -t 600 "$emacs" -L "$sources" -L "$deps/plz" -L "$deps/transient" -L "$deps/cond-let" -L "$deps/compat" -L "$deps/llama" \
   --eval '(setq load-prefer-newer t)' -l "$here/dev/bench/client.el" > "$root/client.log" 2>&1 &
 client=$!
 
-# Kill both above 2 GB of resident memory.
+# Kill both when the service passes 2 GB of resident memory.
 while kill -0 "$client" 2>/dev/null; do
-  for pid in "$service" "$client"; do
-    rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)
-    if [ -n "$rss" ] && [ "$rss" -gt 2097152 ]; then
-      echo "Process $pid exceeded 2 GB; aborting" >&2
-      kill -9 "$service" "$client" 2>/dev/null || true
-      exit 1
-    fi
-  done
+  rss=$(ps -o rss= -p "$service" 2>/dev/null | tr -d ' ' || true)
+  if [ -n "$rss" ] && [ "$rss" -gt 2097152 ]; then
+    echo "Process $service exceeded 2 GB; aborting" >&2
+    kill -9 "$service" 2>/dev/null || true
+    kill "$client" 2>/dev/null || true
+    wait "$client" || true
+    exit 1
+  fi
   sleep 1
 done
 wait "$client" || true

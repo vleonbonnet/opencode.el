@@ -217,12 +217,13 @@ Session buffers are saved with the desktop by session ID, directory and point, a
 
 * Development
 
-| Command         | Runs                                                            |
-|-----------------+-----------------------------------------------------------------|
-| =make test=     | every ERT test in a batch =emacs -Q=                            |
-| =make test-gui= | the tests that need a graphical frame, in a separate =emacs -Q= |
-| =make compile=  | byte compilation with warnings as errors                        |
-| =make lint=     | checkdoc                                                        |
+| Command                | Runs                                                                                               |
+|------------------------+----------------------------------------------------------------------------------------------------|
+| =make test=            | every ERT test in a batch =emacs -Q=                                                               |
+| =make test-one FILE=F= | the tests of one file F, or those of them =SELECTOR=, a regexp, matches, in a batch =emacs -Q=     |
+| =make test-gui=        | the tests that need a graphical frame, in a separate =emacs -Q= out of sight (=test/gui-emacs.sh=) |
+| =make compile=         | byte compilation with warnings as errors                                                           |
+| =make lint=            | checkdoc                                                                                           |
 
 =dev/bench/run.sh SOURCES OUT= measures how long the main thread is held when the event stream reconnects, in a graphical =emacs -Q= with 22 frames showing session buffers among 26 open with long transcripts, moody and minions, talking to a fake service in a batch Emacs of its own, where agents work while the stream is down: see =doc/design.org=.
 
