@@ -202,7 +202,11 @@ request among them first (see `opencode-tree-requests')."
   "Return the line naming this buffer's session, heading a request answered in place."
   (concat (propertize (or (alist-get 'title opencode-session-info) opencode-session-id)
                       'face 'bold)
-          (propertize (concat "  " (abbreviate-file-name default-directory)) 'face 'shadow)
+          (propertize (concat "  " (if (opencode-service-files-p)
+                                       (abbreviate-file-name default-directory)
+                                     (format "%s on %s" (or (opencode-location) "")
+                                             (opencode-service-label))))
+                      'face 'shadow)
           "\n"))
 
 (defun opencode--respond-in-place ()

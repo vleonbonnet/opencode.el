@@ -70,6 +70,12 @@ following output, to be restored at the end of the transcript then."
                 (list :follow t)))))
 
 (defun opencode--desktop-track ()
+  "Save this buffer with the desktop, unless its session is a remote service's.
+Such a buffer opens through its host's peer, not from a desktop."
+  (unless opencode--buffer-service
+    (opencode--desktop-track-1)))
+
+(defun opencode--desktop-track-1 ()
   "Save this buffer with the desktop."
   (setq-local desktop-save-buffer #'opencode-desktop-save)
   (add-hook 'kill-buffer-hook #'opencode--desktop-stop nil t))

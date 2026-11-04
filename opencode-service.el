@@ -106,6 +106,47 @@ While it runs, the waiters wait for it rather than look for a service.")
 (defvar opencode-service--import-interval 1
   "Seconds between two import status requests.")
 
+;;;; Remote services
+
+(defvar opencode-service-registered-functions nil
+  "Abnormal hook run with a remote service as it is registered, for it.")
+
+(cl-defun opencode-service-register (name &key label connect files)
+  "Register the remote OpenCode service NAME, a string, and return it.
+CONNECT is a function of two arguments, CALLBACK and ERRBACK, telling
+how to reach the service: it calls CALLBACK, now or later, with a
+connection plist (:url URL :password PASSWORD :id ID :version VERSION),
+URL being an http URL or a relay's, relay://NAME (see
+`opencode-transport-register-relay'), or ERRBACK with a line telling
+why it cannot.  It is asked again whenever the service cannot be
+reached or refuses the password.  LABEL names the service in buffer
+names, mode lines and messages, NAME by default.  FILES non-nil says
+the files its sessions name are this host's, which they are not by
+default: Emacs then neither visits, processes nor links them.
+
+Emacs never starts, restarts nor stops a remote service.  Its session
+buffers follow it through an event stream of its own, open while any
+is; its registry holds their sessions and those around them, not every
+session of the service.  Registering NAME again updates it, and opens
+it again once unregistered (see `opencode-service-unregister'), its
+buffers following it anew."
+  (unless (and (stringp name) (string-match-p "\\`[A-Za-z0-9][A-Za-z0-9._-]*\\'" name)
+               (not (equal name "local")))
+    (error "Invalid name of an OpenCode service: %S" name))
+  (unless (functionp connect)
+    (error "OpenCode service %s needs a function telling how to reach it" name))
+  (let ((service (or (gethash name opencode--services)
+                     (puthash name (opencode-svc--make :name name :remote t) opencode--services))))
+    (setf (opencode-svc-label service) label
+          (opencode-svc-connect service) connect
+          (opencode-svc-files service) files
+          (opencode-svc-closed service) nil)
+    ;; Asked anew: its provider may know another way now.
+    (opencode-with-service service
+      (setf (opencode-sv opencode-service-connection) nil)
+      (run-hook-with-args 'opencode-service-registered-functions service))
+    service))
+
 (defun opencode-service-registration-file ()
   "Return the service registration file name."
   (or opencode-service-registration-file
@@ -359,10 +400,14 @@ The waiters get the connection once its service answers; a remote
 service is never started nor waited for to import anything."
   (let ((label (opencode-service-label service)))
     (cl-flet ((fail (text)
-                (opencode-with-service service
-                  (opencode-service--finish lookup nil text))))
+                ;; Never before `opencode-service-ensure' returns.
+                (run-at-time 0 nil (lambda ()
+                                     (opencode-with-service service
+                                       (opencode-service--finish lookup nil text))))))
       (condition-case err
-          (funcall (opencode-svc-connect service)
+          (if (opencode-svc-closed service)
+              (fail (format "The OpenCode service of %s is closed" label))
+            (funcall (opencode-svc-connect service)
                    (lambda (connection)
                      (opencode-with-service service
                        (cond
@@ -377,7 +422,7 @@ service is never started nor waited for to import anything."
                                 (opencode-service--finish lookup connection nil)
                               (fail (format "The OpenCode service of %s does not answer" label)))))))))
                    (lambda (text)
-                     (fail (format "Cannot reach the OpenCode service of %s: %s" label text))))
+                     (fail (format "Cannot reach the OpenCode service of %s: %s" label text)))))
         (error (fail (format "Cannot reach the OpenCode service of %s: %s"
                              label (error-message-string err))))))))
 

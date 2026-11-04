@@ -424,6 +424,48 @@ whose stream reopens as one of them asks for the service."
   (opencode-events--drop)
   (setf (opencode-sv opencode-service-connection) nil))
 
+(defun opencode-events--service-registered (_service)
+  "Open the stream of the current service, registered, when something needs it.
+For `opencode-service-registered-functions': session buffers of a
+service registered again follow it anew."
+  (when (opencode-events--wants-p)
+    (opencode-events-connect)))
+
+(add-hook 'opencode-service-registered-functions #'opencode-events--service-registered)
+
+(defvar opencode-service-unregistered-functions nil
+  "Abnormal hook run with a remote service as it is unregistered.
+It runs for that service, which modules close their part of.")
+
+(defun opencode-service-unregister (service)
+  "Close remote SERVICE, a service or its name.
+Its event stream closes, requests waiting for it fail, and its session
+buffers stay, saying they no longer follow their sessions, until it is
+registered again (see `opencode-service-register')."
+  (let ((service (if (stringp service) (opencode-service-get service) service)))
+    (when (and service (opencode-svc-remote service) (not (opencode-svc-closed service)))
+      (setf (opencode-svc-closed service) t)
+      (opencode-with-service service
+        (opencode-disconnect)
+        (let ((waiters (nreverse (opencode-sv opencode-service--waiters))))
+          (setf (opencode-sv opencode-service--waiters) nil)
+          (cl-incf (opencode-sv opencode-service--lookup))
+          (dolist (waiter waiters)
+            (when (cdr waiter)
+              (with-demoted-errors "OpenCode: %S"
+                (funcall (cdr waiter) (format "The OpenCode service of %s was closed"
+                                              (opencode-service-label service)))))))
+        (opencode-events--run-hook 'opencode-service-unregistered-functions service)))))
+
+(defun opencode-events--run-hook (hook &rest arguments)
+  "Run HOOK with ARGUMENTS, an error of one function not stopping the others."
+  (apply #'run-hook-wrapped hook
+         (lambda (function &rest arguments)
+           (with-demoted-errors "OpenCode hook: %S"
+             (apply function arguments))
+           nil)
+         arguments))
+
 (defun opencode-service-stop (&optional callback errback)
   "Stop the shared service, then call CALLBACK with no argument.
 ERRBACK, when given, receives an error message instead on failure.

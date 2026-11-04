@@ -564,8 +564,9 @@ session's directory as a string, without the file system."
 
 (defun opencode-resolve-file-reference (file)
   "Return the absolute name of existing regular FILE, else nil.
-Relative names are tried against the project root and `default-directory'."
-  (when (and (stringp file) (not (string-empty-p file)))
+Relative names are tried against the project root and `default-directory'.
+A remote service's files are its host's: none resolves here."
+  (when (and (stringp file) (not (string-empty-p file)) (opencode-service-files-p))
     (seq-find (lambda (candidate)
                 (and candidate (file-regular-p candidate)))
               (delete-dups

@@ -2577,11 +2577,43 @@ catches up once it is loaded, as it may have been fetched before."
                  (setf (opencode-sv opencode--resync-active) (cons epoch :unknown))
                  (opencode--resync-pump)))))))
 
+(defun opencode--service-closed (service)
+  "Stop what the session buffers of the current service run, SERVICE unregistered.
+For `opencode-service-unregistered-functions': their catch-ups and
+catalog fetches stop, and each says in its header line that it no
+longer follows its session, until the service is registered again and
+its stream reopens."
+  (dolist (timer (list (opencode-sv opencode--catalog-timer) (opencode-sv opencode--mode-line-timer)))
+    (when (timerp timer) (cancel-timer timer)))
+  (setf (opencode-sv opencode--catalog-timer) nil
+        (opencode-sv opencode--mode-line-timer) nil
+        (opencode-sv opencode--catalog-queue) nil
+        (opencode-sv opencode--resync-queue) nil
+        (opencode-sv opencode--resync-running) nil)
+  (clrhash (opencode-sv opencode--catalog-scheduled))
+  (cl-incf (opencode-sv opencode--resync-epoch))
+  (let ((text (format "%s's OpenCode service is closed: this buffer no longer follows its session"
+                      (opencode-service-label service))))
+    (maphash (lambda (_id buffer)
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq-local header-line-format (propertize text 'face 'warning)))))
+             (opencode-sv opencode-session-buffers))))
+
+(add-hook 'opencode-service-unregistered-functions #'opencode--service-closed)
+
 (opencode-defvar-service opencode--stream-seen nil
   "Non-nil once a stream opened in this Emacs; later openings resynchronize.")
 
 (defun opencode--on-connected ()
-  "Resynchronize open sessions when a stream reopens."
+  "Resynchronize open sessions when a stream reopens.
+A remote service's buffers that said it was closed follow it again."
+  (when (opencode--remote-service)
+    (maphash (lambda (_id buffer)
+               (when (and (buffer-live-p buffer) (local-variable-p 'header-line-format buffer))
+                 (with-current-buffer buffer
+                   (kill-local-variable 'header-line-format))))
+             (opencode-sv opencode-session-buffers)))
   (if (opencode-sv opencode--stream-seen)
       (opencode--resync-all)
     (setf (opencode-sv opencode--stream-seen) t)))

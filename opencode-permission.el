@@ -59,8 +59,12 @@ Each is a plist (:id :action :resources :save :metadata :source :reasons
 ;;;; Titles
 
 (defun opencode--permission-path (path)
-  "Return PATH for display: relative inside the session directory, else abbreviated."
-  (when (and path (not (string-empty-p path)))
+  "Return PATH for display: relative inside the session directory, else abbreviated.
+A remote service's path is its host's, made relative as a string."
+  (when (and path (not (string-empty-p path)) (not (opencode-service-files-p)))
+    (setq path (let ((relative (opencode-relative-path-for-display path)))
+                 (if (equal relative "") "." relative))))
+  (when (and path (not (string-empty-p path)) (opencode-service-files-p))
     (let* ((expanded (expand-file-name path))
            (relative (file-relative-name expanded default-directory)))
       (if (string-prefix-p ".." relative)

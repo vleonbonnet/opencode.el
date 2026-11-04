@@ -299,6 +299,38 @@ accepting after a few connections, so one server serves the whole run.")
                                                                  connection output)))))
   opencode-test--server)
 
+(defun opencode-test-make-service (password)
+  "Return another fake service, listening on a port of its own, with PASSWORD.
+It stands for the service of another host, which the helpers above
+serve while `opencode-test-service' is bound to it: as its own server's
+filter binds it."
+  (let* ((service (opencode-test-service--make :password password :pid 5151))
+         (server (make-network-process
+                  :name "opencode-test-other-service" :server t
+                  :host "127.0.0.1" :service t :family 'ipv4
+                  :noquery t :coding 'binary
+                  :filter (lambda (connection output)
+                            (process-put connection 'opencode-test-service service)
+                            (let ((opencode-test-service service))
+                              (opencode-test--filter service connection output))))))
+    (setf (opencode-test-service-server service) server
+          (opencode-test-service-port service) (process-contact server :service))
+    service))
+
+(defun opencode-test-close-service (service)
+  "Stop SERVICE, made by `opencode-test-make-service': its server and connections."
+  (dolist (connection (append (opencode-test-service-streams service)
+                              (opencode-test-service-held service)))
+    (when (process-live-p connection) (delete-process connection)))
+  (dolist (process (process-list))
+    ;; Connections it accepted are named after its server.
+    (when (and (not (eq process (opencode-test-service-server service)))
+               (eq (process-type process) 'network)
+               (eq (process-get process 'opencode-test-service) service))
+      (delete-process process)))
+  (when (process-live-p (opencode-test-service-server service))
+    (delete-process (opencode-test-service-server service))))
+
 (defmacro opencode-test-with-service (&rest body)
   "Run BODY with `opencode-test-service' serving a fresh registration."
   (declare (indent 0) (debug t))

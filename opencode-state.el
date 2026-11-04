@@ -1303,6 +1303,21 @@ registry missed, having been loaded after it."
 
 (opencode-events-register "server.connected" #'opencode-state--connected)
 
+(defun opencode-state--service-closed (_service)
+  "Stop what the registry of the current service runs, which was unregistered.
+For `opencode-service-unregistered-functions': its answers in flight are
+dropped, and it bootstraps anew once its stream reopens."
+  (opencode-state--cancel-retry)
+  (dolist (timer (list (opencode-sv opencode-state--context-timer) (opencode-sv opencode-state--cache-timer)))
+    (when (timerp timer) (cancel-timer timer)))
+  (setf (opencode-sv opencode-state--context-timer) nil
+        (opencode-sv opencode-state--cache-timer) nil
+        (opencode-sv opencode-state--ready) nil
+        (opencode-sv opencode-state--bootstrapping) nil)
+  (cl-incf (opencode-sv opencode-state--generation)))
+
+(add-hook 'opencode-service-unregistered-functions #'opencode-state--service-closed)
+
 (defun opencode-state--wants-events ()
   "Return non-nil once the registry has clients, which it keeps current from the stream."
   (opencode-sv opencode-state--wanted))
@@ -1695,7 +1710,7 @@ While a listing is in flight, the event waits for its answer."
   (or (plist-get (opencode-state-get id) :directory)
       (when-let* ((buffer (gethash id (opencode-sv opencode-session-buffers)))
                   ((buffer-live-p buffer)))
-        (buffer-local-value 'default-directory buffer))))
+        (with-current-buffer buffer (opencode-location)))))
 
 (defun opencode-session-view (id &optional idle then else)
   "Mark session ID viewed up to IDLE, its last idle time by default.
