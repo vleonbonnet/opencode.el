@@ -313,10 +313,16 @@ viewed, a subagent starting or ending a turn, or a session archived
 show in the mode line, without the session buffer itself changing."
   (unless (timerp (opencode-sv opencode--mode-line-registry-timer))
     (setf (opencode-sv opencode--mode-line-registry-timer)
-          (run-at-time 0 nil #'opencode--mode-line-registry-check))))
+          (apply #'run-at-time 0 nil #'opencode--mode-line-registry-check (opencode--timer-arguments)))))
 
-(defun opencode--mode-line-registry-check ()
-  "Update the mode lines shown whose part from the registry changed."
+(defun opencode--mode-line-registry-check (&optional service)
+  "Update the mode lines shown whose part from the registry changed.
+They are those of SERVICE's session buffers, nil for the local one."
+  (opencode-with-service service
+    (opencode--mode-line-registry-check-1)))
+
+(defun opencode--mode-line-registry-check-1 ()
+  "Update the current service's mode lines, as `opencode--mode-line-registry-check'."
   (setf (opencode-sv opencode--mode-line-registry-timer) nil)
   (maphash (lambda (_id buffer)
              (when (and (buffer-live-p buffer) (get-buffer-window buffer t))
@@ -332,7 +338,7 @@ show in the mode line, without the session buffer itself changing."
   "Return the session title in buffer NAME, without the OpenCode wrapper.
 NAME defaults to the current buffer's name; a uniquifying <N> suffix stays."
   (let ((name (or name (buffer-name))))
-    (if (string-match "\\`\\*OpenCode: \\(.*\\)\\*\\(<[0-9]+>\\)?\\'" name)
+    (if (string-match "\\`\\*OpenCode\\(?:@[^:]*\\)?: \\(.*\\)\\*\\(<[0-9]+>\\)?\\'" name)
         (concat (match-string 1 name) (match-string 2 name))
       name)))
 
@@ -370,7 +376,7 @@ changed, as the mode line is redrawn on every streamed chunk, and once
 after each reconnection, so that the displays ask again for the
 catalogs it left stale (see `opencode-catalog-ensure')."
   (let ((key (list opencode-session-agent opencode-session-model opencode-session-tokens
-                   opencode-session-tokens-estimated default-directory
+                   opencode-session-tokens-estimated (opencode-location)
                    (opencode-catalog-location-generation) (opencode-sv opencode--catalog-epoch)
                    opencode-provider-icons opencode-agent-faces opencode-default-variant-function
                    opencode-long-context-tiers opencode-long-context-near)))
@@ -553,7 +559,14 @@ string, so that a frame changing fits nothing again."
   "Return the session status, title and details fitted to the selected window.
 The tab is made at every call, as moody draws the selected window's
 differently, and the status icon, which shows the frame of its
-animation the clock tells (see `opencode-session-status-animations')."
+animation the clock tells (see `opencode-session-status-animations').
+It is drawn for the buffer's own service, whatever code redisplay
+interrupted."
+  (opencode-with-service opencode--buffer-service
+    (opencode--mode-line-1)))
+
+(defun opencode--mode-line-1 ()
+  "Return the mode line of this session buffer, as `opencode-mode-line'."
   (let* ((status (opencode--mode-line-status))
          (frames (plist-get status :frames))
          (fitted (opencode--mode-line-fit-window (plist-get status :still)

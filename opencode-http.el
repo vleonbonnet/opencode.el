@@ -125,41 +125,50 @@ goes to `message'."
 (defun opencode-request--retryable (failure connection)
   "Return a retry reason for transport FAILURE seen on CONNECTION, or nil.
 `password' when the registration changed after a 401, `refused' when no
-connection could be made or it closed without an answer."
+connection could be made or it closed without an answer.  A remote
+service's provider is asked again after a 401: it may know a new
+password."
   (pcase (opencode-transport-failure-reason failure)
     ('http
      (when (eql (opencode-transport-failure-status failure) 401)
-       (let ((registered (opencode-service-read-registration)))
+       (let ((registered (if (opencode--remote-service)
+                             '(:password :ask)
+                           (opencode-service-read-registration))))
          (and registered
               (not (equal (plist-get registered :password)
                           (plist-get connection :password)))
               'password))))
     ((or 'refused 'closed) 'refused)))
 
-(cl-defun opencode-request (method path &key query body (directory default-directory)
+(cl-defun opencode-request (method path &key query body (directory (opencode-location))
                                    (then #'ignore) else timeout (buffer (current-buffer))
                                    retried)
   "Send METHOD on PATH and call THEN with the decoded response.
-QUERY is an alist of query parameters; BODY is encoded as JSON.
-DIRECTORY scopes location routes; nil sends no directory.  THEN and
-ELSE run in BUFFER when it is live, and are skipped once it is killed;
-BUFFER nil runs them in whatever buffer is current.  ELSE receives an
-`opencode-error'; without ELSE, failures are reported with
-`opencode-report-error'.  TIMEOUT defaults to `opencode-request-timeout'.
-RETRIED is internal."
-  (let ((origin buffer))
+The request goes to the current service (see `opencode-current-service'),
+and THEN and ELSE run for it.  QUERY is an alist of query parameters;
+BODY is encoded as JSON.  DIRECTORY scopes location routes, by default
+the current buffer's location (see `opencode-location'); nil sends no
+directory.  THEN and ELSE run in BUFFER when it is live, and are skipped
+once it is killed; BUFFER nil runs them in whatever buffer is current.
+ELSE receives an `opencode-error'; without ELSE, failures are reported
+with `opencode-report-error'.  TIMEOUT defaults to
+`opencode-request-timeout'.  RETRIED is internal."
+  (let ((origin buffer)
+        (service (opencode--remote-service)))
     (cl-flet ((deliver (function value)
-                (if (null origin)
-                    (funcall function value)
-                  (when (buffer-live-p origin)
-                    (with-current-buffer origin
-                      (funcall function value))))))
+                (opencode-with-service service
+                  (if (null origin)
+                      (funcall function value)
+                    (when (buffer-live-p origin)
+                      (with-current-buffer origin
+                        (funcall function value)))))))
       (if (not (opencode-sv opencode-service-connection))
           (opencode-service-ensure
            (lambda (_connection)
-             (opencode-request method path :query query :body body :directory directory
-                               :then then :else else :timeout timeout :buffer buffer
-                               :retried retried))
+             (opencode-with-service service
+               (opencode-request method path :query query :body body :directory directory
+                                 :then then :else else :timeout timeout :buffer buffer
+                                 :retried retried)))
            (lambda (message)
              (let ((error (opencode-error--make :method method :path path :message message)))
                (if else (deliver else error) (opencode-report-error (opencode-error-describe error))))))
@@ -183,19 +192,20 @@ RETRIED is internal."
                    (opencode-request--log "OK %s %s" method path)
                    (deliver then result))
            :else (lambda (failure)
-                   (let ((reason (and (not retried)
-                                      (opencode-request--retryable failure connection))))
-                     (if reason
-                         (progn
-                           (setf (opencode-sv opencode-service-connection) nil)
-                           (opencode-request method path :query query :body body
-                                             :directory directory :then then :else else
-                                             :timeout timeout :buffer buffer :retried t))
-                       (let ((error (opencode-request--error method path failure)))
-                         (opencode-request--log "ERROR %s" (opencode-error-describe error))
-                         (if else
-                             (deliver else error)
-                           (opencode-report-error (opencode-error-describe error)))))))))))))
+                   (opencode-with-service service
+                     (let ((reason (and (not retried)
+                                        (opencode-request--retryable failure connection))))
+                       (if reason
+                           (progn
+                             (setf (opencode-sv opencode-service-connection) nil)
+                             (opencode-request method path :query query :body body
+                                               :directory directory :then then :else else
+                                               :timeout timeout :buffer buffer :retried t))
+                         (let ((error (opencode-request--error method path failure)))
+                           (opencode-request--log "ERROR %s" (opencode-error-describe error))
+                           (if else
+                               (deliver else error)
+                             (opencode-report-error (opencode-error-describe error))))))))))))))
 
 (defun opencode-request-sync (method path &rest arguments)
   "Send METHOD on PATH synchronously and return the decoded response.

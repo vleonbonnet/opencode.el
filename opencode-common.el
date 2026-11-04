@@ -223,6 +223,14 @@ whatever buffer is current when they run."
 A place: `setf', `push' and `cl-incf' set it."
   `(opencode--sv ',symbol))
 
+(defun opencode--timer-arguments ()
+  "Return the arguments telling a timer's function the current service.
+Nil for the local service, whose functions take none, as before
+services existed; the remote service otherwise.  Functions run by such
+timers take it as their last optional argument and bind it."
+  (when-let* ((service (opencode--remote-service)))
+    (list service)))
+
 (defun opencode--service-reset (service)
   "Forget the state of remote SERVICE, for one registered anew under its name."
   (remhash (opencode-svc-name service) opencode--service-states))
@@ -342,6 +350,33 @@ per session at every redisplay, and resolving the symbolic links of one
 costs a file system call per component.  A link changed meanwhile is
 seen once this passes.")
 
+(defvar-local opencode-session-location nil
+  "The directory of this buffer's session, as its remote service spells it.
+Nil in the session buffers of the local service, whose
+`default-directory' is their session's directory; a remote service's
+directories are its host's, so its session buffers are in this host's
+home and keep their session's here.")
+
+(defun opencode-location ()
+  "Return the directory requests made here are scoped to, or nil.
+For the local service, `default-directory'.  For a remote one, the
+directory of the current buffer's session when it is one of that
+service's session buffers, else nil: this host's directories mean
+nothing to another host's service."
+  (if-let* ((service (opencode--remote-service)))
+      (and (eq opencode--buffer-service service) opencode-session-location)
+    default-directory))
+
+(defun opencode--remote-directory (directory)
+  "Return DIRECTORY, a remote service's, as a directory name spelled as it spells it.
+Nothing is resolved: the directory is that service's host's.
+Backslashes become slashes and a drive letter is upcased, as OpenCode
+spells directories on Windows."
+  (let ((name (string-replace "\\" "/" directory)))
+    (when (string-match-p "\\`[a-z]:" name)
+      (setq name (concat (upcase (substring name 0 1)) (substring name 1))))
+    (if (string-suffix-p "/" name) name (concat name "/"))))
+
 (defun opencode-normalize-directory (directory)
   "Return DIRECTORY as a canonical absolute directory name.
 Symbolic links are resolved, so one project reached through two paths
@@ -349,7 +384,15 @@ maps to one location.  On Windows a network share is named by the drive
 mapped to it, as a link to the drive resolves, and the drive letter is
 upcased, as the server spells it: it keys locations by the exact string
 it receives.  A name resolved in the last `opencode--directory-name-ttl'
-seconds is not resolved again."
+seconds is not resolved again.  For a remote service, the directory is
+its host's, only spelled as that service spells it (see
+`opencode--remote-directory')."
+  (if (opencode--remote-service)
+      (opencode--remote-directory directory)
+    (opencode--normalize-local-directory directory)))
+
+(defun opencode--normalize-local-directory (directory)
+  "Return local DIRECTORY normalized, as `opencode-normalize-directory' says."
   (let* ((name (if (file-name-absolute-p directory) directory (expand-file-name directory)))
          (now (float-time))
          (known (gethash name opencode--directory-names)))
@@ -368,7 +411,10 @@ seconds is not resolved again."
   "Return DIRECTORY as the server names it: normalized, with no trailing slash.
 On Windows `directory-file-name' lowercases the drive letter again, so
 it is upcased after it; otherwise one directory would be two locations."
-  (opencode--upcase-drive (directory-file-name (opencode-normalize-directory directory))))
+  (if (opencode--remote-service)
+      (let ((name (opencode--remote-directory directory)))
+        (if (string-match-p "\\`\\(?:[A-Z]:\\)?/\\'" name) name (substring name 0 -1)))
+    (opencode--upcase-drive (directory-file-name (opencode-normalize-directory directory)))))
 
 (defun opencode-same-directory-p (a b)
   "Return non-nil when directory names A and B name the same directory."
@@ -382,7 +428,14 @@ File references are resolved on every streamed chunk; walking the
 parents of a directory each time to find its project was measurable.")
 
 (defun opencode-project-directory (&optional directory)
-  "Return the project root of DIRECTORY, else DIRECTORY itself."
+  "Return the project root of DIRECTORY, else DIRECTORY itself.
+A remote service's directory is its own root: its host's files are not here."
+  (if (opencode--remote-service)
+      (opencode-normalize-directory (or directory (opencode-location) "/"))
+    (opencode--local-project-directory directory)))
+
+(defun opencode--local-project-directory (directory)
+  "Return the project root of local DIRECTORY, else DIRECTORY itself."
   (let* ((directory (or directory default-directory))
          (cache (or opencode--project-cache
                     (setq opencode--project-cache (make-hash-table :test #'equal)))))
@@ -483,8 +536,19 @@ Comparing true names stats every directory of both, and a transcript
 names the same files again and again.")
 
 (defun opencode-relative-path-for-display (file)
-  "Return FILE relative to the current project root when inside it."
-  (when file
+  "Return FILE relative to the current project root when inside it.
+For a remote service, FILE is its host's: it is made relative to its
+session's directory as a string, without the file system."
+  (cond
+   ((null file) nil)
+   ((opencode--remote-service)
+    (let ((root (opencode-project-directory))
+          (name (string-replace "\\" "/" file)))
+      (if (and (stringp root) (string-prefix-p root name (string-match-p "\\`[A-Z]:" root))
+               (> (length name) (length root)))
+          (substring name (length root))
+        file)))
+   (t
     (let* ((root (opencode-project-directory))
            (key (cons root file)))
       (or (gethash key opencode--display-paths)
@@ -496,7 +560,7 @@ names the same files again and again.")
                      (if (and (file-name-absolute-p file) (file-in-directory-p file root))
                          (file-relative-name file root)
                        file)
-                     opencode--display-paths))))))
+                     opencode--display-paths)))))))
 
 (defun opencode-resolve-file-reference (file)
   "Return the absolute name of existing regular FILE, else nil.

@@ -160,7 +160,7 @@ FUNCTION receives the event alist with members `type', `data', `id',
     (setcdr (opencode-sv opencode-events--queue) cell))
   (unless (timerp (opencode-sv opencode-events--dispatch-timer))
     (setf (opencode-sv opencode-events--dispatch-timer)
-          (run-at-time 0 nil #'opencode-events--dispatch))))
+          (apply #'run-at-time 0 nil #'opencode-events--dispatch (opencode--timer-arguments)))))
 
 (defun opencode-events--frame (start end)
   "Decode the SSE frame between START and END in the stream buffer."
@@ -207,7 +207,9 @@ FUNCTION receives the event alist with members `type', `data', `id',
       (with-current-buffer (get-buffer-create "*opencode-events*")
         (save-excursion
           (goto-char (point-max))
-          (insert (format-time-string "%T ") (or type "?") "\n"))))
+          (insert (format-time-string "%T ")
+                  (if-let* ((label (opencode-service-label))) (concat "@" label " ") "")
+                  (or type "?") "\n"))))
     (when (equal type "server.connected")
       (setf (opencode-sv opencode-events--backoff) 1
             (opencode-sv opencode-events--greeted) (opencode-sv opencode-events--stream)))
@@ -221,8 +223,14 @@ FUNCTION receives the event alist with members `type', `data', `id',
     (when (equal type "server.connected")
       (run-hooks 'opencode-events-connected-hook))))
 
-(defun opencode-events--dispatch ()
-  "Dispatch queued events until the queue empties or the budget is spent."
+(defun opencode-events--dispatch (&optional service)
+  "Dispatch queued events of SERVICE until its queue empties or the budget is spent.
+SERVICE is nil for the local service.  Handlers run for it."
+  (opencode-with-service service
+    (opencode-events--dispatch-1)))
+
+(defun opencode-events--dispatch-1 ()
+  "Dispatch the current service's queued events, as `opencode-events--dispatch'."
   (setf (opencode-sv opencode-events--dispatch-timer) nil)
   (let ((deadline (+ (float-time) opencode-events-dispatch-budget)))
     (while (and (opencode-sv opencode-events--queue) (< (float-time) deadline))
@@ -233,12 +241,12 @@ FUNCTION receives the event alist with members `type', `data', `id',
         (opencode-events--handle event)))
     (when (opencode-sv opencode-events--queue)
       (setf (opencode-sv opencode-events--dispatch-timer)
-            (run-at-time 0 nil #'opencode-events--dispatch)))))
+            (apply #'run-at-time 0 nil #'opencode-events--dispatch (opencode--timer-arguments))))))
 
 (defun opencode-events-dispatch-now ()
-  "Dispatch every queued event at once."
+  "Dispatch every queued event of the current service at once."
   (while (opencode-sv opencode-events--queue)
-    (opencode-events--dispatch)))
+    (opencode-events--dispatch-1)))
 
 ;;;; Lifecycle
 
@@ -251,10 +259,12 @@ That is a client of `opencode-events-wanted-functions'."
   "Reopen the stream after the current backoff, while it is still wanted."
   (when (and (opencode-sv opencode-events--wanted) (not (timerp (opencode-sv opencode-events--reconnect-timer))))
     (setf (opencode-sv opencode-events--reconnect-timer)
-          (run-at-time (opencode-sv opencode-events--backoff) nil
-                       (lambda ()
-                         (setf (opencode-sv opencode-events--reconnect-timer) nil)
-                         (opencode-events--open))))
+          (let ((service (opencode--remote-service)))
+            (run-at-time (opencode-sv opencode-events--backoff) nil
+                         (lambda ()
+                           (opencode-with-service service
+                             (setf (opencode-sv opencode-events--reconnect-timer) nil)
+                             (opencode-events--open))))))
     (setf (opencode-sv opencode-events--backoff) (min 30 (* 2 (opencode-sv opencode-events--backoff))))))
 
 (defun opencode-events--closed (stream)
@@ -283,13 +293,18 @@ is late."
             (opencode-sv opencode-events--last-output) (min (opencode-sv opencode-events--last-output) now)))
     (setf (opencode-sv opencode-events--last-watch) now)))
 
-(defun opencode-events--watch ()
+(defun opencode-events--watch (&optional service)
   "Reopen a stream that stopped producing heartbeats, or one left closed.
 A stream counts as silent only for the time Emacs could have read its
 output, see `opencode-events--note-resumption'.  Nothing should leave a
 wanted stream closed with no reconnection scheduled or waiting for a
 service, but if anything does, this reopens it rather than leave
-session buffers stale."
+session buffers stale.  SERVICE, nil for the local one, owns the stream."
+  (opencode-with-service service
+    (opencode-events--watch-1)))
+
+(defun opencode-events--watch-1 ()
+  "Watch the current service's stream, as `opencode-events--watch'."
   (let ((now (float-time)))
     (opencode-events--note-resumption now)
     (cond
@@ -311,23 +326,28 @@ session buffers stale."
       (setf (opencode-sv opencode-events--reconnect-timer) nil))
     (setf (opencode-sv opencode-events--last-output) (float-time))
     (let ((buffer (generate-new-buffer " *opencode-events*" t))
+          (service (opencode--remote-service))
           stream)
       (with-current-buffer buffer
         (set-buffer-multibyte nil))
       (cl-flet ((closed ()
                   (when (buffer-live-p buffer) (kill-buffer buffer))
-                  (opencode-events--closed stream)))
+                  (opencode-with-service service
+                    (opencode-events--closed stream))))
         (condition-case err
             (setf stream
                   (opencode-transport-request
                    'get (concat (plist-get connection :url) "/api/event")
                    :headers `(("Authorization" . ,(opencode-service-authorization connection))
                               ("Accept" . "text/event-stream"))
-                   :filter (lambda (_stream output) (opencode-events--filter buffer output))
+                   :filter (lambda (_stream output)
+                             (opencode-with-service service
+                               (opencode-events--filter buffer output)))
                    :then (lambda (_) (closed))
                    :else (lambda (failure)
                            (when (eql 401 (opencode-transport-failure-status failure))
-                             (setf (opencode-sv opencode-service-connection) nil))
+                             (opencode-with-service service
+                               (setf (opencode-sv opencode-service-connection) nil)))
                            (closed)))
                   (opencode-sv opencode-events--stream) stream
                   (opencode-sv opencode-events--connection) connection)
@@ -342,14 +362,17 @@ session buffers stale."
              (not (opencode-events-connected-p))
              (not (opencode-sv opencode-events--opening)))
     (setf (opencode-sv opencode-events--opening) t)
-    (let ((handle (opencode-service-ensure
-                   (lambda (connection)
-                     (setf (opencode-sv opencode-events--opening) nil)
-                     (opencode-events--start connection))
-                   (lambda (message)
-                     (setf (opencode-sv opencode-events--opening) nil)
-                     (message "OpenCode: %s" message)
-                     (opencode-events--schedule-reconnect)))))
+    (let* ((service (opencode--remote-service))
+           (handle (opencode-service-ensure
+                    (lambda (connection)
+                      (opencode-with-service service
+                        (setf (opencode-sv opencode-events--opening) nil)
+                        (opencode-events--start connection)))
+                    (lambda (message)
+                      (opencode-with-service service
+                        (setf (opencode-sv opencode-events--opening) nil)
+                        (message "OpenCode: %s" message)
+                        (opencode-events--schedule-reconnect))))))
       ;; Unless it settled already.
       (when (opencode-sv opencode-events--opening)
         (setf (opencode-sv opencode-events--opening) handle)))))
@@ -360,9 +383,10 @@ session buffers stale."
         (opencode-sv opencode-events--closed-for-stop) nil)
   (unless (timerp (opencode-sv opencode-events--watchdog))
     (setf (opencode-sv opencode-events--last-watch) (float-time)
-          (opencode-sv opencode-events--watchdog) (run-at-time opencode-events--watch-interval
-                                                 opencode-events--watch-interval
-                                                 #'opencode-events--watch))))
+          (opencode-sv opencode-events--watchdog) (apply #'run-at-time opencode-events--watch-interval
+                                                               opencode-events--watch-interval
+                                                               #'opencode-events--watch
+                                                               (opencode--timer-arguments)))))
 
 (defun opencode-events-connect (&optional callback)
   "Open the event stream, then call CALLBACK with the service connection."
@@ -381,7 +405,9 @@ so that it shows even when the stream was lost.  A stream closed by
     (opencode-events--open)))
 
 (defun opencode-disconnect ()
-  "Close the event stream.  The shared service keeps running."
+  "Close the event stream of the current service.  The service keeps running.
+That is the local service but in a remote service's session buffers,
+whose stream reopens as one of them asks for the service."
   (interactive)
   (setf (opencode-sv opencode-events--wanted) nil
         (opencode-sv opencode-events--closed-for-stop) nil)
@@ -407,7 +433,8 @@ and the stream then reopens while session buffers are open or the
 session registry has clients; otherwise the next session opened
 reconnects.  Every client loses the service, and running turns resume
 once one starts, though their current step starts over, so
-interactively this asks first while any runs."
+interactively this asks first while any runs.  It is the local
+service, whatever the current buffer: Emacs never stops a remote one."
   (interactive)
   (when (process-live-p opencode-service--starter)
     (user-error "An OpenCode service start, restart or stop is already running"))
@@ -417,6 +444,11 @@ interactively this asks first while any runs."
     (unless (yes-or-no-p (format "%d OpenCode session%s running a turn; stop the service anyway? "
                                  running (if (= running 1) " is" "s are")))
       (user-error "Stop cancelled")))
+  (opencode-with-service nil
+    (opencode-service--stop-local callback errback)))
+
+(defun opencode-service--stop-local (callback errback)
+  "Stop the local service, then call CALLBACK, else ERRBACK, as `opencode-service-stop'."
   (opencode-disconnect)
   (setf (opencode-sv opencode-events--closed-for-stop) t)
   (opencode-service--stop

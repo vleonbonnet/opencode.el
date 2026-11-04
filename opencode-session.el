@@ -295,9 +295,10 @@ show identifiers meanwhile.")
 
 (defun opencode-location-missing-p (&optional directory)
   "Return non-nil when the service said DIRECTORY does not exist.
-DIRECTORY defaults to `default-directory'.  Displays reading its
-catalogs show identifiers instead; see `opencode-catalog-ensure'."
-  (gethash (opencode-normalize-directory (or directory default-directory))
+DIRECTORY defaults to the current location (see `opencode-location').
+Displays reading its catalogs show identifiers instead; see
+`opencode-catalog-ensure'."
+  (gethash (opencode-normalize-directory (or directory (opencode-location) "/"))
            (opencode-sv opencode--missing-locations)))
 
 (defun opencode-location-not-found-p (error)
@@ -338,8 +339,10 @@ afterwards."
   "Catalog kinds and their routes.")
 
 (defun opencode--catalog-key (kind directory)
-  "Return the key of the KIND catalog of DIRECTORY, by default `default-directory'."
-  (cons (opencode-normalize-directory (or directory default-directory)) kind))
+  "Return the key of the KIND catalog of DIRECTORY, by default the current location.
+See `opencode-location'; a remote service's catalogs without a location
+are those of its root."
+  (cons (opencode-normalize-directory (or directory (opencode-location) "/")) kind))
 
 (defun opencode-catalog (kind &optional directory)
   "Return the cached KIND catalog of DIRECTORY, or nil when not fetched.
@@ -357,7 +360,7 @@ likely still current; see `opencode-catalog-ensure'."
 It grows whenever `opencode-catalog-changed-functions' run for
 DIRECTORY, so that values derived from one location's catalogs need not
 be computed again when another location's change."
-  (gethash (opencode-normalize-directory (or directory default-directory))
+  (gethash (opencode-normalize-directory (or directory (opencode-location) "/"))
            (opencode-sv opencode--catalog-generations) 0))
 
 (defun opencode--catalog-missing-p (key)
@@ -390,10 +393,17 @@ milliseconds with many frames, and so did each catalog arriving."
          (cl-pushnew (opencode-normalize-directory directory) (opencode-sv opencode--mode-line-directories)
                      :test #'equal)))
   (unless (timerp (opencode-sv opencode--mode-line-timer))
-    (setf (opencode-sv opencode--mode-line-timer) (run-at-time 0 nil #'opencode--update-mode-lines-now))))
+    (setf (opencode-sv opencode--mode-line-timer)
+          (apply #'run-at-time 0 nil #'opencode--update-mode-lines-now (opencode--timer-arguments)))))
 
-(defun opencode--update-mode-lines-now ()
-  "Update the mode lines `opencode--update-mode-lines' was asked for."
+(defun opencode--update-mode-lines-now (&optional service)
+  "Update the mode lines `opencode--update-mode-lines' was asked for.
+They are those of SERVICE, nil for the local one."
+  (opencode-with-service service
+    (opencode--update-mode-lines-1)))
+
+(defun opencode--update-mode-lines-1 ()
+  "Update the current service's mode lines, as `opencode--update-mode-lines-now'."
   (let ((directories (opencode-sv opencode--mode-line-directories)))
     (setf (opencode-sv opencode--mode-line-timer) nil
           (opencode-sv opencode--mode-line-directories) nil)
@@ -401,7 +411,7 @@ milliseconds with many frames, and so did each catalog arriving."
                (when (and (buffer-live-p buffer) (get-buffer-window buffer t))
                  (with-current-buffer buffer
                    (when (or (eq directories t)
-                             (member (opencode-normalize-directory default-directory) directories))
+                             (member (opencode-normalize-directory (opencode-location)) directories))
                      (force-mode-line-update)))))
              (opencode-sv opencode-session-buffers))))
 
@@ -458,7 +468,8 @@ service says does not exist is remembered (see
 display asks for its catalogs again until the stream reopens."
   (let ((epoch (opencode-sv opencode--catalog-epoch))
         (directory (car key))
-        (kind (cdr key)))
+        (kind (cdr key))
+        (service (opencode--remote-service)))
     (cl-labels ((settle (function)
                   (let ((waiters (nreverse (gethash key (opencode-sv opencode--catalog-waiters)))))
                     (remhash key (opencode-sv opencode--catalog-waiters))
@@ -472,7 +483,9 @@ display asks for its catalogs again until the stream reopens."
                    :then (lambda (response)
                            (let ((data (opencode-request-data response)))
                              (if (and (null data) (> retries 0))
-                                 (run-at-time 0.5 nil #'fetch (1- retries))
+                                 (run-at-time 0.5 nil (lambda ()
+                                                        (opencode-with-service service
+                                                          (fetch (1- retries)))))
                                (opencode--location-back directory)
                                (let ((changed (opencode--catalog-store key data epoch)))
                                  (when (gethash key (opencode-sv opencode--catalog-refetch))
@@ -540,12 +553,19 @@ For commands that prompt with it; see `opencode-wait'."
 Displays ask at redisplay, and a timer also lets one redisplay's asks
 queue up before any starts."
   (when (and (opencode-sv opencode--catalog-queue) (not (timerp (opencode-sv opencode--catalog-timer))))
-    (setf (opencode-sv opencode--catalog-timer) (run-at-time 0 nil #'opencode--catalog-pump))))
+    (setf (opencode-sv opencode--catalog-timer)
+          (apply #'run-at-time 0 nil #'opencode--catalog-pump (opencode--timer-arguments)))))
 
-(defun opencode--catalog-pump ()
+(defun opencode--catalog-pump (&optional service)
   "Start queued catalog fetches while fewer than `opencode-catalog-requests' run.
 Those of catalogs not cached go first: displays show identifiers until
-they arrive, and a stale catalog meanwhile."
+they arrive, and a stale catalog meanwhile.  They are SERVICE's, nil
+for the local one."
+  (opencode-with-service service
+    (opencode--catalog-pump-1)))
+
+(defun opencode--catalog-pump-1 ()
+  "Start the current service's queued catalog fetches, as `opencode--catalog-pump'."
   (setf (opencode-sv opencode--catalog-timer) nil)
   (setf (opencode-sv opencode--catalog-queue)
         (append (seq-filter #'opencode--catalog-missing-p (opencode-sv opencode--catalog-queue))
@@ -722,7 +742,13 @@ the server."
   (user-error "%s" (opencode--comint-refusal this-original-command)))
 
 (defun opencode--session-cleanup ()
-  "Release this buffer's process, registration and temporary files."
+  "Release this buffer's process, registration and temporary files.
+For `kill-buffer-hook': whatever kills it, its own service's registration."
+  (opencode-with-service opencode--buffer-service
+    (opencode--session-cleanup-1)))
+
+(defun opencode--session-cleanup-1 ()
+  "Release this buffer's process, registration and files, as `opencode--session-cleanup'."
   (opencode-dismiss-notifications)
   (when (and opencode-session-id
              (eq (gethash opencode-session-id (opencode-sv opencode-session-buffers)) (current-buffer)))
@@ -807,22 +833,34 @@ resize."
 ;;;; Opening sessions
 
 (defun opencode-session-buffer-name (info)
-  "Return the buffer name of session INFO."
-  (format "*OpenCode: %s*" (or (alist-get 'title info) (alist-get 'id info))))
+  "Return the buffer name of session INFO, of the current service.
+A remote service's is named after it, as \"*OpenCode@core: Title*\"."
+  (format "*OpenCode%s: %s*"
+          (if-let* ((label (opencode-service-label))) (concat "@" label) "")
+          (or (alist-get 'title info) (alist-get 'id info))))
 
 (defun opencode--session-directory (info)
   "Return the directory of session INFO."
   (opencode-normalize-directory (alist-get 'directory (alist-get 'location info))))
 
 (defun opencode--adopt-location (info)
-  "Adopt the confirmed location in session INFO or a move event's data."
-  (setq default-directory (opencode--session-directory info)
-        list-buffers-directory default-directory)
+  "Adopt the confirmed location in session INFO or a move event's data.
+A remote service's session keeps it in `opencode-session-location': the
+buffer stays in this host's home, the directory being the other host's."
+  (if (opencode--remote-service)
+      (setq opencode-session-location (opencode--session-directory info)
+            default-directory (expand-file-name "~/")
+            list-buffers-directory opencode-session-location)
+    (setq default-directory (opencode--session-directory info)
+          list-buffers-directory default-directory))
   (dolist (field '(location projectID subpath))
     (setf (alist-get field opencode-session-info nil t) (alist-get field info))))
 
 (defun opencode--cd (original directory)
-  "Ask the server to move this session when ORIGINAL `cd' selects DIRECTORY."
+  "Ask the server to move this session when ORIGINAL `cd' selects DIRECTORY.
+A session of a remote service is not moved: DIRECTORY is this host's."
+  (when (and (derived-mode-p 'opencode-session-mode) opencode-session-id opencode--buffer-service)
+    (user-error "This session runs on %s: its directory is that host's" (opencode-service-label)))
   (if (not (and (derived-mode-p 'opencode-session-mode) opencode-session-id))
       (funcall original directory)
     (let ((destination
@@ -869,6 +907,7 @@ is not, since a session buffer follows its session through it.  Return
 the buffer."
   (opencode-events-connect)
   (let* ((id (alist-get 'id info))
+         (service (opencode--remote-service))
          (existing (gethash id (opencode-sv opencode-session-buffers))))
     (if (buffer-live-p existing)
         (progn
@@ -879,6 +918,10 @@ the buffer."
           (let ((inhibit-read-only t))
             (erase-buffer))
           (setq buffer-read-only nil)
+          ;; Before the mode, whose hooks run for its service.
+          (setq opencode--buffer-service service)
+          (when service
+            (setq default-directory (expand-file-name "~/")))
           (opencode-session-mode)
           ;; A window takes the insertion type of its point, which keeps
           ;; it after output, and its margins when shown the buffer: one
@@ -888,7 +931,9 @@ the buffer."
             (set-window-buffer window buffer))
           (setq opencode-session-id id)
           (opencode--adopt-info info)
-          (hack-dir-local-variables-non-file-buffer)
+          ;; A remote session's directory is not here.
+          (unless service
+            (hack-dir-local-variables-non-file-buffer))
           (puthash id buffer (opencode-sv opencode-session-buffers))
           (opencode--make-process buffer)
           (run-hook-with-args 'opencode-session-buffer-functions id)
@@ -2213,7 +2258,7 @@ compaction the transcript fetched meanwhile shows finished already."
                  (cl-incf opencode--location-generation)
                  (opencode--adopt-location data)
                  (unless shown
-                   (opencode-output-notice (format "Moved to %s" default-directory)))
+                   (opencode-output-notice (format "Moved to %s" (opencode-location))))
                  (opencode--note-message message))))
             (force-mode-line-update))))))))
 
@@ -4251,7 +4296,8 @@ The read marker is the service's, so every client sees it read."
   (let ((buffer (window-buffer (selected-window))))
     (when-let* ((id (buffer-local-value 'opencode-session-id buffer))
                 ((opencode-buffer-active-p buffer)))
-      (opencode-session-view id))))
+      (opencode-with-service (buffer-local-value 'opencode--buffer-service buffer)
+        (opencode-session-view id)))))
 
 (defun opencode--selection-changed (&optional _frame)
   "Remember the selected session buffer and forget its idle alert.

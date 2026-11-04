@@ -476,10 +476,17 @@ Changes are gathered into one timer; each sync recomputes the state."
   (when-let* ((session-id (or session-id opencode-session-id)))
     (cl-pushnew session-id (opencode-sv opencode--sync-sessions) :test #'equal)
     (unless (timerp (opencode-sv opencode--sync-timer))
-      (setf (opencode-sv opencode--sync-timer) (run-at-time 0 nil #'opencode--flush-sync)))))
+      (setf (opencode-sv opencode--sync-timer)
+            (apply #'run-at-time 0 nil #'opencode--flush-sync (opencode--timer-arguments))))))
 
-(defun opencode--flush-sync ()
-  "Propagate every changed session's pending state to its parents."
+(defun opencode--flush-sync (&optional service)
+  "Propagate every changed session's pending state to its parents.
+The sessions are SERVICE's, nil for the local one."
+  (opencode-with-service service
+    (opencode--flush-sync-1)))
+
+(defun opencode--flush-sync-1 ()
+  "Propagate the current service's changed sessions, as `opencode--flush-sync'."
   (setf (opencode-sv opencode--sync-timer) nil)
   (let ((sessions (reverse (opencode-sv opencode--sync-sessions))))
     (setf (opencode-sv opencode--sync-sessions) nil)
@@ -572,7 +579,8 @@ A request of the subagent call itself keeps precedence."
 
 (defun opencode--forget-child ()
   "Clear this killed session's pending state from its parents."
-  (opencode-request-state-changed))
+  (opencode-with-service opencode--buffer-service
+    (opencode-request-state-changed)))
 
 (add-hook 'opencode-blocks-attach-functions #'opencode--attach-child)
 (add-hook 'opencode-open-link-functions #'opencode--open-subagent)

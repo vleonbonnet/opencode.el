@@ -159,6 +159,13 @@ A session deleted on this stream maps to `deleted'.  Entries of the
 previous stream are not current, and events do not apply to them: their
 session is fetched first.")
 
+(opencode-defvar-service opencode-state--ignored (make-hash-table :test #'equal)
+  "IDs of the sessions a remote service's registry does not follow, mapped to t.
+A remote service's registry holds only the sessions of its buffers and
+those around them (see `opencode-state--followed-p'): one fetched for
+an event and found unrelated is not fetched again until the stream
+reconnects or a buffer opens on it.")
+
 (opencode-defvar-service opencode-state--listing nil
   "Non-nil while the sessions after the first page are listed.")
 
@@ -832,10 +839,15 @@ fetches them."
                       (opencode-state--store id nil))
                      (t
                       (opencode-state--put result)
-                      (dolist (event events)
-                        (opencode-state--dispatch id event t))
-                      (when-let* ((parent (plist-get (opencode-state-get id) :parent-id)))
-                        (push parent parents)))))))))
+                      (if (not (opencode-state--followed-p id))
+                          (progn
+                            (puthash id t (opencode-sv opencode-state--ignored))
+                            (remhash id (opencode-sv opencode-state--current))
+                            (opencode-state--store id nil))
+                        (dolist (event events)
+                          (opencode-state--dispatch id event t))
+                        (when-let* ((parent (plist-get (opencode-state-get id) :parent-id)))
+                          (push parent parents))))))))))
            (when-let* (((and (opencode-sv opencode-state--loaded) (not (opencode-sv opencode-state--listing))))
                        (wanted (seq-filter #'opencode-state--parent-wanted-p (delete-dups parents))))
              (opencode-state--fetch wanted))))))))
@@ -874,6 +886,7 @@ REPLAY is passed to `opencode-state--apply'."
       ;; A current entry is at least as recent as its creation.
       ((opencode-state--current-p id))
       ((opencode-state-get id) (opencode-state--fetch (list id) event))
+      ((not (opencode-state--follows-new-p event)))
       (t
        ;; A new session has no usage yet.
        (puthash id 'known (opencode-sv opencode-state--contexts))
@@ -893,7 +906,40 @@ REPLAY is passed to `opencode-state--apply'."
          ;; Before the hooks run, which may ask for the context size.
          (opencode-state--context-follow id event)
          (opencode-state--store id entry)))
-      (t (opencode-state--fetch (list id) event))))))
+      ((opencode-state--fetches-for-p id event) (opencode-state--fetch (list id) event))))))
+
+(defun opencode-state--follows-new-p (event)
+  "Return non-nil when the registry follows the session `session.created' EVENT announces.
+The local service's follows every session; a remote one's, those of its
+buffers and their subagents (see `opencode-state--followed-p')."
+  (or (not (opencode--remote-service))
+      (let ((id (alist-get 'sessionID (alist-get 'data event)))
+            (parent (alist-get 'parentID (alist-get 'data event))))
+        (or (opencode-state--retained-p id)
+            (and parent (opencode-state-get parent) t)))))
+
+(defun opencode-state--fetches-for-p (id event)
+  "Return non-nil when EVENT of session ID, not held current, has it fetched.
+The local service's registry fetches any session; a remote one's, only
+a session it may follow: one with a buffer, else, for an event that
+changes a status, one not found unrelated already."
+  (or (not (opencode--remote-service))
+      (opencode-state--retained-p id)
+      (and (not (gethash id (opencode-sv opencode-state--ignored)))
+           (member (alist-get 'type event)
+                   '("session.forked" "session.execution.started" "permission.asked" "form.created")))))
+
+(defun opencode-state--followed-p (id)
+  "Return non-nil when the registry follows session ID, which it holds.
+The local service's follows every session.  A remote service's follows
+the sessions of its buffers, their subagents and the sessions above
+them: what their buffers show of their statuses and requests, rather
+than every session of that service, which its host lists."
+  (or (not (opencode--remote-service))
+      (opencode-state--retained-p id)
+      (gethash id (opencode-sv opencode-state--children))
+      (when-let* ((parent (plist-get (opencode-state-get id) :parent-id)))
+        (and (opencode-state-get parent) t))))
 
 (defun opencode-state--handle (event)
   "Apply EVENT to the registry when it follows the stream that delivered it.
@@ -955,18 +1001,20 @@ Then list the other sessions from LISTING, a plist (:next :previous
   (message "OpenCode: cannot load the state of the sessions: %s" (opencode-error-describe error))
   (opencode-state--cancel-retry)
   (let ((stream (opencode-sv opencode-state--stream))
+        (service (opencode--remote-service))
         (timer nil))
     (setf timer (run-at-time
                  (opencode-sv opencode-state--retry-delay) nil
                  (lambda ()
-                   (when (eq (opencode-sv opencode-state--retry-timer) timer)
-                     (setf (opencode-sv opencode-state--retry-timer) nil)
-                     (when (and (eq stream (opencode-sv opencode-state--stream))
-                                (eq stream (opencode-sv opencode-events--stream))
-                                (opencode-events-connected-p)
-                                (not (opencode-sv opencode-state--bootstrapping))
-                                (not (opencode-sv opencode-state--ready)))
-                       (opencode-state--bootstrap)))))
+                   (opencode-with-service service
+                     (when (eq (opencode-sv opencode-state--retry-timer) timer)
+                       (setf (opencode-sv opencode-state--retry-timer) nil)
+                       (when (and (eq stream (opencode-sv opencode-state--stream))
+                                  (eq stream (opencode-sv opencode-events--stream))
+                                  (opencode-events-connected-p)
+                                  (not (opencode-sv opencode-state--bootstrapping))
+                                  (not (opencode-sv opencode-state--ready)))
+                         (opencode-state--bootstrap))))))
           (opencode-sv opencode-state--retry-timer) timer
           (opencode-sv opencode-state--retry-delay) (min 60 (* 2 (opencode-sv opencode-state--retry-delay))))))
 
@@ -988,6 +1036,7 @@ none of them current."
           (opencode-sv opencode-state--list-delay) 1)
     (clrhash (opencode-sv opencode-state--fetching))
     (clrhash (opencode-sv opencode-state--current))
+    (clrhash (opencode-sv opencode-state--ignored))
     (opencode-state--cancel-retry)
     (opencode-state--context-reset)
     (cl-labels ((current-p () (= generation (opencode-sv opencode-state--generation)))
@@ -1031,15 +1080,35 @@ none of them current."
                                                                       infos))
                                                           active)
                                               listing))))))))
-      ;; The service refuses an empty page.
-      (if (zerop limit)
-          (listed nil nil)
+      (cond
+       ((opencode--remote-service)
+        ;; A remote service's registry follows its buffers' sessions,
+        ;; the running ones and those above: no listing.
+        (let ((ids (seq-filter #'opencode-state--retained-p
+                               (hash-table-keys (opencode-sv opencode-session-buffers)))))
+          (opencode-request
+           'get "/api/session/active" :directory nil :buffer nil :else #'fail
+           :then (lambda (response)
+                   (when (current-p)
+                     (opencode-state--load
+                      (delete-dups (append ids (opencode-state--active-ids response)))
+                      (lambda (results)
+                        (when (current-p)
+                          (if-let* ((error (seq-find #'opencode-error-p (mapcar #'cdr results))))
+                              (fail error)
+                            (opencode-state--bootstrapped
+                             (seq-filter #'identity (mapcar #'cdr results))
+                             (list :next nil :previous nil :count 0)))))))))))
+       ;; The service refuses an empty page.
+       ((zerop limit)
+        (listed nil nil))
+       (t
         (opencode-request
          'get "/api/session" :directory nil :buffer nil :else #'fail
          :query `((archived . "false") (order . "desc") (limit . ,limit))
          :then (lambda (response)
                  (when (current-p)
-                   (listed (opencode-request-data response) (alist-get 'cursor response)))))))))
+                   (listed (opencode-request-data response) (alist-get 'cursor response))))))))))
 
 ;;;; Listing
 
@@ -1098,14 +1167,16 @@ first page; :count, the number of sessions listed so far."
                 (when (current-p)
                   (message "OpenCode: cannot list the sessions, retrying: %s" (opencode-error-describe error))
                   (opencode-state--cancel-retry)
-                  (let ((timer nil))
+                  (let ((timer nil)
+                        (service (opencode--remote-service)))
                     (setf timer (run-at-time
                                  (opencode-sv opencode-state--list-delay) nil
                                  (lambda ()
-                                   (when (eq (opencode-sv opencode-state--list-timer) timer)
-                                     (setf (opencode-sv opencode-state--list-timer) nil)
-                                     (when (and (current-p) (opencode-state-ready-p))
-                                       (page query then)))))
+                                   (opencode-with-service service
+                                     (when (eq (opencode-sv opencode-state--list-timer) timer)
+                                       (setf (opencode-sv opencode-state--list-timer) nil)
+                                       (when (and (current-p) (opencode-state-ready-p))
+                                         (page query then))))))
                           (opencode-sv opencode-state--list-timer) timer
                           (opencode-sv opencode-state--list-delay) (min 60 (* 2 (opencode-sv opencode-state--list-delay)))))))
               (newer (cursor)
@@ -1189,6 +1260,8 @@ it, kept until fetched again."
   "Have the registry hold session ID once its buffer opened.
 Until the listing that follows a bootstrap ends, its end does.  For
 `opencode-session-buffer-functions'."
+  (when (opencode-state--retained-p id)
+    (remhash id (opencode-sv opencode-state--ignored)))
   (when (and (opencode-state--retained-p id)
              (opencode-state-loaded-p)
              (not (gethash id (opencode-sv opencode-state--current)))
@@ -1300,7 +1373,7 @@ Clients ask from redisplay, and a timer also lets the asks of one
 redisplay queue up before any starts."
   (when (and (opencode-sv opencode-state--context-queue) (not (timerp (opencode-sv opencode-state--context-timer))))
     (setf (opencode-sv opencode-state--context-timer)
-          (run-at-time 0 nil #'opencode-state--context-pump))))
+          (apply #'run-at-time 0 nil #'opencode-state--context-pump (opencode--timer-arguments)))))
 
 (defun opencode-state--context-running ()
   "Return the number of context-size fetches in flight."
@@ -1309,10 +1382,15 @@ redisplay queue up before any starts."
              (opencode-sv opencode-state--contexts))
     count))
 
-(defun opencode-state--context-pump ()
+(defun opencode-state--context-pump (&optional service)
   "Start the queued context-size fetches, up to `opencode-state-context-requests'.
 While the registry is not ready they wait: its bootstrap queues them
-again and starts them."
+again and starts them.  SERVICE, nil for the local one, owns them."
+  (opencode-with-service service
+    (opencode-state--context-pump-1)))
+
+(defun opencode-state--context-pump-1 ()
+  "Start the current service's queued context-size fetches, as `opencode-state--context-pump'."
   (setf (opencode-sv opencode-state--context-timer) nil)
   (when (opencode-state-ready-p)
     (while (and (opencode-sv opencode-state--context-queue)
@@ -1529,8 +1607,8 @@ No timer runs while none is known."
     (when earliest
       ;; Absolute, as the service's expiries are.
       (setf (opencode-sv opencode-state--cache-timer)
-            (run-at-time (time-convert (+ earliest opencode-state--cache-margin) 'list)
-                         nil #'opencode-state--cache-expired)))))
+            (apply #'run-at-time (time-convert (+ earliest opencode-state--cache-margin) 'list)
+                         nil #'opencode-state--cache-expired (opencode--timer-arguments))))))
 
 (defun opencode-state--cache-listable-p ()
   "Return non-nil when the service can be asked for the expiries now.
@@ -1539,13 +1617,18 @@ While the stream is down, its reconnection lists them."
        (eq (opencode-sv opencode-state--stream) (opencode-sv opencode-events--stream))
        (opencode-events-connected-p)))
 
-(defun opencode-state--cache-expired ()
+(defun opencode-state--cache-expired (&optional service)
   "Forget the expiries that passed, then list them again.
 Nothing reports an entry running out, and once it has, a longer-lived
 entry of a shorter prefix, such as a system prompt cached for an hour
 under a conversation cached for five minutes, may still serve the
 session; a fork may also have refreshed the entry of its parent, which
-hears nothing of it."
+hears nothing of it.  SERVICE, nil for the local one, owns the expiries."
+  (opencode-with-service service
+    (opencode-state--cache-expired-1)))
+
+(defun opencode-state--cache-expired-1 ()
+  "Forget and list again the current service's expiries, as `opencode-state--cache-expired'."
   (setf (opencode-sv opencode-state--cache-timer) nil)
   (opencode-state--cache-prune)
   (if (opencode-state--cache-listable-p)
