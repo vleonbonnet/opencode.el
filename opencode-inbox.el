@@ -362,11 +362,7 @@ change it, so this runs after every change and before redisplay."
     (save-restriction
       (widen)
       (let* ((at (opencode--follow-start))
-             ;; The area starts after a blank line, whatever ends the transcript.
-             (lead (cond ((= at (point-min)) "")
-                         ((/= (char-before at) ?\n) "\n\n")
-                         ((or (= (1- at) (point-min)) (/= (char-before (1- at)) ?\n)) "\n")
-                         (t ""))))
+             (lead (opencode-area-lead at)))
         (unless (= (overlay-start overlay) at)
           (move-overlay overlay at at))
         (unless (equal lead (overlay-get overlay 'opencode-inbox-lead))
@@ -405,8 +401,12 @@ withheld deliveries take out of it."
 
 (defun opencode-inbox-area-string ()
   "Return the text the pending area shows, or nil when it shows nothing."
-  (when (and (overlayp opencode--inbox-overlay) (overlay-buffer opencode--inbox-overlay))
+  (when (opencode-inbox-area-p)
     (substring-no-properties (overlay-get opencode--inbox-overlay 'before-string))))
+
+(defun opencode-inbox-area-p ()
+  "Return non-nil when the pending area shows."
+  (and (overlayp opencode--inbox-overlay) (overlay-buffer opencode--inbox-overlay) t))
 
 ;;;; Withdrawing
 

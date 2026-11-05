@@ -137,6 +137,16 @@ from the process mark.  Without a process, only the end follows."
           ((opencode-prompt-shown-p) (marker-position opencode--prompt-start))
           (t (opencode-pmark)))))
 
+(defun opencode-area-lead (at)
+  "Return the newlines an area shown at AT starts with, after the transcript.
+An area between the transcript and the input, shown as an overlay
+string at AT, starts after a blank line, whatever ends the transcript:
+a partial line of streamed text, a line, or a blank line already."
+  (cond ((= at (point-min)) "")
+        ((/= (char-before at) ?\n) "\n\n")
+        ((or (= (1- at) (point-min)) (/= (char-before (1- at)) ?\n)) "\n")
+        (t "")))
+
 (defun opencode-follows-output-p (position)
   "Return non-nil when POSITION is at the end of the transcript or in the input.
 A point there stays after the output written at the end, at its place

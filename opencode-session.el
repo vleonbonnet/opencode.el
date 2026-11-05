@@ -58,6 +58,7 @@
 (require 'opencode-inbox)
 (require 'opencode-links)
 (require 'opencode-notify)
+(require 'opencode-recap)
 (require 'opencode-render)
 (require 'opencode-state)
 (require 'savehist)
@@ -824,6 +825,7 @@ interrupt the turn or are refused (`opencode-comint-unsupported'), and
   (add-hook 'kill-buffer-hook #'opencode--session-cleanup nil t)
   (add-hook 'comint-input-filter-functions #'opencode--note-input-sent nil t)
   (opencode-inbox-setup)
+  (opencode-recap-setup)
   (add-hook 'fill-nobreak-predicate #'opencode--in-attachment-p nil t)
   (visual-line-mode)
   (cursor-intangible-mode)
@@ -1257,7 +1259,8 @@ leaves the rest withheld."
                         (alist-get 'type (car entry)) (error-message-string err))))))))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (opencode-inbox-update)))))
+        (opencode-inbox-update)
+        (opencode-session-summary-update)))))
 
 (defun opencode--held-status ()
   "Return the status before the first withheld turn event, or nil without one.
@@ -4601,7 +4604,8 @@ keep their own."
         (opencode--unhighlight-sent-prompts)
         (opencode-session-display-setup)
         (opencode-blocks-upgrade)
-        (opencode-read-only-upgrade)))))
+        (opencode-read-only-upgrade)
+        (opencode-recap-setup)))))
 
 (provide 'opencode-session)
 ;;; opencode-session.el ends here

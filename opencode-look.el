@@ -498,6 +498,66 @@ It inherits the working status: a pending prompt waits on the turn."
   "Margin of pending prompts, in the colour of the turn they wait on."
   :group 'opencode-faces)
 
+;;;; Where a session stands
+
+(defcustom opencode-session-summary-icon "※"
+  "Icon heading the line on where a session stands, above its input.
+Claude Code heads its recap with it; an empty string shows the line
+alone.  See `opencode-session-summary-function'."
+  :type 'string
+  :group 'opencode)
+
+(defface opencode-session-summary-icon '((t :inherit shadow))
+  "Icon heading the line on where a session stands, dimmed."
+  :group 'opencode-faces)
+
+(defface opencode-session-summary '((t :inherit shadow :slant italic))
+  "Line on where a session stands, above its input.
+Dimmed and slanted: it is no part of the conversation, which another
+wrote it from."
+  :group 'opencode-faces)
+
+(defface opencode-session-summary-recap '((t :inherit shadow))
+  "Recap of the last turn, below the line on where a session stands."
+  :group 'opencode-faces)
+
+(defun opencode-session-summary-text (line &optional recap unfolded keymap)
+  "Return the lines showing LINE on where a session stands, a blank line after them.
+RECAP, a few lines recapping the last turn, or nil, shows below LINE
+when UNFOLDED, else an ellipsis after it tells there is one, and a
+click on the lines runs what KEYMAP binds, which shows or hides it.
+Session buffers show it above their input (see
+`opencode-session-summary-function'), and other packages' buffers of
+sessions alike."
+  (let* ((icon (if (string-empty-p opencode-session-summary-icon)
+                   ""
+                 (concat (propertize opencode-session-summary-icon 'face 'opencode-session-summary-icon)
+                         " ")))
+         (indent (make-string (string-width icon) ?\s))
+         (unfolded (and recap unfolded))
+         (string
+          (concat icon (propertize line 'face 'opencode-session-summary)
+                  (and recap (not unfolded) (propertize " …" 'face 'opencode-session-summary-recap))
+                  "\n"
+                  (and unfolded
+                       (mapconcat (lambda (recap-line)
+                                    (concat indent
+                                            (propertize recap-line 'face 'opencode-session-summary-recap)
+                                            "\n"))
+                                  (split-string recap "\n")))
+                  "\n")))
+    (put-text-property 0 (length string) 'wrap-prefix indent string)
+    (when (and recap keymap)
+      (add-text-properties 0 (1- (length string))
+                           `(keymap ,keymap
+                             mouse-face highlight
+                             pointer hand
+                             help-echo ,(if unfolded
+                                            "mouse-1: hide the recap of the last turn"
+                                          (concat recap "\n\nmouse-1: show this recap below")))
+                           string))
+    string))
+
 ;;;; Numbers
 
 (defun opencode-format-duration (seconds)
