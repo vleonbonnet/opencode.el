@@ -385,7 +385,7 @@ The connections kept to the one that went away are not used again."
   (opencode-test-with-service
     (setf (opencode-test-service-routes opencode-test-service)
           (list (cons "/api/agent" (lambda (_) '(200 . ((data . [])))))))
-    (let* ((old (make-network-process :name "opencode-test-old-service" :server t
+    (let* ((old (make-network-process :name "opencode-test-old-service" :server opencode-test--backlog
                                       :host "127.0.0.1" :service t :family 'ipv4
                                       :noquery t :coding 'binary
                                       :filter (lambda (connection output)

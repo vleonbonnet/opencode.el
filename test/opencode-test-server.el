@@ -283,6 +283,15 @@ running CLI process until then."
       (accept-process-output nil 0.05))
     (or value (ert-fail (format "Timed out waiting for %S" predicate)))))
 
+(defconst opencode-test--backlog 128
+  "How many connections a fake service's server holds before accepting them.
+The server runs in the test's Emacs, so it accepts only while the test
+waits, and the connections a test opens at once all wait in its queue
+until then.  Emacs listens with a queue of 5 by default; macOS 27 resets
+the connections beyond the queue, where earlier systems dropped them and
+they retried.  Node listens with one of 511, which systems cap, at 128
+for macOS.")
+
 (defvar opencode-test--server nil
   "The listening process shared by every test.
 On Windows, a server made after earlier ones were deleted stops
@@ -292,7 +301,7 @@ accepting after a few connections, so one server serves the whole run.")
   "Return the shared listening process, creating it once."
   (unless (process-live-p opencode-test--server)
     (setq opencode-test--server
-          (make-network-process :name "opencode-test-service" :server t
+          (make-network-process :name "opencode-test-service" :server opencode-test--backlog
                                 :host "127.0.0.1" :service t :family 'ipv4
                                 :noquery t :coding 'binary
                                 :filter (lambda (connection output)
@@ -307,7 +316,7 @@ serve while `opencode-test-service' is bound to it: as its own server's
 filter binds it."
   (let* ((service (opencode-test-service--make :password password :pid 5151))
          (server (make-network-process
-                  :name "opencode-test-other-service" :server t
+                  :name "opencode-test-other-service" :server opencode-test--backlog
                   :host "127.0.0.1" :service t :family 'ipv4
                   :noquery t :coding 'binary
                   :filter (lambda (connection output)
