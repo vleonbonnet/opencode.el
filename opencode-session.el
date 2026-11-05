@@ -4251,6 +4251,62 @@ requests that failed, newest first."
                                            (and (numberp .deletions) .deletions))))
                                  changes)))))))
 
+(defun opencode-session-diff (id callback &optional whole context)
+  "Call CALLBACK with the files session ID changed, as the service diffs them.
+They are the changes of its last turn, or with WHOLE those of every
+turn, from the first prompt to the newest: the service compares the
+snapshots it took of the session's working tree, so they include files
+Git does not track, and leave out what changed meanwhile but by the
+session.  CONTEXT is the number of unchanged lines around each hunk, 3
+when nil.
+
+CALLBACK is called once, in whatever buffer is current then, with a
+list of the service's file diffs, alists of `file', named relative to
+the session's working tree, `patch', a unified diff, `additions',
+`deletions' and `status' (\"added\", \"deleted\" or \"modified\"), a
+patch maybe empty when too large to make; or with (:failure MESSAGE)
+when the service refused, as it does for a range spanning a move of
+the session to another directory."
+  (let ((directory (opencode-state--directory id))
+        (context (number-to-string (or context 3)))
+        (called nil))
+    (cl-labels ((deliver (value)
+                  (unless called
+                    (setq called t)
+                    (funcall callback value)))
+                (fail (error)
+                  (deliver (list :failure (opencode-error-describe error))))
+                (diff (query)
+                  (opencode-request
+                   'get (format "/api/session/%s/diff" id)
+                   :directory directory :buffer nil
+                   :query (cons (cons 'context context) query)
+                   :else #'fail
+                   :then (lambda (response)
+                           (let ((data (opencode-request-data response)))
+                             (deliver (if (listp data) data
+                                        (list :failure "The service told no diff")))))))
+                (user-message (order then)
+                  (opencode-request
+                   'get (format "/api/session/%s/message" id)
+                   :directory directory :buffer nil
+                   :query `((limit . 1) (type . "user") (order . ,order))
+                   :else #'fail
+                   :then (lambda (response)
+                           (funcall then (alist-get 'id (car (opencode-request-data response))))))))
+      (if (not whole)
+          (diff nil)
+        (let ((first 'pending)
+              (last 'pending))
+          (cl-flet ((both ()
+                      (unless (or (eq first 'pending) (eq last 'pending))
+                        (if (and (stringp first) (stringp last))
+                            (diff `((from . ,first) (to . ,last)))
+                          ;; No prompt yet: nothing changed.
+                          (deliver nil)))))
+            (user-message "asc" (lambda (id) (setq first id) (both)))
+            (user-message "desc" (lambda (id) (setq last id) (both)))))))))
+
 (defun opencode--session-title (id)
   "Return the title of session ID as the registry or its buffer knows it, or nil."
   (or (plist-get (opencode-state-get id) :title)

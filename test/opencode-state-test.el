@@ -2306,6 +2306,42 @@ watermark serving every caller."
       (should (eq (car (car results)) :failure))
       (should (string-match-p "Session not found" (cadr (car results)))))))
 
+(ert-deftest opencode-test-session-diff ()
+  "The diff of a session's last turn, or of its every turn, is the service's."
+  (opencode-test-with-state-server
+      (list :messages `(("ses_a"
+                         ((id . "msg_3") (type . "user") (time (created . 30)) (text . "Last"))
+                         ((id . "msg_1") (type . "user") (time (created . 10)) (text . "First")))))
+    (let* ((files '(((file . "a.el") (patch . "@@ -1 +1 @@\n-a\n+b\n") (additions . 1) (deletions . 1)
+                     (status . "modified"))))
+           (opencode-test-routes
+            (append (list (list 'get "\\`/api/session/ses_a/diff\\'" (lambda (_) `((data . ,files))))
+                          (list 'get "\\`/api/session/ses_moved/diff\\'"
+                                (lambda (_) '(:error 400 "Turn range spans a location change")))
+                          (list 'get "\\`/api/session/ses_moved/message\\'"
+                                (lambda (_) '((data ((id . "msg_9") (type . "user")))))))
+                    opencode-test-routes))
+           (results nil))
+      (opencode-session-diff "ses_a" (lambda (value) (push (cons 'turn value) results)))
+      (opencode-session-diff "ses_a" (lambda (value) (push (cons 'whole value) results)) t 0)
+      (opencode-session-diff "ses_moved" (lambda (value) (push (cons 'moved value) results)) t)
+      (opencode-session-diff "ses_none" (lambda (value) (push (cons 'none value) results)) t)
+      (should (equal (alist-get 'turn results) files))
+      (should (equal (alist-get 'whole results) files))
+      (should (eq (car (alist-get 'moved results)) :failure))
+      (should (string-match-p "location change" (cadr (alist-get 'moved results))))
+      ;; A session without a prompt changed nothing.
+      (should (assq 'none results))
+      (should-not (alist-get 'none results))
+      (let ((diffs (seq-filter (lambda (request) (equal (plist-get request :path) "/api/session/ses_a/diff"))
+                               (reverse opencode-test-requests))))
+        (should (= (length diffs) 2))
+        (should (equal (plist-get (car diffs) :query) '((context . "3"))))
+        ;; Every turn: from the first prompt to the newest, as the
+        ;; messages asked first and last tell them.
+        (should (equal (plist-get (cadr diffs) :query)
+                       '((context . "0") (from . "msg_1") (to . "msg_3"))))))))
+
 (ert-deftest opencode-test-respond-session-open-buffer ()
   "Responding to a session with a buffer shows it and answers there."
   (opencode-test-with-server
