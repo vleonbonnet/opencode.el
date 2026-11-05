@@ -49,8 +49,11 @@
   "When non-nil, log every request and response in *opencode-requests*.")
 
 (cl-defstruct (opencode-error (:constructor opencode-error--make))
-  "A failed OpenCode request."
-  status tag message method path)
+  "A failed OpenCode request.
+DATA is the error object the server answered, decoded, or nil: its
+fields beside the tag and the message, such as a provider error's
+reason, tell callers more of the failure."
+  status tag message method path data)
 
 (defun opencode-error-describe (error)
   "Return a one-line description of request ERROR."
@@ -118,6 +121,7 @@ goes to `message'."
     (opencode-error--make
      :status (opencode-transport-failure-status failure) :method method :path path
      :tag (and (consp json) (alist-get '_tag json))
+     :data (and (consp json) (consp (car json)) json)
      :message (or (and (consp json) (alist-get 'message json))
                   (and (stringp body) (not (string-empty-p body)) (string-trim body))
                   (opencode-transport-failure-message failure)))))

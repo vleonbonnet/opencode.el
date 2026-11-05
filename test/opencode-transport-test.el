@@ -99,7 +99,28 @@ which froze Emacs for seconds over the requests of a reconnection."
       (opencode-request 'get "/api/session/ses_missing" :buffer nil :else (lambda (value) (setq error value)))
       (opencode-test-wait-for (lambda () error))
       (should (eql (opencode-error-status error) 404))
-      (should (equal (opencode-error-describe error) "GET /api/session/ses_missing failed (HTTP 404): Not found")))))
+      (should (equal (opencode-error-describe error) "GET /api/session/ses_missing failed (HTTP 404): Not found"))
+      (should (equal (opencode-error-data error) '((message . "Not found"))))))
+  ;; A tagged error keeps its other fields, such as a provider error's reason.
+  (opencode-test-with-service
+    (setf (opencode-test-service-routes opencode-test-service)
+          (list (cons "/api/experimental/generate/text"
+                      (lambda (_) '(502 . ((_tag . "ProviderRequestError") (providerID . "github-copilot")
+                                           (reason . "rate_limit") (message . "Quota exceeded")))))
+                (cons "/api/list" (lambda (_) '(500 . "[1, 2]")))))
+    (let ((error nil))
+      (opencode-request 'post "/api/experimental/generate/text" :buffer nil :directory nil
+                        :body '((prompt . "hi")) :else (lambda (value) (setq error value)))
+      (opencode-test-wait-for (lambda () error))
+      (should (equal (list (opencode-error-status error) (opencode-error-tag error)
+                           (opencode-error-message error) (alist-get 'reason (opencode-error-data error)))
+                     '(502 "ProviderRequestError" "Quota exceeded" "rate_limit")))
+      ;; A body that is no object leaves no data.
+      (setq error nil)
+      (opencode-request 'get "/api/list" :buffer nil :directory nil :else (lambda (value) (setq error value)))
+      (opencode-test-wait-for (lambda () error))
+      (should (eql (opencode-error-status error) 500))
+      (should-not (opencode-error-data error)))))
 
 (ert-deftest opencode-test-service-starting ()
   "A service answering 503 while it boots is waited for."
