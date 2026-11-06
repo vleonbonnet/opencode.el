@@ -201,20 +201,20 @@ cancellation event before answering, `quiet' answers without one,
 (ert-deftest opencode-test-pending-at-idle-prompt ()
   "With the session idle, the pending area shows before the input prompt."
   (opencode-test-with-server
-   (let ((session (opencode-test-scenario "text")))
-     (with-current-buffer (opencode-test-open-empty session)
-       (should (opencode-prompt-shown-p))
-       (opencode-test-dispatch (list (opencode-test-enqueued session "msg_later" "later" "queue")))
-       (should (= (overlay-start opencode--inbox-overlay) (opencode-pmark)))
-       ;; A prompt typed while another waits waits behind it.
-       (let ((id (opencode-test-type-and-send "after that")))
-         (should (string-match-p "later\\(.\\|\n\\)*after that" (opencode-test-area)))
-         (should-not (string-search "> after that" (buffer-string)))
-         (opencode-test-dispatch (list (opencode-test-enqueued session id "after that")
-                                       (opencode-test-delivered session "msg_later")
-                                       (opencode-test-delivered session id)))
-         (should (< (opencode-test-find "later") (opencode-test-find "after that")))
-         (should (equal (opencode-test-area) "")))))))
+    (let ((session (opencode-test-scenario "text")))
+      (with-current-buffer (opencode-test-open-empty session)
+        (should (opencode-prompt-shown-p))
+        (opencode-test-dispatch (list (opencode-test-enqueued session "msg_later" "later" "queue")))
+        (should (= (overlay-start opencode--inbox-overlay) (opencode-pmark)))
+        ;; A prompt typed while another waits waits behind it.
+        (let ((id (opencode-test-type-and-send "after that")))
+          (should (string-match-p "later\\(.\\|\n\\)*after that" (opencode-test-area)))
+          (should-not (string-search "> after that" (buffer-string)))
+          (opencode-test-dispatch (list (opencode-test-enqueued session id "after that")
+                                        (opencode-test-delivered session "msg_later")
+                                        (opencode-test-delivered session id)))
+          (should (< (opencode-test-find "later") (opencode-test-find "after that")))
+          (should (equal (opencode-test-area) "")))))))
 
 ;;;; Withdrawing
 
