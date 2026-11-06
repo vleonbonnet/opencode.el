@@ -399,7 +399,8 @@ drover's, give the agents of other front ends one by their name."
 (defcustom opencode-provider-icons
   '(("\\`github-copilot\\'" . "\uf4b8")  ; nf-oct-copilot
     ("\\`anthropic\\'" . "\uec82")       ; nf-cod-claude
-    ("\\`openai\\'" . "\uec81"))         ; nf-cod-openai
+    ("\\`openai\\'" . "\uec81")          ; nf-cod-openai
+    ("\\`opencode\\'" . "\U000F0C8C"))   ; nf-md-application_brackets_outline
   "Alist of (PROVIDER-ID-REGEXP . ICON) for the provider of a session.
 Providers without a match show `opencode-provider-default-icon' followed
 by their name."
