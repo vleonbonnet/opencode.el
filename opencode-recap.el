@@ -31,7 +31,7 @@
 ;; goes as a turn starts or a prompt is sent.
 ;;
 ;; Like the pending area (see opencode-inbox.el), it is an overlay
-;; string where the points following output start, after the pending
+;; string between the transcript and the input, after the pending
 ;; prompts, never text: it never holds point, is never part of the
 ;; transcript nor of the input, and line motion passes over it.
 
@@ -121,17 +121,17 @@ of `opencode-recap--lines' lines at most; a failure tells nothing."
 
 (defun opencode-recap--place ()
   "Keep the line on where the session stands just above the input.
-That is where points following output start, after the pending area,
-a blank line before it, whatever ends the transcript.  An overlay that
-a rewrite of the transcript deleted is made again."
+That is where the pending area shows (see `opencode-area-start'), after
+it, a blank line before it, whatever ends the transcript.  An overlay
+that a rewrite of the transcript deleted is made again."
   (let ((overlay opencode--recap-overlay))
     (if (not (and (overlayp overlay) (overlay-buffer overlay)))
         (opencode-recap--render)
       (save-restriction
         (widen)
-        (let* ((at (opencode--follow-start))
+        (let* ((at (opencode-area-start))
                ;; The pending area ends with a blank line of its own.
-               (lead (if (opencode-inbox-area-p) "" (opencode-area-lead at))))
+               (lead (if (opencode-inbox-area-p) "" (opencode-area-lead (opencode--follow-start)))))
           (unless (= (overlay-start overlay) at)
             (move-overlay overlay at at))
           (unless (equal lead (overlay-get overlay 'opencode-recap-lead))
@@ -146,7 +146,7 @@ a rewrite of the transcript deleted is made again."
         (delete-overlay opencode--recap-overlay)
         (setq opencode--recap-overlay nil))
     (unless (and (overlayp opencode--recap-overlay) (overlay-buffer opencode--recap-overlay))
-      (let ((at (save-restriction (widen) (opencode--follow-start))))
+      (let ((at (opencode-area-start)))
         (setq opencode--recap-overlay (make-overlay at at nil t t))
         (overlay-put opencode--recap-overlay 'opencode-recap t)
         ;; Before-strings show by increasing priority: after the pending area's.

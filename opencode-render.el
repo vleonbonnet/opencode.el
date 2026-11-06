@@ -137,6 +137,19 @@ from the process mark.  Without a process, only the end follows."
           ((opencode-prompt-shown-p) (marker-position opencode--prompt-start))
           (t (opencode-pmark)))))
 
+(defun opencode-area-start ()
+  "Return where an area between the transcript and the input shows.
+Such an area, the pending prompts or where the session stands, is an
+overlay string at that position: the process mark, after the idle
+prompt, else the end without a process.  Not at the idle prompt's start,
+where the transcript ends: redisplay skipping the prompt, which an
+overlay hides, draws none of the strings of other overlays starting
+there.  `opencode-area-lead' of `opencode--follow-start' tells the
+newlines it starts with."
+  (save-restriction
+    (widen)
+    (if (get-buffer-process (current-buffer)) (opencode-pmark) (point-max))))
+
 (defun opencode-area-lead (at)
   "Return the newlines an area shown at AT starts with, after the transcript.
 An area between the transcript and the input, shown as an overlay

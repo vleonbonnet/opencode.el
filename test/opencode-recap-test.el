@@ -63,10 +63,10 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
         (opencode-test-idle (format "msg_r%02di" n))))
 
 (defun opencode-test-recap-at-prompt-p ()
-  "Return non-nil when the line shows at the idle prompt, after the pending area."
+  "Return non-nil when the line shows after the idle prompt, after the pending area."
   (and (overlay-buffer opencode--recap-overlay)
        (opencode-prompt-shown-p)
-       (= (overlay-start opencode--recap-overlay) (marker-position opencode--prompt-start))))
+       (= (overlay-start opencode--recap-overlay) (opencode-pmark))))
 
 (defun opencode-test-recap-groups ()
   "Return the groups of the current buffer, in order, as (START MEMBERS)."
@@ -94,6 +94,23 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
         (opencode-test-recap-redisplay)
         (opencode-test-recap-redisplay)
         (should (= opencode-test-recap-asked 1))))))
+
+(ert-deftest opencode-test-recap-drawn ()
+  "Redisplay draws the line after the idle prompt it hides, alone or after the pending area."
+  (opencode-test-with-recap '("Done: first" . "A recap.")
+    (opencode-test-with-transcript (opencode-test-recap-turn 1)
+      (let ((session (opencode-test-session)))
+        (with-current-buffer (opencode-test-open session)
+          (should (opencode-prompt-shown-p))
+          (should (equal (opencode-test-area-drawn opencode--recap-overlay) '(2 . 2)))
+          (opencode-test-dispatch
+           `(((type . "session.inbox.enqueued")
+              (data (sessionID . ,session) (inboxID . "msg_tui")
+                    (item (type . "user") (delivery . "queue") (payload (text . "later")))))))
+          (let ((pending (opencode-test-area-drawn opencode--inbox-overlay)))
+            (should (cl-plusp (cdr pending)))
+            (should (= (car pending) (cdr pending))))
+          (should (equal (opencode-test-area-drawn opencode--recap-overlay) '(2 . 2))))))))
 
 (ert-deftest opencode-test-recap-none-without-function ()
   "Without a function, or one telling nothing, nothing shows; one failing tells nothing."

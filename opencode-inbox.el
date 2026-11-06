@@ -353,16 +353,16 @@ none.  It costs little, for menus telling whether they apply."
 
 (defun opencode-inbox--anchor (&rest _)
   "Keep the pending area between the transcript and the input.
-That is where points following output start: at the idle prompt, else
-at the process mark.  Output inserted there and the idle prompt moving
-change it, so this runs after every change and before redisplay."
+That is at the process mark, after the idle prompt (see
+`opencode-area-start').  Output inserted there and the idle prompt
+moving change it, so this runs after every change and before redisplay."
   (when-let* ((overlay opencode--inbox-overlay)
               ((overlay-buffer overlay))
               ((get-buffer-process (current-buffer))))
     (save-restriction
       (widen)
-      (let* ((at (opencode--follow-start))
-             (lead (opencode-area-lead at)))
+      (let* ((at (opencode-area-start))
+             (lead (opencode-area-lead (opencode--follow-start))))
         (unless (= (overlay-start overlay) at)
           (move-overlay overlay at at))
         (unless (equal lead (overlay-get overlay 'opencode-inbox-lead))
@@ -387,7 +387,7 @@ withheld deliveries take out of it."
             (delete-overlay opencode--inbox-overlay)
             (setq opencode--inbox-overlay nil))
         (unless (and (overlayp opencode--inbox-overlay) (overlay-buffer opencode--inbox-overlay))
-          (let ((at (save-restriction (widen) (opencode--follow-start))))
+          (let ((at (opencode-area-start)))
             (setq opencode--inbox-overlay (make-overlay at at nil t t))
             (overlay-put opencode--inbox-overlay 'opencode-inbox t)))
         (overlay-put opencode--inbox-overlay 'opencode-inbox-body (opencode-inbox--body entries))

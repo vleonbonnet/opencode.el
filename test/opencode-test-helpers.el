@@ -511,6 +511,38 @@ The fake service's inboxes follow their events (see `opencode-test-inbox')."
     (search-forward text)
     (match-beginning 0)))
 
+(defun opencode-test-lines-shown (buffer)
+  "Return how many lines BUFFER shows, the strings of its overlays included.
+BUFFER is laid out in the selected window as redisplay lays it out,
+which batch Emacs does without displaying it: text an overlay hides
+shows nothing, nor what redisplay leaves out with it."
+  (save-window-excursion
+    (set-window-buffer (selected-window) buffer)
+    (with-current-buffer buffer
+      (save-restriction
+        (widen)
+        (/ (cdr (window-text-pixel-size nil (point-min) (point-max))) (default-line-height))))))
+
+(defun opencode-test-area-drawn (overlay)
+  "Return the lines OVERLAY's string adds to what the current buffer shows, and its lines.
+The value is (DRAWN . LINES), DRAWN equal to LINES when redisplay draws
+the whole string.  Input is typed meanwhile, then deleted: the buffer
+ends with a line, which laying it out counts whatever its end.  The
+buffer must not start with hidden text, which laying it out from its
+start skips with the strings after it, whatever shows."
+  (save-excursion
+    (goto-char (point-max))
+    (let ((start (point)))
+      (insert "draft")
+      (unwind-protect
+          (let ((string (overlay-get overlay 'before-string))
+                (with (opencode-test-lines-shown (current-buffer))))
+            (overlay-put overlay 'before-string nil)
+            (unwind-protect
+                (cons (- with (opencode-test-lines-shown (current-buffer))) (cl-count ?\n string))
+              (overlay-put overlay 'before-string string)))
+        (delete-region start (point-max))))))
+
 ;;;; Keys
 
 (defun opencode-test-press (buffer keys)
