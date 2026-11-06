@@ -9,12 +9,13 @@
 
 ;;; Commentary:
 
-;; Once a turn ended, a session buffer shows the line
-;; `opencode-session-summary-function' tells, just above its input, and
-;; nothing while a turn runs.  These tests check where it shows, when
-;; it is asked for, and that it changes nothing else: the transcript and
-;; its read-only text, the pending area, groups, catching up and
-;; reloading, the input and line motion.
+;; Once a turn ended, a session buffer shows the summary
+;; `opencode-session-summary-function' tells, as text just above its
+;; input, and nothing while a turn runs.  These tests check where it
+;; shows, when it is asked for and when it goes, that it reads, moves
+;; and quotes as the transcript does, and that it changes nothing else:
+;; the transcript as the service has it, the pending area, groups,
+;; catching up and reloading, the input, its undo and line motion.
 
 ;;; Code:
 
@@ -33,7 +34,6 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
   (declare (indent 1) (debug t))
   `(let* ((opencode-test-recap-value ,value)
           (opencode-test-recap-asked 0)
-          (opencode-session-summary-recap nil)
           (opencode-session-summary-icon "※")
           (opencode-session-summary-function
            (lambda ()
@@ -45,9 +45,15 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
   "Return what the current buffer shows of where its session stands, or \"\"."
   (or (opencode-session-summary-string) ""))
 
-(defun opencode-test-recap-redisplay ()
-  "Run what redisplay runs first in the current buffer, as batch Emacs never redisplays."
-  (run-hook-with-args 'pre-redisplay-functions (selected-window)))
+(defun opencode-test-recap-text ()
+  "Return the current buffer's text without the summary, trailing whitespace dropped.
+As the transcript reads without it."
+  (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+    (string-trim-right
+     (if-let* ((start (opencode-idle-start))
+               ((< start opencode--prompt-start)))
+         (concat (substring text 0 (1- start)) (substring text (1- opencode--prompt-start)))
+       text))))
 
 (defun opencode-test-recap-turn (n)
   "Return the messages of turn N: a prompt, a step with two tool calls and text, its end."
@@ -63,10 +69,10 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
         (opencode-test-idle (format "msg_r%02di" n))))
 
 (defun opencode-test-recap-at-prompt-p ()
-  "Return non-nil when the line shows after the idle prompt, after the pending area."
-  (and (overlay-buffer opencode--recap-overlay)
-       (opencode-prompt-shown-p)
-       (= (overlay-start opencode--recap-overlay) (opencode-pmark))))
+  "Return non-nil when the summary shows as text just before the idle prompt."
+  (and (opencode-prompt-shown-p)
+       (< (opencode-idle-start) opencode--prompt-start)
+       (string-prefix-p "※ " (opencode-test-recap))))
 
 (defun opencode-test-recap-groups ()
   "Return the groups of the current buffer, in order, as (START MEMBERS)."
@@ -80,95 +86,91 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
 ;;;; Showing
 
 (ert-deftest opencode-test-recap-shows-at-idle-prompt ()
-  "An idle session shows its summary just above its input, as overlay text alone."
-  (opencode-test-with-recap '("Done: added search, tests pass" . "Added FTS.\nTests pass.")
+  "An idle session shows its summary as read-only text just above its input."
+  (opencode-test-with-recap "Adding search: the index is done, tests pass. Next, ranking."
     (opencode-test-with-transcript (opencode-test-recap-turn 1)
       (with-current-buffer (opencode-test-open (opencode-test-session))
-        (should (equal (opencode-test-recap) "※ Done: added search, tests pass …\n\n"))
+        (should (equal (opencode-test-recap)
+                       "※ Adding search: the index is done, tests pass. Next, ranking.\n\n"))
         (should (opencode-test-recap-at-prompt-p))
-        (should (= opencode-test-recap-asked 1))
-        ;; Not in the text, nor in the input.
-        (should-not (string-search "Done: added" (buffer-string)))
+        ;; Text after the transcript, a blank line before it, the input empty.
+        (should (string-search "Answer 1.\n\n※ Adding search" (buffer-string)))
         (should (equal (opencode-test-input (current-buffer)) ""))
-        ;; Redisplay asks nothing more while nothing changes.
-        (opencode-test-recap-redisplay)
-        (opencode-test-recap-redisplay)
-        (should (= opencode-test-recap-asked 1))))))
-
-(ert-deftest opencode-test-recap-drawn ()
-  "Redisplay draws the line after the idle prompt it hides, alone or after the pending area."
-  (opencode-test-with-recap '("Done: first" . "A recap.")
-    (opencode-test-with-transcript (opencode-test-recap-turn 1)
-      (let ((session (opencode-test-session)))
-        (with-current-buffer (opencode-test-open session)
-          (should (opencode-prompt-shown-p))
-          (should (equal (opencode-test-area-drawn opencode--recap-overlay) '(2 . 2)))
-          (opencode-test-dispatch
-           `(((type . "session.inbox.enqueued")
-              (data (sessionID . ,session) (inboxID . "msg_tui")
-                    (item (type . "user") (delivery . "queue") (payload (text . "later")))))))
-          (let ((pending (opencode-test-area-drawn opencode--inbox-overlay)))
-            (should (cl-plusp (cdr pending)))
-            (should (= (car pending) (cdr pending))))
-          (should (equal (opencode-test-area-drawn opencode--recap-overlay) '(2 . 2))))))))
+        (let ((start (opencode-idle-start)))
+          (should (get-text-property start 'read-only))
+          (should (eq (get-text-property start 'font-lock-face) 'opencode-session-summary-icon))
+          (should (eq (get-text-property (+ start 2) 'font-lock-face) 'opencode-session-summary))
+          ;; It is no part of what was synced.
+          (should (<= opencode-synced-end start)))
+        ;; Redisplay asks nothing.
+        (let ((asked opencode-test-recap-asked))
+          (run-hook-with-args 'pre-redisplay-functions (selected-window))
+          (should (= opencode-test-recap-asked asked)))))))
 
 (ert-deftest opencode-test-recap-none-without-function ()
   "Without a function, or one telling nothing, nothing shows; one failing tells nothing."
   (opencode-test-with-transcript (opencode-test-recap-turn 1)
     (with-current-buffer (opencode-test-open (opencode-test-session))
-      (should-not opencode--recap-overlay)
-      (opencode-test-with-recap nil
-        (opencode-session-summary-update)
-        (should-not opencode--recap-overlay)
-        (should (= opencode-test-recap-asked 1))
-        (setq opencode-test-recap-value "  \n")
-        (opencode-session-summary-update)
-        (should-not opencode--recap-overlay))
-      (let ((opencode-session-summary-function (lambda () (error "No summary"))))
-        (let ((inhibit-message t))
-          (opencode-session-summary-update))
-        (should-not opencode--recap-overlay)))))
+      (let ((text (buffer-string)))
+        (should-not (opencode-session-summary-string))
+        (opencode-test-with-recap nil
+          (opencode-session-summary-update)
+          (should-not (opencode-session-summary-string))
+          (should (= opencode-test-recap-asked 1))
+          (setq opencode-test-recap-value "  \n")
+          (opencode-session-summary-update)
+          (should-not (opencode-session-summary-string)))
+        (let ((opencode-session-summary-function (lambda () (error "No summary"))))
+          (let ((inhibit-message t))
+            (opencode-session-summary-update))
+          (should-not (opencode-session-summary-string)))
+        (should (equal (buffer-string) text))))))
 
-(ert-deftest opencode-test-recap-string-first-line ()
-  "A string tells a line, its first; a recap keeps a few lines, blank ones dropped."
-  (opencode-test-with-recap "Waiting for approval\nignored"
+(ert-deftest opencode-test-recap-lines ()
+  "A line and a recap show as lines; a summary keeps a few lines, blank ones dropped."
+  (opencode-test-with-recap '("Waiting for approval" . "To push the fix.")
     (opencode-test-with-transcript (opencode-test-recap-turn 1)
       (with-current-buffer (opencode-test-open (opencode-test-session))
-        (should (equal (opencode-test-recap) "※ Waiting for approval\n\n"))
+        (should (equal (opencode-test-recap) "※ Waiting for approval\n  To push the fix.\n\n"))
         (setq opencode-test-recap-value
-              (cons "Done" (mapconcat (lambda (n) (format "line %d\n" n)) (number-sequence 1 12) "\n")))
+              (mapconcat (lambda (n) (format "line %d\n" n)) (number-sequence 1 12) "\n"))
         (opencode-session-summary-update)
-        (opencode-toggle-session-summary-recap)
         (should (equal (opencode-test-recap)
-                       (concat "※ Done\n"
-                               (mapconcat (lambda (n) (format "  line %d\n" n)) (number-sequence 1 8) "")
-                               "\n")))))))
+                       (concat "※ line 1\n"
+                               (mapconcat (lambda (n) (format "  line %d\n" n)) (number-sequence 2 8) "")
+                               "\n")))
+        ;; Wrapped, a line starts after the icon's width.
+        (should (equal (get-text-property (opencode-idle-start) 'wrap-prefix) "  "))
+        (setq opencode-test-recap-value (make-string 5000 ?a))
+        (opencode-session-summary-update)
+        (should (= (length (opencode-test-recap)) (+ 2 2000 2)))))))
 
 (ert-deftest opencode-test-recap-hidden-while-turn-runs ()
-  "The line goes as a turn starts, and is asked anew once it ends."
-  (opencode-test-with-recap '("Done: first" . nil)
+  "The summary goes as a turn starts, and is asked anew once it ends."
+  (opencode-test-with-recap "First turn done."
     (opencode-test-with-transcript (opencode-test-recap-turn 1)
       (let ((session (opencode-test-session)))
         (with-current-buffer (opencode-test-open session)
-          (should (string-search "Done: first" (opencode-test-recap)))
+          (should (opencode-test-recap-at-prompt-p))
           ;; A turn another client started.
           (opencode-test-turn session "started")
           (should-not (opencode-session-summary-string))
-          (should-not opencode--recap-overlay)
-          (setq opencode-test-recap-value '("Done: second" . nil))
+          (should-not (string-search "First turn done." (buffer-string)))
+          (setq opencode-test-recap-value "Second turn done.")
           (opencode-test-answer session "msg_step" "Working on it.")
-          (opencode-test-recap-redisplay)
-          (should-not (opencode-session-summary-string))
+          (should-not (string-search "turn done." (buffer-string)))
           (let ((asked opencode-test-recap-asked))
             (opencode-test-turn session "succeeded")
-            (opencode-test-recap-redisplay)
             (should (opencode-test-recap-at-prompt-p))
-            (should (equal (opencode-test-recap) "※ Done: second\n\n"))
-            (should (= opencode-test-recap-asked (1+ asked)))))))))
+            (should (equal (opencode-test-recap) "※ Second turn done.\n\n"))
+            (should (> opencode-test-recap-asked asked))
+            ;; After the turn's text.
+            (should (< (opencode-test-find "Working on it.") (opencode-test-find "Second turn done.")))
+            (should (= 1 (how-many "turn done\\." (point-min) (point-max))))))))))
 
 (ert-deftest opencode-test-recap-hidden-once-sent ()
-  "Sending a prompt hides the line at once: it never shows after the prompt sent."
-  (opencode-test-with-recap '("Done: first" . nil)
+  "Sending a prompt deletes the summary: it never stays in the transcript."
+  (opencode-test-with-recap "First turn done."
     (opencode-test-with-transcript (opencode-test-recap-turn 1)
       (with-current-buffer (opencode-test-open (opencode-test-session))
         (should (opencode-session-summary-string))
@@ -178,13 +180,23 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
         (should (opencode-test-recap-at-prompt-p))
         (opencode-send-input)
         (should-not (opencode-session-summary-string))
-        (opencode-test-recap-redisplay)
-        (should-not (opencode-session-summary-string))
-        (should (string-search "next" (buffer-substring-no-properties (point-min) (opencode-pmark))))))))
+        (should-not (string-search "First turn done." (buffer-string)))
+        (should (string-search "Answer 1.\n\n> next" (buffer-substring-no-properties (point-min) (opencode-pmark))))))))
+
+(ert-deftest opencode-test-recap-not-written-for-a-prompt-delivered ()
+  "A prompt of another client delivered at the idle prompt writes no summary before it."
+  (opencode-test-with-recap "First turn done."
+    (opencode-test-with-transcript (opencode-test-recap-turn 1)
+      (let ((session (opencode-test-session)))
+        (with-current-buffer (opencode-test-open session)
+          (should (opencode-session-summary-string))
+          (opencode-test-dispatch (opencode-test-inbox-events session "msg_tui" "from the TUI"))
+          (should (string-search "from the TUI" (buffer-string)))
+          (should-not (string-search "First turn done." (buffer-string))))))))
 
 (ert-deftest opencode-test-recap-updated-in-place ()
-  "Asked anew, the line changes in place, its overlay kept, points left where they are."
-  (opencode-test-with-recap '("Done: first" . nil)
+  "Asked anew, the summary changes, the input, point and window point kept."
+  (opencode-test-with-recap "First."
     (opencode-test-with-transcript (opencode-test-recap-turn 1)
       (let ((buffer (opencode-test-open (opencode-test-session))))
         (with-current-buffer buffer
@@ -192,135 +204,75 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
             (set-window-buffer (selected-window) buffer)
             (goto-char (point-max))
             (insert "draft")
-            (let ((overlay opencode--recap-overlay)
-                  (point (point))
-                  (window-point (window-point))
-                  (tick (buffer-modified-tick)))
-              (setq opencode-test-recap-value '("Done: revised" . nil))
+            (backward-char 2)
+            (set-window-point (selected-window) (point))
+            (let ((from-end (- (point-max) (point))))
+              (setq opencode-test-recap-value "A revised summary, longer than the first.")
               (opencode-session-summary-update buffer)
-              (should (eq opencode--recap-overlay overlay))
-              (should (equal (opencode-test-recap) "※ Done: revised\n\n"))
-              (should (= (point) point))
-              (should (= (window-point) window-point))
-              (should (= (buffer-modified-tick) tick))
+              (should (equal (opencode-test-recap) "※ A revised summary, longer than the first.\n\n"))
+              (should (= (- (point-max) (point)) from-end))
+              (should (= (- (point-max) (window-point)) from-end))
+              (should (equal (opencode-test-input buffer) "draft"))
+              ;; Told the same, nothing is written.
+              (let ((tick (buffer-modified-tick)))
+                (opencode-session-summary-update buffer)
+                (should (= (buffer-modified-tick) tick)))
               ;; Told nothing any more, it goes.
               (setq opencode-test-recap-value nil)
               (opencode-session-summary-update buffer)
               (should-not (opencode-session-summary-string))
               (should (equal (opencode-test-input buffer) "draft")))))))))
 
-(ert-deftest opencode-test-recap-unfolds ()
-  "A recap shows folded, unfolds on a click, and a new summary folds it again."
-  (opencode-test-with-recap '("Done: search" . "Added FTS.\n\n  Tests pass.  ")
+(ert-deftest opencode-test-recap-keeps-input-undo ()
+  "Writing the summary anew leaves the input's undo as it was."
+  (opencode-test-with-recap "First."
     (opencode-test-with-transcript (opencode-test-recap-turn 1)
       (let ((buffer (opencode-test-open (opencode-test-session))))
         (with-current-buffer buffer
-          (should (equal (opencode-test-recap) "※ Done: search …\n\n"))
-          (let* ((string (overlay-get opencode--recap-overlay 'before-string))
-                 (start (string-search "Done" string)))
-            (should (eq (lookup-key (get-text-property start 'keymap string) [mouse-1])
-                        #'opencode-session-summary-click))
-            (should (string-search "Tests pass." (get-text-property start 'help-echo string))))
-          (save-window-excursion
-            (set-window-buffer (selected-window) buffer)
-            (opencode-session-summary-click
-             `(mouse-1 (,(selected-window) ,(marker-position opencode--prompt-start) (0 . 0) 0))))
-          (should (equal (opencode-test-recap) "※ Done: search\n  Added FTS.\n  Tests pass.\n\n"))
-          (opencode-toggle-session-summary-recap)
-          (should (equal (opencode-test-recap) "※ Done: search …\n\n"))
-          (opencode-toggle-session-summary-recap)
-          (setq opencode-test-recap-value '("Done: more" . "Another recap."))
-          (opencode-session-summary-update)
-          (should (equal (opencode-test-recap) "※ Done: more …\n\n"))
-          (let ((opencode-session-summary-recap t))
-            (setq opencode-test-recap-value '("Done: again" . "Shown."))
-            (opencode-session-summary-update)
-            (should (equal (opencode-test-recap) "※ Done: again\n  Shown.\n\n")))
-          (setq opencode-test-recap-value '("Done: none" . nil))
-          (opencode-session-summary-update)
-          (should-error (opencode-toggle-session-summary-recap) :type 'user-error))))))
-
-;;;; What it leaves alone
-
-(ert-deftest opencode-test-recap-after-pending-area ()
-  "With pending prompts, the line shows after them, the pending area as it was."
-  (opencode-test-with-recap '("Done: first" . nil)
-    (opencode-test-with-transcript (opencode-test-recap-turn 1)
-      (let ((session (opencode-test-session)))
-        (with-current-buffer (opencode-test-open session)
-          (let ((alone (progn
-                         (let ((opencode-session-summary-function nil))
-                           (opencode-session-summary-update))
-                         (opencode-test-dispatch
-                          `(((type . "session.inbox.enqueued")
-                             (data (sessionID . ,session) (inboxID . "msg_tui")
-                                   (item (type . "user") (delivery . "queue") (payload (text . "later")))))))
-                         (opencode-inbox-area-string))))
-            (should (string-search "later" alone))
-            (opencode-session-summary-update)
-            (should (equal (opencode-inbox-area-string) alone))
-            (should (= (overlay-start opencode--inbox-overlay) (overlay-start opencode--recap-overlay)))
-            ;; Before-strings show by increasing priority: the pending area first.
-            (should (< (or (overlay-get opencode--inbox-overlay 'priority) 0)
-                       (overlay-get opencode--recap-overlay 'priority)))
-            ;; The pending area ends with a blank line, the line needs none before it.
-            (should (string-suffix-p "\n\n" alone))
-            (should (equal (opencode-test-recap) "※ Done: first\n\n"))
-            (opencode-test-dispatch
-             `(((type . "session.inbox.cancelled") (data (sessionID . ,session) (inboxID . "msg_tui")))))
-            (should-not (opencode-inbox-area-string))
-            (should (opencode-test-recap-at-prompt-p))))))))
-
-(ert-deftest opencode-test-recap-after-partial-line ()
-  "The line starts after a blank line whatever ends the transcript before it."
-  (opencode-test-with-transcript (opencode-test-recap-turn 1)
-    (with-current-buffer (opencode-test-open (opencode-test-session))
-      (should (equal (opencode-area-lead (point-min)) ""))
-      (let ((inhibit-read-only t))
-        (save-excursion
+          (buffer-enable-undo)
           (goto-char (point-max))
-          (insert "partial")))
-      (should (equal (opencode-area-lead (point-max)) "\n\n")))))
+          (undo-boundary)
+          (insert "draft")
+          (undo-boundary)
+          (setq opencode-test-recap-value "A revised summary, longer than the first.")
+          (opencode-session-summary-update buffer)
+          (let ((last-command nil))
+            (undo))
+          (should (equal (opencode-test-input buffer) ""))
+          (should (equal (opencode-test-recap) "※ A revised summary, longer than the first.\n\n")))))))
+
+;;;; Reading it
+
+(ert-deftest opencode-test-recap-quoted ()
+  "RET on the summary gives its line as it gives any line of the transcript."
+  (opencode-test-with-recap "Adding search: the index is done."
+    (opencode-test-with-transcript (opencode-test-recap-turn 1)
+      (with-current-buffer (opencode-test-open (opencode-test-session))
+        (let* ((given nil)
+               (opencode-old-input-function (lambda (text _buffer) (setq given text))))
+          (goto-char (opencode-test-find "the index"))
+          (opencode-send-input)
+          (should (equal given "※ Adding search: the index is done.")))))))
 
 (ert-deftest opencode-test-recap-input-and-motion ()
-  "The line takes no point: the input is typed and sent as ever, line motion passes over it."
-  (opencode-test-with-recap '("Done: first" . "A recap.")
+  "C-p and C-n go through the summary as through the transcript, to the input and back."
+  (opencode-test-with-recap "A summary."
     (opencode-test-with-transcript (opencode-test-recap-turn 1)
       (let ((buffer (opencode-test-open (opencode-test-session))))
         (with-current-buffer buffer
-          (save-window-excursion
-            (set-window-buffer (selected-window) buffer)
-            (set-window-start (selected-window) (point-min))
-            (goto-char (point-max))
-            (insert "first line\nsecond line")
-            (cl-flet ((places ()
-                        (goto-char (point-max))
-                        (let ((places nil))
-                          (dotimes (_ 3)
-                            (let ((this-command 'previous-line) (last-command 'previous-line))
-                              (line-move -1 t))
-                            (push (point) places))
-                          (dotimes (_ 3)
-                            (let ((this-command 'next-line) (last-command 'next-line))
-                              (line-move 1 t))
-                            (push (point) places))
-                          (nreverse places))))
-              (should (opencode-session-summary-string))
-              (let ((with (places))
-                    (pmark (opencode-pmark)))
-                ;; Up to the input's first line, then into the transcript.
-                (should (>= (nth 0 with) pmark))
-                (should (<= (nth 0 with) (+ pmark (length "first line"))))
-                (should (< (nth 1 with) (marker-position opencode--prompt-start)))
-                (should (opencode-session-summary-string))
-                (let ((opencode-session-summary-function nil))
-                  (opencode-session-summary-update))
-                (should-not (opencode-session-summary-string))
-                ;; As without the line.
-                (should (equal with (places)))))))))))
+          (let ((start (opencode-idle-start)))
+            (cl-flet ((press (keys)
+                        (should-not (opencode-test-press buffer keys))
+                        (point)))
+              (goto-char (point-max))
+              ;; Up from the empty input: the blank line, then the summary.
+              (press "C-p C-p")
+              (should (= (pos-bol) start))
+              ;; Down again, past the prompt, into the input.
+              (should (= (press "C-n C-n") (opencode-pmark))))))))))
 
 (ert-deftest opencode-test-recap-groups-as-without ()
-  "A prompt sent while the line shows groups the turn before it as without the line."
+  "A prompt sent while the summary shows groups the turn before it as without one."
   (cl-flet ((groups-after-send (function)
               (opencode-test-with-transcript (append (opencode-test-recap-turn 1) (opencode-test-recap-turn 2))
                 (let ((opencode-session-summary-function function))
@@ -330,31 +282,108 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
                       (goto-char (point-max))
                       (insert "Question 3")
                       (opencode-send-input)
-                      (list before (opencode-test-recap-groups) (opencode-test-text (current-buffer)))))))))
-    (let ((with (groups-after-send (lambda () '("Done: second" . "Recap."))))
+                      (list (length before) (length (opencode-test-recap-groups))
+                            (opencode-test-text (current-buffer)))))))))
+    (let ((with (groups-after-send (lambda () "Second turn done.")))
           (without (groups-after-send nil)))
-      (should (= (length (car with)) 1))
-      (should (= (length (cadr with)) 2))
+      (should (= (car with) 1))
+      (should (= (cadr with) 2))
       (should (equal with without)))))
 
+;;;; The pending area
+
+(ert-deftest opencode-test-recap-before-pending-area ()
+  "With pending prompts, the summary comes first, then the pending area, drawn whole."
+  (opencode-test-with-recap "First turn done."
+    (opencode-test-with-transcript (opencode-test-recap-turn 1)
+      (let ((session (opencode-test-session)))
+        (with-current-buffer (opencode-test-open session)
+          (opencode-test-dispatch
+           `(((type . "session.inbox.enqueued")
+              (data (sessionID . ,session) (inboxID . "msg_tui")
+                    (item (type . "user") (delivery . "queue") (payload (text . "later")))))))
+          (should (string-search "later" (opencode-inbox-area-string)))
+          (should (= (overlay-start opencode--inbox-overlay) opencode--prompt-start))
+          (should (< (opencode-idle-start) (overlay-start opencode--inbox-overlay)))
+          ;; The summary ends with a blank line: the area needs none more.
+          (should-not (string-prefix-p "\n" (opencode-inbox-area-string)))
+          (let ((drawn (opencode-test-area-drawn opencode--inbox-overlay)))
+            (should (cl-plusp (cdr drawn)))
+            (should (= (car drawn) (cdr drawn))))
+          ;; Written anew, the summary leaves the area as it was.
+          (let ((area (opencode-inbox-area-string)))
+            (setq opencode-test-recap-value "Revised.")
+            (opencode-session-summary-update)
+            (run-hook-with-args 'pre-redisplay-functions (selected-window))
+            (should (equal (opencode-inbox-area-string) area))
+            (should (= (overlay-start opencode--inbox-overlay) opencode--prompt-start))))))))
+
+;; A graphical frame alone draws margins.
+(defun opencode-test-recap-margin-faces (from to)
+  "Return the faces of the left margins drawn on the rows from FROM to TO, by row.
+FROM and TO are buffer positions shown in the selected window, which
+was just redisplayed: its rows are read from what it drew."
+  (let ((top (cdr (posn-x-y (posn-at-point from))))
+        (bottom (cdr (posn-x-y (posn-at-point to))))
+        (faces nil))
+    (dotimes (row (window-body-height))
+      (when-let* ((line (window-line-height row))
+                  (y (nth 2 line))
+                  ((<= top y bottom)))
+        (let* ((posn (posn-at-x-y 0 (+ y (/ (car line) 2)) (selected-window) t))
+               (string (and (eq (posn-area posn) 'left-margin) (car (posn-string posn)))))
+          (push (and string (get-text-property (or (cdr (posn-string posn)) 0) 'face string)) faces))))
+    (nreverse faces)))
+
+(ert-deftest opencode-test-recap-margin-on-input ()
+  "The prompt's margin is drawn on the input's row, not on the summary's nor the pending area's."
+  :tags '(gui)
+  (skip-unless (display-graphic-p))
+  (opencode-test-with-recap "First turn done."
+    (opencode-test-with-transcript (opencode-test-recap-turn 1)
+      (let* ((session (opencode-test-session))
+             (buffer (opencode-test-open session)))
+        (with-current-buffer buffer
+          (save-window-excursion
+            (set-window-buffer (selected-window) buffer)
+            (cl-flet ((faces ()
+                        (goto-char (point-max))
+                        (recenter -1)
+                        (redisplay t)
+                        (opencode-test-recap-margin-faces (opencode-idle-start) (point-max))))
+              (let ((faces (faces)))
+                (should (eq (car (last faces)) 'opencode-request-margin-highlight))
+                (should-not (memq 'opencode-request-margin-highlight (butlast faces))))
+              (opencode-test-dispatch
+               `(((type . "session.inbox.enqueued")
+                  (data (sessionID . ,session) (inboxID . "msg_tui")
+                        (item (type . "user") (delivery . "queue") (payload (text . "later")))))))
+              (let ((faces (faces)))
+                (should (> (length faces) 4))
+                (should (eq (car (last faces)) 'opencode-request-margin-highlight))
+                (should-not (memq 'opencode-request-margin-highlight (butlast faces)))))))))))
+
+;;;; Catching up and reloading
+
 (ert-deftest opencode-test-recap-catch-up ()
-  "Catching up shows the line at the new idle prompt, asked anew, the transcript as opened afresh."
-  (opencode-test-with-recap '("Done: first" . nil)
+  "Catching up shows the summary at the new idle prompt, asked anew, the transcript as opened afresh."
+  (opencode-test-with-recap "First turn done."
     (opencode-test-with-transcript (opencode-test-recap-turn 1)
       (let* ((id (opencode-test-session))
              (buffer (opencode-test-open id)))
         (with-current-buffer buffer
           (should (opencode-test-recap-at-prompt-p))
           (setq opencode-test-transcript (append opencode-test-transcript (opencode-test-recap-turn 2))
-                opencode-test-recap-value '("Done: second" . nil))
+                opencode-test-recap-value "Second turn done.")
           (let ((asked opencode-test-recap-asked))
             (opencode-test-reconnect)
             (should-not opencode--holding)
             (should (string-search "Answer 2." (opencode-test-text buffer)))
             (should (opencode-test-recap-at-prompt-p))
-            (should (equal (opencode-test-recap) "※ Done: second\n\n"))
+            (should (equal (opencode-test-recap) "※ Second turn done.\n\n"))
+            (should-not (string-search "First turn done." (buffer-string)))
             (should (> opencode-test-recap-asked asked))))
-        (let ((text (opencode-test-text buffer)))
+        (let ((text (with-current-buffer buffer (opencode-test-recap-text))))
           (let ((opencode-session-summary-function nil))
             (with-current-buffer buffer
               (rename-buffer "opencode-test-old" t)
@@ -365,25 +394,23 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
                 (puthash id buffer opencode-session-buffers)))))))))
 
 (ert-deftest opencode-test-recap-catch-up-renders-whole ()
-  "A catch-up rendering the transcript whole, as after a revert, ends with the line at the prompt."
-  (opencode-test-with-recap '("Done: second" . nil)
+  "A catch-up rendering the transcript whole, as after a revert, ends with one summary."
+  (opencode-test-with-recap "Second turn done."
     (opencode-test-with-transcript (append (opencode-test-recap-turn 1) (opencode-test-recap-turn 2))
       (let ((buffer (opencode-test-open (opencode-test-session))))
         (setq opencode-test-transcript (append (opencode-test-recap-turn 1) (opencode-test-recap-turn 3))
-              opencode-test-recap-value '("Done: third" . nil))
+              opencode-test-recap-value "Third turn done.")
         (opencode-test-reconnect)
         (with-current-buffer buffer
           (should-not (string-search "Answer 2." (opencode-test-text buffer)))
           (should (string-search "Answer 3." (opencode-test-text buffer)))
           (should (opencode-test-recap-at-prompt-p))
-          (should (equal (opencode-test-recap) "※ Done: third\n\n"))
-          ;; One line, whatever was deleted and written meanwhile.
-          (should (= 1 (seq-count (lambda (overlay) (overlay-get overlay 'opencode-recap))
-                                  (overlays-in (point-min) (point-max))))))))))
+          (should (equal (opencode-test-recap) "※ Third turn done.\n\n"))
+          (should (= 1 (how-many "turn done\\." (point-min) (point-max)))))))))
 
 (ert-deftest opencode-test-recap-reload ()
-  "Reverting a session buffer shows the line again at its prompt, the transcript unchanged."
-  (opencode-test-with-recap '("Done: first" . nil)
+  "Reverting a session buffer shows the summary again at its prompt, the transcript unchanged."
+  (opencode-test-with-recap "First turn done."
     (opencode-test-with-transcript (opencode-test-recap-turn 1)
       (let ((buffer (opencode-test-open (opencode-test-session))))
         (with-current-buffer buffer
@@ -392,11 +419,11 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
             (should-not opencode--holding)
             (should (equal (opencode-test-text buffer) text))
             (should (opencode-test-recap-at-prompt-p))
-            (should (equal (opencode-test-recap) "※ Done: first\n\n"))))))))
+            (should (= 1 (how-many "turn done\\." (point-min) (point-max))))))))))
 
 (ert-deftest opencode-test-recap-withheld-until-applied ()
-  "While a buffer withholds its events, the line does not show anew; it may go."
-  (opencode-test-with-recap '("Done: first" . nil)
+  "While a buffer withholds its events, the summary is not written; it is once they are applied."
+  (opencode-test-with-recap "First turn done."
     (opencode-test-with-transcript (opencode-test-recap-turn 1)
       (with-current-buffer (opencode-test-open (opencode-test-session))
         (let ((opencode--holding t))
@@ -408,16 +435,33 @@ VALUE is `opencode-test-recap-value', and the calls are counted in
         (opencode-session-summary-update)
         (should (opencode-test-recap-at-prompt-p))))))
 
-(ert-deftest opencode-test-recap-overlay-deleted-made-again ()
-  "An overlay a rewrite deleted is made again where the line belongs."
-  (opencode-test-with-recap '("Done: first" . nil)
+(ert-deftest opencode-test-recap-upgrades-earlier-buffers ()
+  "A buffer of an earlier version loses its overlay and hooks, its prompt displayed as its margin."
+  (opencode-test-with-recap "First turn done."
     (opencode-test-with-transcript (opencode-test-recap-turn 1)
       (with-current-buffer (opencode-test-open (opencode-test-session))
-        (delete-overlay opencode--recap-overlay)
-        (opencode-test-recap-redisplay)
-        (should (opencode-test-recap-at-prompt-p))
-        (should (equal (opencode-test-recap) "※ Done: first\n\n"))
-        (should (= opencode-test-recap-asked 1))))))
+        (let ((prompt (seq-find (lambda (overlay) (overlay-get overlay 'opencode-prompt-string))
+                                (overlays-at opencode--prompt-start)))
+              (margin (opencode-add-margin opencode--prompt-start (opencode-pmark)
+                                           'opencode-request-margin-highlight))
+              (old (make-overlay (opencode-pmark) (opencode-pmark))))
+          (overlay-put prompt 'display nil)
+          (overlay-put prompt 'opencode-prompt-string nil)
+          (overlay-put prompt 'invisible t)
+          (overlay-put old 'opencode-recap t)
+          (add-hook 'after-change-functions 'opencode-recap--anchor nil t)
+          (add-hook 'pre-redisplay-functions 'opencode-recap--anchor-window nil t)
+          (opencode-prompt-upgrade)
+          (opencode-recap-setup)
+          (should (equal (overlay-get prompt 'display)
+                         (opencode-margin-spec 'opencode-request-margin-highlight)))
+          (should (overlay-get prompt 'opencode-prompt-string))
+          (should-not (overlay-get prompt 'invisible))
+          (should-not (overlay-buffer margin))
+          (should-not (overlay-buffer old))
+          (should-not (memq 'opencode-recap--anchor after-change-functions))
+          (should-not (memq 'opencode-recap--anchor-window pre-redisplay-functions))
+          (should (opencode-test-recap-at-prompt-p)))))))
 
 (provide 'opencode-recap-test)
 ;;; opencode-recap-test.el ends here

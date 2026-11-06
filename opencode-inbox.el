@@ -353,22 +353,24 @@ none.  It costs little, for menus telling whether they apply."
 
 (defun opencode-inbox--anchor (&rest _)
   "Keep the pending area between the transcript and the input.
-That is at the process mark, after the idle prompt (see
+That is at the start of the idle prompt, else at the process mark (see
 `opencode-area-start').  Output inserted there and the idle prompt
-moving change it, so this runs after every change and before redisplay."
+moving change it, so this runs after every change and before redisplay;
+an overlay that lifting the idle prompt deleted with it is made again."
   (when-let* ((overlay opencode--inbox-overlay)
-              ((overlay-buffer overlay))
               ((get-buffer-process (current-buffer))))
-    (save-restriction
-      (widen)
-      (let* ((at (opencode-area-start))
-             (lead (opencode-area-lead (opencode--follow-start))))
-        (unless (= (overlay-start overlay) at)
-          (move-overlay overlay at at))
-        (unless (equal lead (overlay-get overlay 'opencode-inbox-lead))
-          (overlay-put overlay 'opencode-inbox-lead lead)
-          (overlay-put overlay 'before-string
-                       (concat lead (overlay-get overlay 'opencode-inbox-body))))))))
+    (if (not (overlay-buffer overlay))
+        (opencode-inbox-update)
+      (save-restriction
+        (widen)
+        (let* ((at (opencode-area-start))
+               (lead (opencode-area-lead at)))
+          (unless (= (overlay-start overlay) at)
+            (move-overlay overlay at at))
+          (unless (equal lead (overlay-get overlay 'opencode-inbox-lead))
+            (overlay-put overlay 'opencode-inbox-lead lead)
+            (overlay-put overlay 'before-string
+                         (concat lead (overlay-get overlay 'opencode-inbox-body)))))))))
 
 (defun opencode-inbox--anchor-window (_window)
   "Keep the pending area in place before redisplay, as `pre-redisplay-functions' run it."

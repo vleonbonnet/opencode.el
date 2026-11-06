@@ -501,18 +501,18 @@ It inherits the working status: a pending prompt waits on the turn."
 ;;;; Where a session stands
 
 (defcustom opencode-session-summary-icon "※"
-  "Icon heading the line on where a session stands, above its input.
-Claude Code heads its recap with it; an empty string shows the line
+  "Icon heading the summary of where a session stands, above its input.
+Claude Code heads its recap with it; an empty string shows the summary
 alone.  See `opencode-session-summary-function'."
   :type 'string
   :group 'opencode)
 
 (defface opencode-session-summary-icon '((t :inherit shadow))
-  "Icon heading the line on where a session stands, dimmed."
+  "Icon heading the summary of where a session stands, dimmed."
   :group 'opencode-faces)
 
 (defface opencode-session-summary '((t :inherit shadow :slant italic))
-  "Line on where a session stands, above its input.
+  "Summary of where a session stands, above its input.
 Dimmed and slanted: it is no part of the conversation, which another
 wrote it from."
   :group 'opencode-faces)
@@ -526,9 +526,9 @@ wrote it from."
 RECAP, a few lines recapping the last turn, or nil, shows below LINE
 when UNFOLDED, else an ellipsis after it tells there is one, and a
 click on the lines runs what KEYMAP binds, which shows or hides it.
-Session buffers show it above their input (see
-`opencode-session-summary-function'), and other packages' buffers of
-sessions alike."
+Other packages' buffers of sessions show it above their input, as an
+overlay string; session buffers write their summary as text instead
+\(see `opencode-session-summary-function')."
   (let* ((icon (if (string-empty-p opencode-session-summary-icon)
                    ""
                  (concat (propertize opencode-session-summary-icon 'face 'opencode-session-summary-icon)

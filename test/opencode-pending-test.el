@@ -205,7 +205,7 @@ cancellation event before answering, `quiet' answers without one,
       (with-current-buffer (opencode-test-open-empty session)
         (should (opencode-prompt-shown-p))
         (opencode-test-dispatch (list (opencode-test-enqueued session "msg_later" "later" "queue")))
-        (should (= (overlay-start opencode--inbox-overlay) (opencode-pmark)))
+        (should (= (overlay-start opencode--inbox-overlay) (marker-position opencode--prompt-start)))
         ;; A prompt typed while another waits waits behind it.
         (let ((id (opencode-test-type-and-send "after that")))
           (should (string-match-p "later\\(.\\|\n\\)*after that" (opencode-test-area)))

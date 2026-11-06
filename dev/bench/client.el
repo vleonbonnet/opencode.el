@@ -386,7 +386,7 @@ While it is down, agents work: the service adds turns to sessions."
 (defun bench-transcript-text (buffer)
   "Return the transcript BUFFER shows, without its idle prompt or the input."
   (with-current-buffer buffer
-    (let ((end (if (opencode-prompt-shown-p) (marker-position opencode--prompt-start) (opencode-pmark))))
+    (let ((end (or (opencode-idle-start) (opencode-pmark))))
       (string-trim-right (buffer-substring-no-properties (point-min) end)))))
 
 (defun bench-fetch-transcript (id)

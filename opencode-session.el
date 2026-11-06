@@ -1139,7 +1139,7 @@ Each is (EVENT . FUNCTION), FUNCTION applying EVENT in this buffer.")
   (when (and opencode--newest-message (null opencode--open-messages)
              (get-buffer-process (current-buffer)))
     ;; Before the idle prompt, which is rewritten after any new message.
-    (let ((end (if (opencode-prompt-shown-p) (marker-position opencode--prompt-start) (opencode-pmark)))
+    (let ((end (or (opencode-idle-start) (opencode-pmark)))
           (before (opencode--finished-end))
           (response (plist-get opencode--synced :response)))
       (if (markerp opencode-synced-end)
@@ -1461,7 +1461,8 @@ Input still being typed is lifted out and put back afterwards."
            (pending (opencode--take-input)))
       (unless (opencode-prompt-shown-p)
         (opencode-open-block 'user)
-        (opencode-show-prompt))
+        (let ((opencode--recap-inhibited t))
+          (opencode-show-prompt)))
       (goto-char (point-max))
       (insert text)
       (let ((comint-input-sender #'opencode-highlight-input)
@@ -3054,6 +3055,9 @@ Comint with another sender, SEND runs as it is."
   (cond
    ((not (and (derived-mode-p 'opencode-session-mode)
               (eq comint-input-sender #'opencode--send-input)))
+    ;; A prompt rendered from the transcript is sent from the idle prompt.
+    (when (derived-mode-p 'opencode-session-mode)
+      (opencode-recap-remove))
     (apply send arguments))
    ((and (not (seq-some #'identity arguments))
          (not (eq opencode--sending-input (current-buffer)))
@@ -3061,6 +3065,7 @@ Comint with another sender, SEND runs as it is."
     (let ((opencode--routing-input t))
       (opencode-send-input)))
    (t
+    (opencode-recap-remove)
     (let ((opencode--sending-input (current-buffer))
           (opencode--input-sent (and (get-buffer-process (current-buffer))
                                      (>= (point) (opencode-pmark))
@@ -3212,10 +3217,12 @@ them as their `opencode-sent-attachment' property."
 (defun opencode--hidden-p (position)
   "Return non-nil when an overlay hides the character at POSITION.
 Those are the blocks of a collapsed group and the prompt string before
-each prompt; text that markup hides, such as a link's target, shows."
+each prompt, invisible or displayed as its margin; text that markup
+hides, such as a link's target, shows."
   (seq-some (lambda (overlay)
-              (when-let* ((invisible (overlay-get overlay 'invisible)))
-                (invisible-p invisible)))
+              (or (overlay-get overlay 'opencode-prompt-string)
+                  (when-let* ((invisible (overlay-get overlay 'invisible)))
+                    (invisible-p invisible))))
             (overlays-at position)))
 
 (defun opencode-transcript-text (start end)
@@ -4183,26 +4190,28 @@ there is no reply or the request fails."
   "Call CALLBACK with a recap of the last turn of session ID, as a plist.
 The turn is that of the newest user message.  The plist holds:
 
- :prompt   The text of that message.
- :reply    The text of the newest assistant message with text since
-           it, whole: what the agent said last.
- :error    The message of the error the turn's newest assistant
-           message ended with.
- :changes  The files the turn changed, as (FILE ADDITIONS DELETIONS),
-           FILE as the service names it, relative to the session's
-           working tree.
+ :prompt        The text of that message.
+ :reply         The text of the newest assistant message with text since
+                it, whole: what the agent said last.
+ :error         The message of the error the turn's newest assistant
+                message ended with.
+ :changes       The files the turn changed, as (FILE ADDITIONS DELETIONS),
+                FILE as the service names it, relative to the session's
+                working tree.
+ :first-prompt  The text of the session's first user message, what
+                started it, which may be the turn's own.
 
-Each is nil when the turn has none.  The prompt, the replies and the
+Each is nil when the turn has none.  The prompts, the replies and the
 files changed are asked for at once; a request failing leaves its
 members nil, and when every request fails the plist is (:failure
 MESSAGE).  CALLBACK is called once, possibly before this returns, in
 whatever buffer is current then."
-  (let ((pending 3)
+  (let ((pending 4)
         (failures nil)
-        prompt newest reply changes)
+        prompt newest reply changes first)
     (cl-labels ((done ()
                   (when (zerop (cl-decf pending))
-                    (funcall callback (opencode--last-turn prompt newest reply changes failures))))
+                    (funcall callback (opencode--last-turn prompt newest reply changes failures first))))
                 (fail (error)
                   (push (opencode-error-describe error) failures)
                   (done)))
@@ -4214,6 +4223,14 @@ whatever buffer is current then."
          :else #'fail
          :then (lambda (response)
                  (setq prompt (car (opencode-request-data response)))
+                 (done)))
+        (opencode-request
+         'get (format "/api/session/%s/message" id)
+         :directory directory :buffer nil
+         :query '((limit . 1) (type . "user") (order . "asc"))
+         :else #'fail
+         :then (lambda (response)
+                 (setq first (car (opencode-request-data response)))
                  (done)))
         (opencode--newest-assistant
          id (lambda (message text-message)
@@ -4230,13 +4247,13 @@ whatever buffer is current then."
                  (setq changes (opencode-request-data response))
                  (done)))))))
 
-(defun opencode--last-turn (prompt newest reply changes failures)
+(defun opencode--last-turn (prompt newest reply changes failures &optional first)
   "Return the recap of `opencode-session-last-turn'.
 PROMPT is the newest user message, NEWEST the newest assistant
 message, REPLY the newest one with text, CHANGES the files the turn
-changed, each nil when unknown; FAILURES the descriptions of the
-requests that failed, newest first."
-  (if (= (length failures) 3)
+changed, FIRST the first user message, each nil when unknown; FAILURES
+the descriptions of the requests that failed, newest first."
+  (if (= (length failures) 4)
       (list :failure (car (last failures)))
     (let ((since (alist-get 'created (alist-get 'time prompt))))
       (cl-flet ((in-turn (message)
@@ -4245,10 +4262,12 @@ requests that failed, newest first."
                        (or (not (numberp since))
                            (let ((created (alist-get 'created (alist-get 'time message))))
                              (or (not (numberp created)) (>= created since))))
-                       message)))
-        (let ((text (alist-get 'text prompt))
-              (error (alist-get 'error (in-turn newest))))
-          (list :prompt (and (stringp text) (not (string-blank-p text)) (string-trim text))
+                       message))
+                (text (message)
+                  (let ((text (alist-get 'text message)))
+                    (and (stringp text) (not (string-blank-p text)) (string-trim text)))))
+        (let ((error (alist-get 'error (in-turn newest))))
+          (list :prompt (text prompt)
                 :reply (opencode--reply-text (in-turn reply))
                 :error (let ((message (alist-get 'message error)))
                          (and (stringp message) (not (string-empty-p message)) message))
@@ -4257,7 +4276,8 @@ requests that failed, newest first."
                                      (list .file
                                            (and (numberp .additions) .additions)
                                            (and (numberp .deletions) .deletions))))
-                                 changes)))))))
+                                 changes)
+                :first-prompt (text first)))))))
 
 (defun opencode-session-diff (id callback &optional whole context)
   "Call CALLBACK with the files session ID changed, as the service diffs them.
@@ -4610,6 +4630,7 @@ keep their own."
         (opencode-session-display-setup)
         (opencode-blocks-upgrade)
         (opencode-read-only-upgrade)
+        (opencode-prompt-upgrade)
         (opencode-recap-setup)))))
 
 (provide 'opencode-session)

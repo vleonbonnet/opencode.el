@@ -2279,11 +2279,11 @@ watermark serving every caller."
         (opencode-session-last-turn id (lambda (turn) (push (cons id turn) results))))
       (should (equal (alist-get "ses_a" results nil nil #'equal)
                      '(:prompt "Fix the build" :reply "All done." :error "Quota exceeded"
-                       :changes (("a.el" 10 2) ("b/c.el" 3 0)))))
+                       :changes (("a.el" 10 2) ("b/c.el" 3 0)) :first-prompt "Fix the build")))
       ;; A reply older than the prompt is a former turn's; the files
       ;; changed, unavailable, are unknown.
       (should (equal (alist-get "ses_b" results nil nil #'equal)
-                     '(:prompt "Next step" :reply nil :error nil :changes nil)))
+                     '(:prompt "Next step" :reply nil :error nil :changes nil :first-prompt "Next step")))
       ;; Without context: only the counts are read.
       (let ((diff (seq-find (lambda (request) (equal (plist-get request :path) "/api/session/ses_a/diff"))
                             opencode-test-requests)))

@@ -43,12 +43,14 @@ BLOCKS defaults to three: reasoning, a file read and a shell command."
         (opencode-test-idle (format "msg_g%02di" n))))
 
 (defun opencode-test-visible-text ()
-  "Return the text of the current buffer that shows, invisible text left out."
+  "Return the text of the current buffer that shows, hidden text left out.
+That is invisible text, and text an overlay hides otherwise, such as
+the prompt string before each prompt (see `opencode--hidden-p')."
   (let ((parts nil)
         (pos (point-min)))
     (while (< pos (point-max))
-      (let ((next (next-single-char-property-change pos 'invisible)))
-        (unless (invisible-p pos)
+      (let ((next (next-char-property-change pos)))
+        (unless (or (invisible-p pos) (opencode--hidden-p pos))
           (push (buffer-substring-no-properties pos next) parts))
         (setq pos next)))
     (string-trim-right (apply #'concat (nreverse parts)))))

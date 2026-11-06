@@ -112,6 +112,25 @@ output came last, prompt or not.")
        (marker-buffer opencode--prompt-start)
        (= (+ (marker-position opencode--prompt-start) 2) (opencode-pmark))))
 
+(defvar opencode--idle-text-function nil
+  "Function returning the text written just before the idle prompt, or nil.
+Called as the prompt is written, it returns a string carrying the
+property `opencode-idle-text' throughout, or nil for none: the text goes
+with the prompt (see `opencode-idle-start').")
+
+(defun opencode-idle-start ()
+  "Return where the idle prompt's area starts, or nil without an idle prompt.
+That is the start of the text written with the prompt and going with
+it (see `opencode--idle-text-function'), else of the prompt itself:
+the transcript ends there."
+  (when (opencode-prompt-shown-p)
+    (save-restriction
+      (widen)
+      (let ((start (marker-position opencode--prompt-start)))
+        (if (and (> start (point-min)) (get-text-property (1- start) 'opencode-idle-text))
+            (or (previous-single-property-change start 'opencode-idle-text) (point-min))
+          start)))))
+
 ;;;; Points following output
 
 ;; Comint keeps the points at the process mark after the output it
@@ -129,26 +148,28 @@ That call saw them before anything changed, so inner calls leave them.")
 (defun opencode--follow-start ()
   "Return where the positions following output start in this buffer.
 They are at the end of the transcript or in the input: from the start
-of the idle prompt ending the transcript, which shows as nothing, else
-from the process mark.  Without a process, only the end follows."
+of the idle prompt's area ending the transcript (see
+`opencode-idle-start'), else from the process mark.  Without a process,
+only the end follows."
+  (save-restriction
+    (widen)
+    (cond ((not (get-buffer-process (current-buffer))) (point-max))
+          ((opencode-idle-start))
+          (t (opencode-pmark)))))
+
+(defun opencode-area-start ()
+  "Return where an area between the transcript and the input shows.
+Such an area, the pending prompts, is an overlay string at that
+position: the start of the idle prompt, after the text going with it,
+else the process mark, or the end without a process.  The idle prompt
+displays as its margin rather than being invisible: redisplay skipping
+text an overlay makes invisible draws none of the strings of other
+overlays starting where it starts (see `opencode-show-prompt')."
   (save-restriction
     (widen)
     (cond ((not (get-buffer-process (current-buffer))) (point-max))
           ((opencode-prompt-shown-p) (marker-position opencode--prompt-start))
           (t (opencode-pmark)))))
-
-(defun opencode-area-start ()
-  "Return where an area between the transcript and the input shows.
-Such an area, the pending prompts or where the session stands, is an
-overlay string at that position: the process mark, after the idle
-prompt, else the end without a process.  Not at the idle prompt's start,
-where the transcript ends: redisplay skipping the prompt, which an
-overlay hides, draws none of the strings of other overlays starting
-there.  `opencode-area-lead' of `opencode--follow-start' tells the
-newlines it starts with."
-  (save-restriction
-    (widen)
-    (if (get-buffer-process (current-buffer)) (opencode-pmark) (point-max))))
 
 (defun opencode-area-lead (at)
   "Return the newlines an area shown at AT starts with, after the transcript.
@@ -416,9 +437,14 @@ blank line.  Spacing is measured at the process mark and only added."
         (opencode-output (make-string (- want newlines) ?\n)))))
   (setq opencode--last-block-kind kind))
 
+(defun opencode-margin-spec (face)
+  "Return the display specification drawing a FACE bar in the `left-margin'.
+Text it displays shows nothing else."
+  `((margin left-margin) ,(propertize "▎" 'face face)))
+
 (defun opencode-margin (face)
   "Return the `left-margin' display string drawn in FACE."
-  (propertize ">" 'display `((margin left-margin) ,(propertize "▎" 'face face))))
+  (propertize ">" 'display (opencode-margin-spec face)))
 
 (defun opencode-add-margin (start end face)
   "Draw a FACE margin from START up to, excluding, END."
@@ -430,9 +456,10 @@ blank line.  Spacing is measured at the process mark and only added."
 
 (defun opencode-lift-prompt ()
   "Remove the input prompt ending the transcript; return non-nil if there was one.
-Output written while a session is idle belongs before its prompt."
+Output written while a session is idle belongs before its prompt.  The
+text going with the prompt goes with it (see `opencode-idle-start')."
   (when (opencode-prompt-shown-p)
-    (let ((start (marker-position opencode--prompt-start))
+    (let ((start (opencode-idle-start))
           (inhibit-read-only t))
       (opencode-delete-overlays start (opencode-pmark))
       (delete-region start (opencode-pmark))
@@ -452,18 +479,43 @@ Output written while a session is idle belongs before its prompt."
            (opencode-show-prompt))))))
 
 (defun opencode-show-prompt ()
-  "Write the hidden input prompt and its margin after the transcript.
-Nothing is written when the transcript already ends with one."
+  "Write the hidden input prompt after the transcript, its margin drawn.
+The text going with it, if any, comes first (see
+`opencode--idle-text-function').  Nothing is written when the
+transcript already ends with a prompt.  The prompt displays as the
+margin's bar alone, on the row where it starts the input: neither an
+invisible prompt, which would hide the strings of the overlays starting
+where it starts, such as the pending area's, nor a line prefix, which
+would draw the bar on their first row."
   (unless (opencode-prompt-shown-p)
+    (when-let* ((text (and opencode--idle-text-function (funcall opencode--idle-text-function))))
+      (opencode-output text))
     (let ((start (opencode-pmark)))
       (opencode-output "> ")
-      (overlay-put (make-overlay start (opencode-pmark)) 'invisible t)
-      (opencode-add-margin start (opencode-pmark) 'opencode-request-margin-highlight)
+      (let ((overlay (make-overlay start (opencode-pmark))))
+        (overlay-put overlay 'display (opencode-margin-spec 'opencode-request-margin-highlight))
+        (overlay-put overlay 'opencode-prompt-string t))
       ;; The previous prompt became a sent input's; its marker would
       ;; slow every insertion until a garbage collection.
       (if (markerp opencode--prompt-start)
           (set-marker opencode--prompt-start start)
         (setq opencode--prompt-start (copy-marker start))))))
+
+(defun opencode-prompt-upgrade ()
+  "Have the idle prompt an earlier version made invisible display as its margin.
+Its margin, a line prefix then, goes.  See `opencode-show-prompt'."
+  (when (opencode-prompt-shown-p)
+    (let ((start (marker-position opencode--prompt-start))
+          (end (opencode-pmark)))
+      (dolist (overlay (overlays-in start end))
+        (cond
+         ((and (eq (overlay-get overlay 'invisible) t)
+               (= (overlay-start overlay) start) (= (overlay-end overlay) end))
+          (overlay-put overlay 'invisible nil)
+          (overlay-put overlay 'display (opencode-margin-spec 'opencode-request-margin-highlight))
+          (overlay-put overlay 'opencode-prompt-string t))
+         ((and (overlay-get overlay 'line-prefix) (= (overlay-start overlay) start))
+          (delete-overlay overlay)))))))
 
 (defun opencode-highlight-input (&optional _process _string)
   "Margin and mark the input just sent or replayed as prompt text.
