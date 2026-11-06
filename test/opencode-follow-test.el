@@ -426,5 +426,61 @@ session's ID, its buffer and the windows, the selected one first."
           (should (= (window-point (nth 2 windows)) (+ (point-min) 2)))
           (should (= (window-start (nth 2 windows)) (point-min))))))))
 
+(ert-deftest opencode-test-follow-sent-prompt ()
+  "A prompt sent past the input brings the buffer's point and its windows to the end of the input."
+  (opencode-test-with-server
+   (let* ((session (opencode-test-scenario "text"))
+          (buffer (opencode-test-open session))
+          (other (get-buffer-create "*follow sender*")))
+     (unwind-protect
+         (save-window-excursion
+           (pcase-let ((`(,_selected . ,windows) (opencode-test-windows other buffer buffer)))
+             (with-current-buffer buffer
+               (goto-char (point-max))
+               (insert "draft")
+               (let ((text (opencode-test-find "hello fixture")))
+                 (goto-char text)
+                 (set-window-point (car windows) (+ (opencode-pmark) 2))
+                 (set-window-point (cadr windows) text)
+                 (set-window-start (cadr windows) (point-min)))
+               (let ((id (opencode-session-send "from drover" :show t)))
+                 (should (equal (opencode-test-offsets buffer windows) '(5 5 5)))
+                 (should (equal (opencode-test-follow-input buffer) "draft"))
+                 ;; At the end, they follow the prompt delivered and the turn it starts.
+                 (opencode-test-dispatch (opencode-test-inbox-events session id "from drover"))
+                 (opencode-test-turn session "started")
+                 (opencode-test-answer session "msg_follow_sent" "Answered.")
+                 (should (string-search "Answered." (opencode-test-text buffer)))
+                 (should (equal (opencode-test-follow-input buffer) "draft"))
+                 (should (equal (opencode-test-offsets buffer windows) '(5 5 5)))))))
+       (kill-buffer other)))))
+
+(ert-deftest opencode-test-follow-sent-prompt-busy ()
+  "A prompt sent past the input while a turn runs brings the points to the end, after it pending."
+  (opencode-test-with-busy-session (session buffer windows)
+    (opencode-test-answer session "msg_follow_working" "Working.")
+    (opencode-test-place buffer (with-current-buffer buffer (opencode-test-find "Working.")) windows)
+    (with-current-buffer buffer
+      (opencode-session-send "steer from drover" :show t)
+      (should (string-search "steer from drover" (opencode-inbox-area-string))))
+    (should (equal (opencode-test-offsets buffer windows) '(0 0 0)))))
+
+(ert-deftest opencode-test-follow-sent-prompt-pinned ()
+  "A prompt sent while the transcript is written whole leaves its points to the load's end."
+  (opencode-test-with-server
+   (let* ((session (opencode-test-scenario "text"))
+          (buffer (opencode-test-open session)))
+     (save-window-excursion
+       (let ((windows (opencode-test-windows buffer buffer))
+             (start (with-current-buffer buffer (point-min))))
+         (opencode-test-place buffer start windows)
+         (with-current-buffer buffer
+           (setq opencode--pinned t)
+           (opencode-session-send "while loading" :show t)
+           (should (equal (cons (point) (mapcar #'window-point windows))
+                          (list start start start)))
+           (opencode--unpin))
+         (should (equal (opencode-test-offsets buffer windows) '(0 0 0))))))))
+
 (provide 'opencode-follow-test)
 ;;; opencode-follow-test.el ends here

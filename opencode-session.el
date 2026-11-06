@@ -2886,7 +2886,9 @@ transcript, where it goes back to the input should the server refuse
 it.  SHOW renders it once delivered, like a prompt of another client,
 and as pending until then while a turn runs or other prompts wait (see
 `opencode--defer-prompt-p').  Pending, it can be withdrawn to be edited
-again (see `opencode-edit-pending-prompt').
+again (see `opencode-edit-pending-prompt').  Sending moves the buffer's
+point and its windows to the end of the input, wherever the prompt
+comes from, so that they follow the turn it starts.
 
 THEN runs with the admitted inbox item, ELSE with the error; a prompt
 that fails keeps no ID.
@@ -2916,6 +2918,9 @@ it."
                                                          `((id . ,skill))))
                                                      attachments)))))
     (opencode-dismiss-turn-notifications)
+    ;; A transcript being written whole shows its end once loaded.
+    (unless opencode--pinned
+      (opencode--pin-viewport t))
     (unless show
       (puthash id t opencode--own-inputs)
       (when region
