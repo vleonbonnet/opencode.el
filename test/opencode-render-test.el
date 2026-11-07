@@ -60,6 +60,23 @@
       (font-lock-ensure)
       (should (memq 'opencode-prompt (ensure-list (get-text-property (1+ pmark) 'face)))))))
 
+(ert-deftest opencode-test-expanded-shell-is-literal ()
+  "A shell command keeps its dollars and other markup through expansion and refontification."
+  (opencode-test-with-input
+    (let ((command "kill -0 $$\nprintf '%s' '`code` **bold** _name_ $HOME [label](url)'"))
+      (opencode-tool-start "call_literal" "shell" `((command . ,command)) "running")
+      (let ((block (opencode-block "call_literal")))
+        (dotimes (_ 2)
+          (opencode-expand-block block)
+          (font-lock-fontify-region (point-min) (point-max))
+          (let* ((content (overlay-get block 'opencode-content-overlay))
+                 (start (overlay-start content))
+                 (end (+ start 2 (length command))))
+            (should (equal (buffer-substring-no-properties start end) (concat "$ " command)))
+            (should-not (opencode-test-hidden start end))
+            (should-not (text-property-not-all start end 'display nil)))
+          (opencode-collapse-block block))))))
+
 (ert-deftest opencode-test-transcript-markup-hidden ()
   "Markup before the input stays hidden: sent prompts read as quotes, their \"> \" unseen."
   (opencode-test-with-input

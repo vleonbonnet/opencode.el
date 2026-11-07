@@ -234,12 +234,12 @@ session's ID, its buffer and the windows, the selected one first."
            `(((type . "permission.asked")
               (data (id . "per_follow") (sessionID . ,session) (action . "shell") (resources "rm junk.txt")
                     (source (type . "tool") (messageID . "msg_follow_asking") (id . "call_unshown"))))))
-          (should (string-search "? Shell command: rm junk.txt" (opencode-test-text buffer)))
+          (should (string-search "? Run rm junk.txt" (opencode-test-text buffer)))
           (should (equal (opencode-test-offsets buffer windows) '(0 0 0)))
           (opencode-test-dispatch
            `(((type . "permission.replied")
               (data (sessionID . ,session) (requestID . "per_follow") (reply . "once")))))
-          (should (string-search "? Shell command: rm junk.txt [accepted]" (opencode-test-text buffer)))
+          (should (string-search "? Run rm junk.txt [accepted]" (opencode-test-text buffer)))
           (should (equal (opencode-test-offsets buffer windows) '(0 0 0))))))))
 
 (ert-deftest opencode-test-follow-inbox ()

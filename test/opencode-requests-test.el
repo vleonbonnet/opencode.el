@@ -12,7 +12,7 @@
 (require 'opencode-test-helpers)
 
 (ert-deftest opencode-test-permission-marks-its-tool ()
-  "A permission request marks the block of the call that asked, with its command and rule."
+  "A permission marks its tool with an action; expansion holds the asking rule."
   (opencode-test-with-server
     (let* ((id (opencode-test-scenario "permission"))
            (buffer (opencode-test-open-empty id))
@@ -21,24 +21,106 @@
         (should (= (length opencode-pending-permissions) 1))
         (let* ((permission (car opencode-pending-permissions))
                (overlay (opencode--permission-block permission)))
-          (should (equal (plist-get permission :title) "Shell command: rm junk.txt"))
+          (should (equal (plist-get permission :title) "Run rm junk.txt"))
           (should overlay)
           (should (eq (plist-get (opencode-block-data overlay) :waiting-kind) 'permission))
-          (should (string-match-p "rm junk.txt · asked by rule \"rm \\*\""
+          (should (string-match-p "Run rm junk.txt"
                                   (buffer-substring (overlay-start overlay) (overlay-end overlay))))
+          (should-not (string-search "rule" (overlay-get overlay 'opencode-summary)))
+          (opencode-expand-block overlay)
+          (should (string-search "Approval required\n  shell rule \"rm *\"" (opencode-test-text buffer)))
           (should (opencode-pending-request-p))
           ;; Answered in another client.
           (opencode-test-dispatch-until rest "permission.replied")
           (should-not opencode-pending-permissions)
           (should-not (plist-get (opencode-block-data overlay) :waiting)))))))
 
-(ert-deftest opencode-test-permission-summary-keeps-command ()
-  "A block waiting on a permission shows its command, then the rule that asked."
-  (should (string-match-p "rm junk.txt · asked by rule \"rm \\*\""
+(ert-deftest opencode-test-permission-summary-shows-action ()
+  "A block waiting on a permission uses the readable action as its summary."
+  (should (string-match-p "Send TERM to node (222209)"
                           (opencode-tool-collapsed-summary
-                           '(:type tool :tool "shell" :input ((command . "rm junk.txt"))
-                             :waiting t :waiting-kind permission
-                             :waiting-description "asked by rule \"rm *\"")))))
+                           '(:type tool :tool "shell" :input ((command . "kill -TERM 222209"))
+                                   :waiting t :waiting-kind permission
+                                   :waiting-summary "Send TERM to node (222209)")))))
+
+(ert-deftest opencode-test-permission-process-details ()
+  "Names come from the service; the expansion has context and the form only its command."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "text"))
+           (buffer (opencode-test-open-empty id))
+           (command "kill -TERM 222209 221757")
+           (request `((id . "per_processes") (sessionID . ,id) (action . "shell")
+                      (resources ,command) (save "kill *")
+                      (source (type . "tool") (messageID . "msg_processes") (id . "call_processes"))
+                      (reasons ((resource . ,command) (rule (action . "shell") (resource . "kill *") (effect . "ask"))))
+                      (metadata (command . ,command) (cwd . ,opencode-test-workspace) (shell . "bash") (timeout . 0)
+                                (signals ((command . ,command) (signal . "TERM")
+                                          (targets ((target . "222209") (kind . "pid") (name . "node")
+                                                    (command . "node server.js --port 3000"))
+                                                   ((target . "221757") (kind . "pid")))))))))
+      (with-current-buffer buffer
+        (opencode-tool-start "call_processes" "shell" '((command . "kill 222209") (timeout . 1000) (background . t)) "running")
+        (cl-letf (((symbol-function 'process-attributes) (lambda (&rest _) (ert-fail "Looked up a local PID"))))
+          (opencode-permission-queue request))
+        (let* ((permission (car opencode-pending-permissions))
+               (block (opencode--permission-block permission))
+               (opencode--permission-transient-state (list :buffer buffer :permission permission)))
+          (should (equal (plist-get permission :title) "Send TERM to node (222209), PID 221757"))
+          (should (equal (opencode--permission-description) command))
+          (opencode-expand-block block)
+          (let ((text (opencode--expanded-content block)))
+            (should (string-prefix-p (concat "$ " command) text))
+            (should (string-search "node server.js --port 3000" text))
+            (should (string-match-p "221757 +unavailable" text))
+            (should (string-search "Directory  " text))
+            (should (string-search "Execution  Background" text))
+            (should (string-search "Shell      bash" text))
+            (should (string-search "Timeout    Unlimited" text))
+            (should (string-suffix-p "Approval required\n  shell rule \"kill *\"" text))
+            (should (= 2 (length (split-string text (regexp-quote command))))))
+          (opencode-permission-reply permission 'once)
+          (should-not (plist-get (opencode-block-data block) :waiting-summary))
+          (should-not (plist-get (opencode-block-data block) :permission-display)))))))
+
+(ert-deftest opencode-test-permission-before-tool-keeps-full-command ()
+  "A request received before its tool gets a compact prompt and later a complete expansion."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
+      (let* ((command "kill -0 $$\nprintf '%s' '**literal**'")
+             (request `((id . "per_late_process") (action . "shell") (resources "kill -0 $$")
+                        (source (type . "tool") (id . "call_late_process")))))
+        (opencode-permission-queue request)
+        (opencode-tool-start "call_late_process" "shell" `((command . ,command)) "running")
+        (let* ((permission (car opencode-pending-permissions))
+               (opencode--permission-transient-state (list :permission permission)))
+          (should (equal (opencode--permission-description) "kill -0 $$ …"))
+          (should (string-search command (opencode--expanded-content (opencode-block "call_late_process")))))))))
+
+(ert-deftest opencode-test-permission-signal-target-kinds ()
+  "Signal zero and non-PID targets have accurate action labels."
+  (dolist (entry '(("shell" "$$" "Check the current shell ($$)")
+                   ("group" "-22" "Check process group 22 (-22)")
+                   ("group" "0" "Check the current process group (0)")
+                   ("all" "-1" "Check all permitted processes (-1)")
+                   ("job" "%1" "Check shell job %1")
+                   ("dynamic" "$PIDS" "Check target $PIDS (resolved at execution)")))
+    (pcase-let* ((`(,kind ,target ,expected) entry)
+                 (command (concat "kill -0 -- " target)))
+      (should (equal (opencode-permission-title
+                      "shell" (list command)
+                      `((command . ,command)
+                        (signals ((command . ,command) (signal . "0")
+                                  (targets ((kind . ,kind) (target . ,target)))))) nil)
+                     expected)))))
+
+(ert-deftest opencode-test-permission-remote-context ()
+  "A remote request displays the execution directory as that host spells it."
+  (cl-letf (((symbol-function 'opencode-service-files-p) (lambda () nil))
+            ((symbol-function 'opencode-service-label) (lambda () "remote-host")))
+    (let ((text (opencode--permission-display
+                 '(:action "shell" :metadata ((cwd . "/srv/project") (command . "pwd")))
+                 "shell" '((command . "pwd")))))
+      (should (string-search "Directory  /srv/project\nHost       remote-host" text)))))
 
 (ert-deftest opencode-test-permission-reply-request ()
   "Answering sends the decision to the session's reply route."
@@ -68,17 +150,17 @@
                            `((resource . "\"$W\" status 2>&1") (rule . ,dynamic))
                            `((resource . "\"$W\" status") (rule . ,dynamic))
                            '((resource . "curl example.com")))))
-                   (concat "\n\nAsked because:"
-                           "\n  shell rule \"*kanopy-oidc*\" asks for:"
+                   (concat "\n\nApproval required"
+                           "\n  shell rule \"*kanopy-oidc*\":"
                            "\n    python3 - <<'EOF' …"
                            "\n      line 3: mode = 'kanopy-oidc'"
-                           "\n  shell rule \"\"$*\" asks for:"
+                           "\n  shell rule \"\"$*\":"
                            "\n    \"$W\" status 2>&1"
-                           "\n  no rule allows:"
+                           "\n  no rule allows it:"
                            "\n    curl example.com")))
     (should (equal (opencode-permission-reasons-summary
                     `(((resource . "a") (rule . ,dynamic)) ((resource . "c"))))
-                    "asked by rule \"\"$*\"; no rule allows the rest"))))
+                   "asked by rule \"\"$*\"; no rule allows the rest"))))
 
 (ert-deftest opencode-test-permission-reject-commands ()
   "Plain rejection omits feedback; the feedback command sends its trimmed text."
@@ -124,11 +206,11 @@
                            `((resource . "bash -c \"$S\"")
                              (spelling . "set -e\ncd src\nmode=kanopy-oidc")
                              (rule . ,oidc)))))
-                   (concat "\n\nAsked because:"
-                           "\n  shell rule \"git push *\" asks for:"
+                   (concat "\n\nApproval required"
+                           "\n  shell rule \"git push *\":"
                            "\n    /usr/bin/git push origin"
                            "\n      as: git push origin"
-                           "\n  shell rule \"*kanopy-oidc*\" asks for:"
+                           "\n  shell rule \"*kanopy-oidc*\":"
                            "\n    bash -c \"$S\""
                            "\n      as: set -e …"
                            "\n      line 3: mode=kanopy-oidc")))))
@@ -444,11 +526,10 @@ transient's menu fails, and so does showing a session buffer otherwise."
   (car (split-string heading "\n")))
 
 (ert-deftest opencode-test-permission-in-place ()
-  "A permission is answered from a list, its transient naming the session, the session's buffer shown nowhere."
+  "A permission answered from a list has only its command above the controls."
   (opencode-test-with-server
     (let* ((id (opencode-test-scenario "permission"))
-           (buffer (opencode-test-open-empty id))
-           (title (opencode-test-session-title id)))
+           (buffer (opencode-test-open-empty id)))
       (opencode-test-dispatch-until (opencode-test-events id) "permission.asked")
       (let ((permission (car (buffer-local-value 'opencode-pending-permissions buffer))))
         (opencode-test-in-place id
@@ -458,10 +539,7 @@ transient's menu fails, and so does showing a session buffer otherwise."
             (opencode-test-keys "A"))
           (should (opencode-transient-displayed-p 'opencode-permission-transient))
           (should (window-live-p transient--window))
-          (let ((heading (opencode--permission-description)))
-            (should (string-prefix-p title (opencode-test-heading-line heading)))
-            (should (string-match-p "Shell command: rm junk.txt" heading))
-            (should (string-match-p "rule \"rm \\*\" asks for" heading)))
+          (should (equal (opencode--permission-description) "rm junk.txt"))
           (opencode-test-keys "o"))
         (should (equal (car (opencode-test-requests-to
                              'post (format "/api/session/%s/permission/%s/reply" id (plist-get permission :id))))
@@ -525,33 +603,25 @@ transient's menu fails, and so does showing a session buffer otherwise."
               (source (type . "tool") (messageID . ,message) (id . ,call))))))
     (concat "per_" call)))
 
-(ert-deftest opencode-test-permission-in-place-shows-change ()
-  "Answered in place, a file permission shows the change asked for, cut to the preview's lines."
+(ert-deftest opencode-test-permission-change-stays-in-expansion ()
+  "File changes stay in the expansion, whether the compact form is opened here or from a list."
   (opencode-test-with-server
     (let* ((id (opencode-test-scenario "text"))
            (buffer (opencode-test-open-empty id)))
       (opencode-test-edit-permission id "msg_test_edit" "call_test_edit")
       (opencode-test-in-place id
         (opencode-respond-session id nil t)
-        (let* ((heading (opencode--permission-description))
-               (removed (string-search "-beta" heading))
-               (added (string-search "+BETA" heading)))
-          (should (string-match-p "^Edit notes.txt$" heading))
-          (should (and removed added (< removed added)))
-          (should (string-search "+delta" heading))
-          (should (eq (get-text-property removed 'face heading) 'diff-removed))
-          (should (eq (get-text-property added 'face heading) 'diff-added)))
+        (should (equal (opencode--permission-description) "Edit notes.txt"))
+        (with-current-buffer buffer
+          (let ((block (opencode-block "call_test_edit")))
+            (opencode-expand-block block)
+            (should (string-search "-beta" (opencode-test-text buffer)))
+            (should (string-search "+BETA" (opencode-test-text buffer)))
+            (should (string-search "+delta" (opencode-test-text buffer)))))
         (opencode-test-keys "n"))
       (should (equal (car (opencode-test-requests-to 'post "/permission/per_call_test_edit/reply"))
                      '((decision . "reject"))))
       (with-current-buffer buffer (should-not opencode-pending-permissions))
-      (opencode-test-edit-permission id "msg_test_edit_2" "call_test_edit_2")
-      (opencode-test-in-place id
-        (let ((opencode-request-preview-lines 2))
-          (opencode-respond-session id nil t))
-        (should (string-suffix-p "\n\n  @@ -1,3 +1,4 @@\n   alpha\n  … 4 more lines"
-                                 (opencode--permission-description)))
-        (opencode-test-keys "o"))
       ;; Answered in its buffer, the transcript shows the change instead.
       (opencode-test-edit-permission id "msg_test_edit_3" "call_test_edit_3")
       (opencode-test-with-transients buffer
@@ -610,7 +680,7 @@ transient's menu fails, and so does showing a session buffer otherwise."
         (opencode-respond-session id nil t)
         (should (buffer-live-p (gethash id opencode-session-buffers)))
         (should (opencode-transient-displayed-p 'opencode-permission-transient))
-        (should (string-match-p "Shell command: make check" (opencode--permission-description)))
+        (should (equal "make check" (opencode--permission-description)))
         (opencode-test-keys "a"))
       (should (equal (car (opencode-test-requests-to 'post "/permission/per_test_background/reply"))
                      '((decision . "always"))))
@@ -653,8 +723,7 @@ transient's menu fails, and so does showing a session buffer otherwise."
         (opencode-test-in-place parent
           (opencode-respond-session parent nil t)
           (should (eq (plist-get opencode--permission-transient-state :buffer) child-buffer))
-          (should (string-prefix-p (opencode-test-session-title child)
-                                   (opencode-test-heading-line (opencode--permission-description))))
+          (should (equal (opencode--permission-description) "rm junk3.txt"))
           (opencode-test-keys "o"))
         (should (opencode-test-requests-to
                  'post (format "/api/session/%s/permission/%s/reply" child (plist-get permission :id))))
@@ -1118,7 +1187,7 @@ BACKGROUND runs the child in the background, as for
       (with-current-buffer buffer
         (let ((permission (car opencode-pending-permissions)))
           (should (equal (overlay-get (opencode--permission-block permission) 'help-echo)
-                         "Permission pending: Shell command: rm junk.txt.  C-' A responds."))
+                         "Permission pending: Run rm junk.txt.  C-' A responds."))
           (should (equal (opencode-test-capturing-messages
                            (let ((opencode--active-permission (list :buffer buffer :id (plist-get permission :id))))
                              (opencode--permission-on-exit)))

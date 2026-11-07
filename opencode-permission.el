@@ -23,20 +23,20 @@
 ;;; Commentary:
 
 ;; A permission request names the tool call that asked, so it marks that
-;; call's block in the attention face; the transient shows the whole
-;; command, patch or argument list.  A request whose block has not arrived
-;; yet prints a fallback line that the block replaces.  The transient
+;; call's block in the attention face, with a readable action.  Expanding
+;; it shows the operation, its targets and context, and the asking rules.
+;; The transient holds just a one-line command or action and its controls.
+;; A request whose block has not arrived yet prints a fallback line that
+;; the block replaces.  The transient
 ;; accepts once (o), always (a, showing the patterns saved), rejects (n),
 ;; rejects with feedback and continues (f),
 ;; or hands the task off to another primary agent (h): the session
 ;; switches agent, a synthetic message tells the model, and the pending
 ;; call is accepted once, so the turn continues with its context intact.
 ;;
-;; A shell request's resources are the command nodes rules match, without
-;; operators or redirections; its title shows the command as written, from
-;; the tool call, by its first line, and the transient shows all of it.
-;; My fork reports the rule behind each resource; the transient lists
-;; them, and the pending block names the rules instead of the command.
+;; Shell process details come from the execution host in the request's
+;; metadata; Emacs never looks up the PIDs on its own host.  The command
+;; and those details are literal text, not Markdown.
 
 ;;; Code:
 
@@ -51,7 +51,7 @@
 (defvar-local opencode-pending-permissions nil
   "Permission requests of this session awaiting an answer, oldest first.
 Each is a plist (:id :action :resources :save :metadata :source :reasons
-:title :detail :marker).")
+:title :prompt :marker).")
 
 (defvar opencode--active-permission nil
   "Plist (:buffer :id) of the permission shown or suspended in the transient.")
@@ -84,6 +84,28 @@ A remote service's path is its host's, made relative as a string."
               (overlay (opencode-block id)))
     (plist-get (opencode-block-data overlay) :input)))
 
+(defun opencode--permission-target-label (target)
+  "Return the readable name of signal TARGET from the execution host."
+  (let-alist target
+    (pcase .kind
+      ("pid" (if (and (stringp .name) (not (string-empty-p .name)))
+                 (format "%s (%s)" .name .target)
+               (format "PID %s" .target)))
+      ("shell" (format "the current shell (%s)" .target))
+      ("group" (if (equal .target "0") "the current process group (0)"
+                 (format "process group %s (%s)" (string-remove-prefix "-" .target) .target)))
+      ("all" "all permitted processes (-1)")
+      ("job" (format "shell job %s" .target))
+      (_ (format "target %s (resolved at execution)" .target)))))
+
+(defun opencode--permission-signal-title (command signals)
+  "Describe COMMAND when SIGNALS identifies the whole command as one signal operation."
+  (when (and (= (length signals) 1)
+             (equal (string-trim command) (string-trim (or (alist-get 'command (car signals)) ""))))
+    (let-alist (car signals)
+      (concat (if (equal .signal "0") "Check " (format "Send %s to " .signal))
+              (mapconcat #'opencode--permission-target-label .targets ", ")))))
+
 (defun opencode-permission-title (action resources metadata input)
   "Return the title of a permission request for ACTION on RESOURCES.
 METADATA comes with the request; INPUT is the asking tool call's input."
@@ -91,11 +113,9 @@ METADATA comes with the request; INPUT is the asking tool call's input."
     (let-alist metadata
       (pcase action
         ("shell"
-         (let ((command (or (alist-get 'command input) .command)))
-           (format "Shell command: %s"
-                   (if (and (stringp command) (not (string-empty-p command)))
-                       (opencode-permission-command-summary command)
-                     (string-join resources " ")))))
+         (let ((command (or .command (alist-get 'command input) (string-join resources " "))))
+           (or (opencode--permission-signal-title command .signals)
+               (format "Run %s" (opencode-permission-command-summary command)))))
         ("edit" (format "Edit %s" (opencode--permission-path (or (alist-get 'path input) first ""))))
         ("read" (format "Read %s" (opencode--permission-path (or (alist-get 'path input) first ""))))
         ((or "glob" "grep") (format "%s %S" (capitalize action) (or (alist-get 'pattern input) first "")))
@@ -111,13 +131,14 @@ METADATA comes with the request; INPUT is the asking tool call's input."
         (_ (format "Call %s%s" action
                    (if resources (format " on %s" (string-join resources ", ")) "")))))))
 
-(defun opencode--permission-detail (action input)
-  "Return the full text of an ACTION request with tool INPUT, or nil.
-Nil means its title already shows everything."
-  (let ((command (alist-get 'command input)))
-    (when (and (equal action "shell") (stringp command)
-               (string-search "\n" (string-trim command)))
-      (concat "Shell command: " command))))
+(defun opencode--permission-prompt (permission input)
+  "Return the one-line command or action of PERMISSION with tool INPUT."
+  (opencode-permission-command-summary
+   (or (alist-get 'command (plist-get permission :metadata))
+       (alist-get 'command input)
+       (and (equal (plist-get permission :action) "shell")
+            (string-join (plist-get permission :resources) " "))
+       (plist-get permission :title))))
 
 ;;;; Reasons
 
@@ -166,17 +187,17 @@ script."
             (named)
             (t "asked: no rule allows it")))))
 
-(defun opencode-permission-reasons-text (reasons)
+(defun opencode-permission-reasons-text (reasons &optional command)
   "Return the text explaining why a request with REASONS asks, or nil.
 Resources are grouped by the rule asking for them; one contained in
 another of its group, such as a command without its redirections, is
-left out."
+left out.  COMMAND, when it is the only resource, is already shown."
   (when reasons
     (let (groups)
       (dolist (reason reasons)
         (push reason (alist-get (alist-get 'rule reason) groups nil nil #'equal)))
       (concat
-       "\n\nAsked because:"
+       "\n\nApproval required"
        (mapconcat
         (lambda (group)
           (let* ((rule (car group))
@@ -191,14 +212,63 @@ left out."
                                     members)))
             (concat "\n  "
                     (if rule
-                        (format "%s rule \"%s\" asks for:"
+                        (format "%s rule \"%s\""
                                 (alist-get 'action rule) (alist-get 'resource rule))
-                      "no rule allows:")
-                    (mapconcat (lambda (reason)
-                                 (opencode--reason-resource (alist-get 'resource reason) rule
-                                                            (alist-get 'spelling reason)))
-                               shown ""))))
+                      "no rule allows it")
+                    (unless (and (= (length reasons) 1)
+                                 (not (alist-get 'spelling (car reasons)))
+                                 command
+                                 (equal (string-trim command)
+                                        (string-trim (alist-get 'resource (car reasons)))))
+                      (concat ":"
+                              (mapconcat (lambda (reason)
+                                           (opencode--reason-resource (alist-get 'resource reason) rule
+                                                                      (alist-get 'spelling reason)))
+                                         shown ""))))))
         (reverse groups) "")))))
+
+(defun opencode--permission-targets-text (signals)
+  "Return the target names and command lines in SIGNALS, or nil."
+  (when signals
+    (concat "\n\nTargets"
+            (mapconcat
+             (lambda (signal)
+               (concat (when (cdr signals) (format "\n  %s" (alist-get 'command signal)))
+                       (mapconcat
+                        (lambda (target)
+                          (let-alist target
+                            (format "\n  %-8s %s%s" .target
+                                    (if (equal .kind "pid") (or .name "unavailable")
+                                      (opencode--permission-target-label target))
+                                    (if (and (stringp .command) (not (string-empty-p .command)))
+                                        (concat "  " (replace-regexp-in-string "[\n\r\t]+" " " .command))
+                                      ""))))
+                        (alist-get 'targets signal) "")))
+             signals ""))))
+
+(defun opencode--permission-display (permission tool input)
+  "Return the expanded operation and context of PERMISSION for TOOL with INPUT."
+  (let* ((metadata (plist-get permission :metadata))
+         (command (or (alist-get 'command metadata) (alist-get 'command input)))
+         (directory (or (alist-get 'cwd metadata) (alist-get 'workdir input)
+                        (opencode-location) default-directory))
+         (reasons (opencode-permission-reasons-text (plist-get permission :reasons) command)))
+    (concat
+     (if (and (equal tool "shell") command)
+         (opencode-fontify-as (concat "$ " command) 'verbatim)
+       (opencode-format-tool-call tool input))
+     (opencode-fontify-as
+      (concat (opencode--permission-targets-text (alist-get 'signals metadata))
+              "\n\nDirectory  " (if (opencode-service-files-p)
+                                    (abbreviate-file-name (expand-file-name directory)) directory)
+              (unless (opencode-service-files-p) (concat "\nHost       " (opencode-service-label)))
+              (when (eq (alist-get 'background input) t) "\nExecution  Background")
+              (when-let* ((shell (alist-get 'shell metadata))) (concat "\nShell      " shell))
+              (when-let* ((timeout (or (alist-get 'timeout metadata) (alist-get 'timeout input))))
+                (format "\nTimeout    %s" (if (zerop timeout) "Unlimited" (format "%s ms" timeout))))
+              (or reasons (concat "\n\nApproval required\n  " (plist-get permission :action)))
+              (when-let* ((message (plist-get permission :message))) (concat "\n  " message)))
+      'verbatim))))
 
 ;;;; Queue
 
@@ -214,11 +284,17 @@ left out."
 
 (defun opencode--permission-mark-block (permission)
   "Mark PERMISSION's tool block as waiting; return the block.
-The transient shows the full command, so the block stays collapsed."
+The expanded block holds the details; the transient stays compact."
   (when-let* ((overlay (opencode--permission-block permission)))
-    (opencode-block-update overlay :waiting t :waiting-kind 'permission
-                           :waiting-description
-                           (opencode-permission-reasons-summary (plist-get permission :reasons)))
+    (let* ((data (opencode-block-data overlay))
+           (input (plist-get data :input)))
+      (plist-put permission :title
+                 (opencode-permission-title (plist-get permission :action) (plist-get permission :resources)
+                                            (plist-get permission :metadata) input))
+      (plist-put permission :prompt (opencode--permission-prompt permission input))
+      (opencode-block-update overlay :waiting t :waiting-kind 'permission
+                             :waiting-summary (plist-get permission :title) :waiting-description nil
+                             :permission-display (opencode--permission-display permission (plist-get data :tool) input)))
     (overlay-put overlay 'help-echo
                  (format "Permission pending: %s.  %s responds."
                          (plist-get permission :title) (opencode-command-keys 'opencode-respond)))
@@ -228,7 +304,8 @@ The transient shows the full command, so the block stays collapsed."
   "Clear the waiting mark of PERMISSION's tool block."
   (when-let* ((overlay (opencode--permission-block permission)))
     (when (eq (plist-get (opencode-block-data overlay) :waiting-kind) 'permission)
-      (opencode-block-update overlay :waiting nil :waiting-kind nil :waiting-description nil)
+      (opencode-block-update overlay :waiting nil :waiting-kind nil :waiting-description nil
+                             :waiting-summary nil :permission-display nil)
       (overlay-put overlay 'help-echo nil))))
 
 (defun opencode--permission-fallback (permission)
@@ -276,9 +353,10 @@ The transient shows the full command, so the block stays collapsed."
     (unless (opencode--permission-find .id)
       (let* ((input (opencode--permission-tool-input .source))
              (permission (list :id .id :action .action :resources .resources :save .save
-                               :metadata .metadata :source .source :reasons .reasons
+                               :metadata .metadata :source .source :reasons .reasons :message .message
                                :title (opencode-permission-title .action .resources .metadata input)
-                               :detail (opencode--permission-detail .action input))))
+                               :prompt nil)))
+        (plist-put permission :prompt (opencode--permission-prompt permission input))
         (setq opencode-pending-permissions (append opencode-pending-permissions (list permission)))
         (unless (opencode--permission-mark-block permission)
           (opencode--permission-fallback permission))
@@ -380,10 +458,7 @@ The transient shows the full command, so the block stays collapsed."
 ;;;; Transient
 
 (defvar opencode--permission-transient-state nil
-  "Plist (:buffer :permission :in-place :preview) the permission transient acts on.
-:in-place is non-nil when it is answered in place, see
-`opencode-respond-session', and :preview is then the change the
-request's tool call would make, if any.")
+  "Plist (:buffer :permission) the permission transient acts on.")
 
 (defun opencode--permission-transient-act (function &rest arguments)
   "Call FUNCTION with the transient's permission and ARGUMENTS in its buffer."
@@ -440,75 +515,19 @@ request's tool call would make, if any.")
     (let ((agent (completing-read (format-prompt "Hand off to" (car names)) names nil t nil nil (car names))))
       (opencode--permission-transient-act #'opencode-permission-hand-off agent))))
 
-(defcustom opencode-request-preview-lines 20
-  "Lines of a tool call's changes shown when answering its permission in place.
-Answered in place (see `opencode-respond-session'), a permission to edit,
-patch or write a file shows the diff or the content its tool call
-would write, cut to this many lines; nil shows all of it."
-  :type '(choice (const :tag "All" nil) natnum)
-  :group 'opencode)
-
-(defun opencode--preview-lines (text diff)
-  "Return TEXT indented and cut to `opencode-request-preview-lines' lines.
-DIFF colors its lines as a diff's."
-  (let* ((lines (split-string (string-trim-right text) "\n"))
-         (shown (if opencode-request-preview-lines (seq-take lines opencode-request-preview-lines) lines))
-         (rest (- (length lines) (length shown))))
-    (concat
-     (mapconcat (lambda (line)
-                  (concat "  " (if diff
-                                   (propertize line 'face
-                                               (cond ((string-prefix-p "@@" line) 'diff-hunk-header)
-                                                     ((string-prefix-p "***" line) 'diff-file-header)
-                                                     ((string-prefix-p "+" line) 'diff-added)
-                                                     ((string-prefix-p "-" line) 'diff-removed)
-                                                     (t 'diff-context)))
-                                 line)))
-                shown "\n")
-     (when (> rest 0)
-       (propertize (format "\n  … %d more line%s" rest (if (= rest 1) "" "s")) 'face 'shadow)))))
-
-(defun opencode--permission-preview (permission)
-  "Return what PERMISSION's tool call would change, or nil.
-The title names the file an edit, patch or write changes, not the
-change, which its block shows in the transcript: answered in place,
-the transient shows it instead."
-  (when-let* ((overlay (opencode--permission-block permission))
-              (data (opencode-block-data overlay))
-              (input (plist-get data :input)))
-    (let* ((tool (plist-get data :tool))
-           (text (let-alist input
-                   (pcase tool
-                     ("edit" (opencode--format-edit-diff (or .oldString "") (or .newString "")))
-                     ("patch" (opencode--format-patch (or .patchText "")))
-                     ("write" .content)))))
-      (when (and (stringp text) (not (string-blank-p text)))
-        (opencode--preview-lines text (not (equal tool "write")))))))
-
 (defun opencode--permission-description ()
-  "Return the heading of the permission transient.
-Answered in place, it names the session first and shows the change
-asked for last."
-  (let* ((state opencode--permission-transient-state)
-         (permission (plist-get state :permission))
-         (buffer (plist-get state :buffer))
-         (in-place (and (plist-get state :in-place) (buffer-live-p buffer))))
-    (concat (when in-place
-              (with-current-buffer buffer (opencode--request-session-heading)))
-            (or (plist-get permission :detail) (plist-get permission :title) "Permission")
-            (opencode-permission-reasons-text (plist-get permission :reasons))
-            (when-let* ((in-place)
-                        (preview (plist-get state :preview)))
-              (concat "\n\n" preview)))))
+  "Return the one-line command or action heading the permission transient."
+  (let ((permission (plist-get opencode--permission-transient-state :permission)))
+    (or (plist-get permission :prompt) (plist-get permission :title) "Permission")))
 
 (transient-define-prefix opencode-permission-transient ()
   "Answer an OpenCode permission request."
   [:description opencode--permission-description
-                ("o" "Accept once" opencode-permission-accept)
-                ("a" opencode-permission-accept-always)
-                ("n" "Reject and stop" opencode-permission-reject)
-                ("f" "Reject with feedback" opencode-permission-reject-with-feedback)
-                ("h" "Hand off to another agent" opencode-permission-hand-off-suffix)])
+                [("o" "Accept once" opencode-permission-accept)
+                 ("n" "Reject and stop" opencode-permission-reject)
+                 ("h" "Hand off to another agent" opencode-permission-hand-off-suffix)]
+                [("a" opencode-permission-accept-always)
+                 ("f" "Reject with feedback" opencode-permission-reject-with-feedback)]])
 
 (opencode-install-hidden-navigation 'opencode-permission-transient opencode-transient-scroll-suffixes)
 
@@ -537,8 +556,7 @@ drover's menu, comes once this one is shown, and does not count."
 (defun opencode-respond-permission (&optional permission)
   "Open the transient of PERMISSION, else the oldest pending one.
 A transient suspended from this buffer is resumed instead.  Opened in
-place (see `opencode-respond-session'), it always shows its menu,
-which holds the request's context."
+place (see `opencode-respond-session'), it always shows its menu."
   (interactive)
   (opencode--with-transient-menu opencode--answering-in-place
     (cond
@@ -546,11 +564,6 @@ which holds the request's context."
            (eq (plist-get opencode--active-permission :buffer) (current-buffer))
            (or (null permission)
                (equal (plist-get permission :id) (plist-get opencode--active-permission :id))))
-      (setq opencode--permission-transient-state
-            (plist-put (plist-put opencode--permission-transient-state :in-place opencode--answering-in-place)
-                       :preview (and opencode--answering-in-place
-                                     (opencode--permission-preview
-                                      (plist-get opencode--permission-transient-state :permission)))))
       (add-hook 'transient-exit-hook #'opencode--permission-on-exit)
       (transient-resume))
      ((bound-and-true-p transient--prefix)
@@ -562,10 +575,7 @@ which holds the request's context."
           (pop transient--stack))
         (setq opencode--active-permission (list :buffer (current-buffer) :id (plist-get permission :id))
               opencode--permission-transient-state
-              (list :buffer (current-buffer) :permission permission
-                    :in-place opencode--answering-in-place
-                    ;; Once: the menu's heading is drawn again after every key.
-                    :preview (and opencode--answering-in-place (opencode--permission-preview permission))))
+              (list :buffer (current-buffer) :permission permission))
         (add-hook 'transient-exit-hook #'opencode--permission-on-exit)
         (call-interactively #'opencode-permission-transient))))))
 

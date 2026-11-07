@@ -88,7 +88,7 @@
       (opencode-test-dispatch-until (opencode-test-events id) "permission.asked")
       (should (equal (opencode-test-notification-kinds) '(permission)))
       (should (equal (alist-get 'message (car opencode-test-notifications))
-                     "Shell command: rm junk.txt"))
+                     "Run rm junk.txt"))
       (opencode-test-dispatch
        `(((type . "session.retry.scheduled")
           (data (sessionID . ,id) (assistantMessageID . "msg_x") (attempt . 2) (at . 0)
