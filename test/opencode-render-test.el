@@ -63,7 +63,7 @@
 (ert-deftest opencode-test-expanded-shell-is-literal ()
   "A shell command keeps its dollars and other markup through expansion and refontification."
   (opencode-test-with-input
-    (let ((command "kill -0 $$\nprintf '%s' '`code` **bold** _name_ $HOME [label](url)'"))
+    (let ((command "echo $$\nprintf '%s' '`code` **bold** _name_ $HOME [label](url)'"))
       (opencode-tool-start "call_literal" "shell" `((command . ,command)) "running")
       (let ((block (opencode-block "call_literal")))
         (dotimes (_ 2)

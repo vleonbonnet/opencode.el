@@ -24,7 +24,7 @@
 
 ;; A permission request names the tool call that asked, so it marks that
 ;; call's block in the attention face, with a readable action.  Expanding
-;; it shows the operation, its targets and context, and the asking rules.
+;; it shows the operation, its context and the asking rules.
 ;; The transient holds just a one-line command or action and its controls.
 ;; A request whose block has not arrived yet prints a fallback line that
 ;; the block replaces.  The transient
@@ -34,9 +34,8 @@
 ;; switches agent, a synthetic message tells the model, and the pending
 ;; call is accepted once, so the turn continues with its context intact.
 ;;
-;; Shell process details come from the execution host in the request's
-;; metadata; Emacs never looks up the PIDs on its own host.  The command
-;; and those details are literal text, not Markdown.
+;; A shell command and its execution details are literal text, not
+;; Markdown.
 
 ;;; Code:
 
@@ -84,28 +83,6 @@ A remote service's path is its host's, made relative as a string."
               (overlay (opencode-block id)))
     (plist-get (opencode-block-data overlay) :input)))
 
-(defun opencode--permission-target-label (target)
-  "Return the readable name of signal TARGET from the execution host."
-  (let-alist target
-    (pcase .kind
-      ("pid" (if (and (stringp .name) (not (string-empty-p .name)))
-                 (format "%s (%s)" .name .target)
-               (format "PID %s" .target)))
-      ("shell" (format "the current shell (%s)" .target))
-      ("group" (if (equal .target "0") "the current process group (0)"
-                 (format "process group %s (%s)" (string-remove-prefix "-" .target) .target)))
-      ("all" "all permitted processes (-1)")
-      ("job" (format "shell job %s" .target))
-      (_ (format "target %s (resolved at execution)" .target)))))
-
-(defun opencode--permission-signal-title (command signals)
-  "Describe COMMAND when SIGNALS identifies the whole command as one signal operation."
-  (when (and (= (length signals) 1)
-             (equal (string-trim command) (string-trim (or (alist-get 'command (car signals)) ""))))
-    (let-alist (car signals)
-      (concat (if (equal .signal "0") "Check " (format "Send %s to " .signal))
-              (mapconcat #'opencode--permission-target-label .targets ", ")))))
-
 (defun opencode-permission-title (action resources metadata input)
   "Return the title of a permission request for ACTION on RESOURCES.
 METADATA comes with the request; INPUT is the asking tool call's input."
@@ -113,9 +90,8 @@ METADATA comes with the request; INPUT is the asking tool call's input."
     (let-alist metadata
       (pcase action
         ("shell"
-         (let ((command (or .command (alist-get 'command input) (string-join resources " "))))
-           (or (opencode--permission-signal-title command .signals)
-               (format "Run %s" (opencode-permission-command-summary command)))))
+         (format "Run %s" (opencode-permission-command-summary
+                           (or .command (alist-get 'command input) (string-join resources " ")))))
         ("edit" (format "Edit %s" (opencode--permission-path (or (alist-get 'path input) first ""))))
         ("read" (format "Read %s" (opencode--permission-path (or (alist-get 'path input) first ""))))
         ((or "glob" "grep") (format "%s %S" (capitalize action) (or (alist-get 'pattern input) first "")))
@@ -227,25 +203,6 @@ left out.  COMMAND, when it is the only resource, is already shown."
                                          shown ""))))))
         (reverse groups) "")))))
 
-(defun opencode--permission-targets-text (signals)
-  "Return the target names and command lines in SIGNALS, or nil."
-  (when signals
-    (concat "\n\nTargets"
-            (mapconcat
-             (lambda (signal)
-               (concat (when (cdr signals) (format "\n  %s" (alist-get 'command signal)))
-                       (mapconcat
-                        (lambda (target)
-                          (let-alist target
-                            (format "\n  %-8s %s%s" .target
-                                    (if (equal .kind "pid") (or .name "unavailable")
-                                      (opencode--permission-target-label target))
-                                    (if (and (stringp .command) (not (string-empty-p .command)))
-                                        (concat "  " (replace-regexp-in-string "[\n\r\t]+" " " .command))
-                                      ""))))
-                        (alist-get 'targets signal) "")))
-             signals ""))))
-
 (defun opencode--permission-display (permission tool input)
   "Return the expanded operation and context of PERMISSION for TOOL with INPUT."
   (let* ((metadata (plist-get permission :metadata))
@@ -258,8 +215,7 @@ left out.  COMMAND, when it is the only resource, is already shown."
          (opencode-fontify-as (concat "$ " command) 'verbatim)
        (opencode-format-tool-call tool input))
      (opencode-fontify-as
-      (concat (opencode--permission-targets-text (alist-get 'signals metadata))
-              "\n\nDirectory  " (if (opencode-service-files-p)
+      (concat "\n\nDirectory  " (if (opencode-service-files-p)
                                     (abbreviate-file-name (expand-file-name directory)) directory)
               (unless (opencode-service-files-p) (concat "\nHost       " (opencode-service-label)))
               (when (eq (alist-get 'background input) t) "\nExecution  Background")

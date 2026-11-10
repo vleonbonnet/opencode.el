@@ -37,46 +37,39 @@
 
 (ert-deftest opencode-test-permission-summary-shows-action ()
   "A block waiting on a permission uses the readable action as its summary."
-  (should (string-match-p "Send TERM to node (222209)"
+  (should (string-match-p "Run rm junk.txt"
                           (opencode-tool-collapsed-summary
-                           '(:type tool :tool "shell" :input ((command . "kill -TERM 222209"))
+                           '(:type tool :tool "shell" :input ((command . "rm junk.txt"))
                                    :waiting t :waiting-kind permission
-                                   :waiting-summary "Send TERM to node (222209)")))))
+                                   :waiting-summary "Run rm junk.txt")))))
 
-(ert-deftest opencode-test-permission-process-details ()
-  "Names come from the service; the expansion has context and the form only its command."
+(ert-deftest opencode-test-permission-details ()
+  "The command comes from the service; the expansion has context and the form only its command."
   (opencode-test-with-server
     (let* ((id (opencode-test-scenario "text"))
            (buffer (opencode-test-open-empty id))
-           (command "kill -TERM 222209 221757")
-           (request `((id . "per_processes") (sessionID . ,id) (action . "shell")
-                      (resources ,command) (save "kill *")
-                      (source (type . "tool") (messageID . "msg_processes") (id . "call_processes"))
-                      (reasons ((resource . ,command) (rule (action . "shell") (resource . "kill *") (effect . "ask"))))
-                      (metadata (command . ,command) (cwd . ,opencode-test-workspace) (shell . "bash") (timeout . 0)
-                                (signals ((command . ,command) (signal . "TERM")
-                                          (targets ((target . "222209") (kind . "pid") (name . "node")
-                                                    (command . "node server.js --port 3000"))
-                                                   ((target . "221757") (kind . "pid")))))))))
+           (command "rm junk.txt build.log")
+           (request `((id . "per_details") (sessionID . ,id) (action . "shell")
+                      (resources ,command) (save "rm *")
+                      (source (type . "tool") (messageID . "msg_details") (id . "call_details"))
+                      (reasons ((resource . ,command) (rule (action . "shell") (resource . "rm *") (effect . "ask"))))
+                      (metadata (command . ,command) (cwd . ,opencode-test-workspace) (shell . "bash") (timeout . 0)))))
       (with-current-buffer buffer
-        (opencode-tool-start "call_processes" "shell" '((command . "kill 222209") (timeout . 1000) (background . t)) "running")
-        (cl-letf (((symbol-function 'process-attributes) (lambda (&rest _) (ert-fail "Looked up a local PID"))))
-          (opencode-permission-queue request))
+        (opencode-tool-start "call_details" "shell" '((command . "rm build.log") (timeout . 1000) (background . t)) "running")
+        (opencode-permission-queue request)
         (let* ((permission (car opencode-pending-permissions))
                (block (opencode--permission-block permission))
                (opencode--permission-transient-state (list :buffer buffer :permission permission)))
-          (should (equal (plist-get permission :title) "Send TERM to node (222209), PID 221757"))
+          (should (equal (plist-get permission :title) (concat "Run " command)))
           (should (equal (opencode--permission-description) command))
           (opencode-expand-block block)
           (let ((text (opencode--expanded-content block)))
             (should (string-prefix-p (concat "$ " command) text))
-            (should (string-search "node server.js --port 3000" text))
-            (should (string-match-p "221757 +unavailable" text))
             (should (string-search "Directory  " text))
             (should (string-search "Execution  Background" text))
             (should (string-search "Shell      bash" text))
             (should (string-search "Timeout    Unlimited" text))
-            (should (string-suffix-p "Approval required\n  shell rule \"kill *\"" text))
+            (should (string-suffix-p "Approval required\n  shell rule \"rm *\"" text))
             (should (= 2 (length (split-string text (regexp-quote command))))))
           (opencode-permission-reply permission 'once)
           (should-not (plist-get (opencode-block-data block) :waiting-summary))
@@ -86,32 +79,15 @@
   "A request received before its tool gets a compact prompt and later a complete expansion."
   (opencode-test-with-server
     (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
-      (let* ((command "kill -0 $$\nprintf '%s' '**literal**'")
-             (request `((id . "per_late_process") (action . "shell") (resources "kill -0 $$")
-                        (source (type . "tool") (id . "call_late_process")))))
+      (let* ((command "echo $$\nprintf '%s' '**literal**'")
+             (request `((id . "per_late") (action . "shell") (resources "echo $$")
+                        (source (type . "tool") (id . "call_late")))))
         (opencode-permission-queue request)
-        (opencode-tool-start "call_late_process" "shell" `((command . ,command)) "running")
+        (opencode-tool-start "call_late" "shell" `((command . ,command)) "running")
         (let* ((permission (car opencode-pending-permissions))
                (opencode--permission-transient-state (list :permission permission)))
-          (should (equal (opencode--permission-description) "kill -0 $$ …"))
-          (should (string-search command (opencode--expanded-content (opencode-block "call_late_process")))))))))
-
-(ert-deftest opencode-test-permission-signal-target-kinds ()
-  "Signal zero and non-PID targets have accurate action labels."
-  (dolist (entry '(("shell" "$$" "Check the current shell ($$)")
-                   ("group" "-22" "Check process group 22 (-22)")
-                   ("group" "0" "Check the current process group (0)")
-                   ("all" "-1" "Check all permitted processes (-1)")
-                   ("job" "%1" "Check shell job %1")
-                   ("dynamic" "$PIDS" "Check target $PIDS (resolved at execution)")))
-    (pcase-let* ((`(,kind ,target ,expected) entry)
-                 (command (concat "kill -0 -- " target)))
-      (should (equal (opencode-permission-title
-                      "shell" (list command)
-                      `((command . ,command)
-                        (signals ((command . ,command) (signal . "0")
-                                  (targets ((kind . ,kind) (target . ,target)))))) nil)
-                     expected)))))
+          (should (equal (opencode--permission-description) "echo $$ …"))
+          (should (string-search command (opencode--expanded-content (opencode-block "call_late")))))))))
 
 (ert-deftest opencode-test-permission-remote-context ()
   "A remote request displays the execution directory as that host spells it."
