@@ -125,6 +125,21 @@ stays."
   "Functions called in the session buffer with the outcome of each turn that ends.
 They run before `opencode-session-idle-functions'.")
 
+(defvar opencode-handed-back-functions nil
+  "Functions called in a session buffer as its turn is handed back to its session.
+Each receives what handed it back: `prompt' or `command', input sent
+from the buffer's prompt; `permission', a permission request accepted,
+or rejected with a correction the agent goes on with; `question', a
+form answered.  A permission rejected plainly, which ends the agent's
+step, and a form dismissed do not count, nor does a prompt another
+package sends with `opencode-session-send'.  They run as the input or
+the answer leaves, before the service took it, as the transcript shows
+it answered then; an error of one function does not stop the others.")
+
+(defun opencode-handed-back (kind)
+  "Run `opencode-handed-back-functions' with KIND in the current session buffer."
+  (opencode-events--run-hook 'opencode-handed-back-functions kind))
+
 (defvar opencode-step-failed-functions nil
   "Functions called with `session.step.failed' data; non-nil handles its display.")
 
@@ -3396,6 +3411,8 @@ that can go with a prompt again (see `opencode--mark-sent-attachments')."
         (opencode--restore-input string)
       (setq opencode--attachments nil
             opencode--temp-files nil)
+      (when (memq (plist-get request :kind) '(prompt command))
+        (opencode-handed-back (plist-get request :kind)))
       (pcase (plist-get request :kind)
         ('command
          (opencode-session-command (plist-get request :name) (plist-get request :arguments)

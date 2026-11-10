@@ -270,6 +270,8 @@ shows typed answers in place of the option keys."
     (plist-put entry :submitted t)
     (force-mode-line-update)
     (opencode-request-state-changed)
+    (unless cancel
+      (opencode-handed-back 'question))
     (cl-flet ((failed (error)
                 (if (eql (opencode-error-status error) 404)
                     (progn (opencode--form-resolved id)
@@ -597,6 +599,7 @@ Answered in place, the prompts name the session asking."
       (let ((value (opencode--read-field field session)))
         (when value (push (cons (intern (alist-get 'key field)) value) answer))))
     (plist-put entry :submitted t)
+    (opencode-handed-back 'question)
     (opencode-request 'post (format "/api/session/%s/form/%s/reply" opencode-session-id (plist-get entry :id))
                       :body `((answer . ,(or (nreverse answer) (opencode-empty-object))))
                       :then (lambda (_) (opencode--form-resolved (plist-get entry :id))))))

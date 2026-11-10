@@ -157,6 +157,22 @@ Each label stands for its attachment, which the next prompt carries."
         (should-not opencode--attachments)
         (should (equal (opencode-test-typed-input) ""))))))
 
+(ert-deftest opencode-test-send-input-hands-back ()
+  "Prompts and commands sent from the prompt hand the turn back; shell commands do not."
+  (opencode-test-with-server
+   (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
+     (let* ((handed nil)
+            (opencode-handed-back-functions (list (lambda (kind) (push kind handed)))))
+       (dolist (input '("!ls" "Hello" "/review"))
+         (goto-char (point-max))
+         (insert input)
+         (opencode-send-input))
+       (should (equal handed '(command prompt)))
+       (let ((opencode-send-checks (list (lambda (_) 'cancel))))
+         (insert "Kept")
+         (opencode-send-input))
+       (should (equal handed '(command prompt)))))))
+
 (ert-deftest opencode-test-comint-send-input-restores-archived ()
   "`comint-send-input' in an archived session's buffer restores it first, as RET does."
   (opencode-test-with-server

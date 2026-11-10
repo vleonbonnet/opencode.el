@@ -114,6 +114,25 @@
                            '((decision . "reject") (message . "Not that one.")))))
           (should-not opencode-pending-permissions))))))
 
+(ert-deftest opencode-test-permission-reply-hands-back ()
+  "Answers the agent goes on with hand its turn back; a plain rejection does not."
+  (opencode-test-with-server
+   (let* ((id (opencode-test-scenario "permission"))
+          (buffer (opencode-test-open-empty id))
+          (handed nil)
+          (opencode-handed-back-functions
+           (list (lambda (kind) (push (list kind (current-buffer)) handed)))))
+     (opencode-test-dispatch-until (opencode-test-events id) "permission.asked")
+     (with-current-buffer buffer
+       (let ((permission (car opencode-pending-permissions)))
+         (opencode-permission-reply permission 'reject)
+         (should-not handed)
+         (opencode-permission-reply permission 'reject "Not that one.")
+         (should (equal handed (list (list 'permission buffer))))
+         (setq handed nil)
+         (opencode-permission-reply permission 'once)
+         (should (equal handed (list (list 'permission buffer)))))))))
+
 (ert-deftest opencode-test-permission-reasons ()
   "Reasons are grouped by rule; a long resource shows the line its rule matched."
   (let ((script "python3 - <<'EOF'\nimport os\nmode = 'kanopy-oidc'\nEOF")
@@ -213,6 +232,21 @@
             (should (equal (plist-get request :body)
                            '((answer . ((q0 . "Blue") (q1 . ["Apple" "Plum"])))))))
           (should-not opencode-pending-forms))))))
+
+(ert-deftest opencode-test-question-answer-hands-back ()
+  "Answering a form hands the turn back; dismissing it does not."
+  (opencode-test-with-server
+   (let* ((id (opencode-test-scenario "question"))
+          (buffer (opencode-test-open-empty id))
+          (handed nil)
+          (opencode-handed-back-functions (list (lambda (kind) (push kind handed)))))
+     (opencode-test-dispatch-until (opencode-test-events id) "form.created")
+     (with-current-buffer buffer
+       (let ((entry (car opencode-pending-forms)))
+         (opencode-form-send entry t)
+         (should-not handed)
+         (opencode-form-send entry)
+         (should (equal handed '(question))))))))
 
 (defun opencode-test-tool-form (call-id)
   "Return a web search consent form, as tool call CALL-ID asks it."

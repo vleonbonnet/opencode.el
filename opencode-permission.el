@@ -361,6 +361,9 @@ The expanded block holds the details; the transient stays compact."
      (pcase decision
        ('once " [accepted]") ('always " [accepted always]") (_ " [rejected]"))
      (if (eq decision 'reject) 'error 'success))
+    ;; A plain rejection ends the agent's step: the turn is not handed back.
+    (when (or message (not (eq decision 'reject)))
+      (opencode-handed-back 'permission))
     (opencode-request
      'post (format "/api/session/%s/permission/%s/reply" opencode-session-id (plist-get permission :id))
      :body `((decision . ,(symbol-name decision)) ,@(when message `((message . ,message))))
@@ -389,6 +392,7 @@ The expanded block holds the details; the transient stays compact."
   (let ((buffer (current-buffer))
         (session opencode-session-id))
     (opencode--permission-forget permission (format " [handed off to %s]" agent) 'success)
+    (opencode-handed-back 'permission)
     (cl-flet ((fail (error)
                 (with-current-buffer buffer
                   (setq opencode-pending-permissions (cons permission opencode-pending-permissions))
