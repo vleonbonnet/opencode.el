@@ -104,6 +104,8 @@
                  "Call slack_post"))
   (should (equal (opencode-permission-title "slack_post" '("C1") nil nil)
                  "Call slack_post on C1"))
+  (let ((opencode-tool-summary-functions `(("slack_post" . ,(lambda (_) (error "No cache"))))))
+    (should (equal (opencode-permission-title "slack_post" '("*") nil nil) "Call slack_post")))
   (opencode-test-with-server
    (let* ((id (opencode-test-scenario "text"))
           (buffer (opencode-test-open-empty id))

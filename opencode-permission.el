@@ -104,8 +104,7 @@ METADATA comes with the request; INPUT is the asking tool call's input."
                   (or .parentDir .path
                       (and first (if (string-match-p "\\*" first) (file-name-directory first) first))))))
         ("doom_loop" "Continue after repeated failures")
-        (_ (or (when-let* ((custom (cdr (assoc action opencode-tool-summary-functions))))
-                 (funcall custom input))
+        (_ (or (opencode-call-tool-function opencode-tool-summary-functions action input)
                (format "Call %s%s" action
                        (if (and resources (not (equal resources '("*"))))
                            (format " on %s" (string-join resources ", "))

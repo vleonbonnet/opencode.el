@@ -247,25 +247,37 @@ Questions are shortened so the answers stay within the summary width."
                               text))
      "; ")))
 
+(defun opencode-call-tool-function (functions tool input)
+  "Call the function FUNCTIONS, an alist, has for TOOL with INPUT.
+Return its value, or nil when TOOL has none or it fails: a package's
+description must not keep a block, or the permission it waits on, from
+showing."
+  (when-let* ((function (cdr (assoc tool functions))))
+    (condition-case err
+        (funcall function input)
+      (error
+       (message "OpenCode %s description failed: %s" tool
+                (truncate-string-to-width (error-message-string err) 200 nil nil "…"))
+       nil))))
+
 (defun opencode-tool-description (tool input)
   "Return the raw, possibly multi-line, description of TOOL called with INPUT."
-  (let ((custom (cdr (assoc tool opencode-tool-summary-functions))))
-    (or (and custom (funcall custom input))
-        (let-alist input
-          (pcase tool
-            ((or "read" "write" "edit")
-             (or (and .path (opencode-relative-path-for-display .path)) "?"))
-            ("patch" (opencode--patch-description .patchText))
-            ("shell" (or .command "?"))
-            ((or "grep" "glob") (format "%S" (or .pattern "?")))
-            ("websearch" (format "%S" (or .query "?")))
-            ("webfetch" (or .url "?"))
-            ("question" (opencode-question-description input))
-            ("skill" (or .id "?"))
-            ("execute" (or (and (stringp .code) (car (split-string (string-trim .code) "\n")))
-                           (opencode--generic-tool-description input)))
-            ("subagent" (format "%s: %s" (capitalize (or .agent "subagent")) (or .description "")))
-            (_ (opencode--generic-tool-description input)))))))
+  (or (opencode-call-tool-function opencode-tool-summary-functions tool input)
+      (let-alist input
+        (pcase tool
+          ((or "read" "write" "edit")
+           (or (and .path (opencode-relative-path-for-display .path)) "?"))
+          ("patch" (opencode--patch-description .patchText))
+          ("shell" (or .command "?"))
+          ((or "grep" "glob") (format "%S" (or .pattern "?")))
+          ("websearch" (format "%S" (or .query "?")))
+          ("webfetch" (or .url "?"))
+          ("question" (opencode-question-description input))
+          ("skill" (or .id "?"))
+          ("execute" (or (and (stringp .code) (car (split-string (string-trim .code) "\n")))
+                         (opencode--generic-tool-description input)))
+          ("subagent" (format "%s: %s" (capitalize (or .agent "subagent")) (or .description "")))
+          (_ (opencode--generic-tool-description input))))))
 
 (defun opencode-tool-summary (tool input face &optional status-icon description note)
   "Return the one-line summary of TOOL called with INPUT, colored as FACE.
@@ -622,8 +634,7 @@ longer is, groups its turn's blocks anew (see `opencode-group-runs')."
 (defun opencode-format-tool-call (tool input)
   "Return the full display of TOOL called with INPUT.
 A function of `opencode-tool-display-functions' for TOOL comes first."
-  (or (when-let* ((custom (cdr (assoc tool opencode-tool-display-functions))))
-        (funcall custom input))
+  (or (opencode-call-tool-function opencode-tool-display-functions tool input)
       (opencode--default-tool-call tool input)))
 
 (defun opencode--default-tool-call (tool input)

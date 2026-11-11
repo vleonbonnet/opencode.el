@@ -833,7 +833,10 @@ switch of model changes it."
     (should (equal (opencode-format-tool-call "slack_post" '((channel . "C1") (ts . "1")))
                    "slack_post [channel=C1, ts=1]"))
     (should (equal (opencode-format-tool-call "websearch" '((query . "x")))
-                   "websearch \"x\""))))
+                   "websearch \"x\"")))
+  (let ((opencode-tool-display-functions `(("slack_post" . ,(lambda (_) (error "No cache"))))))
+    (should (equal (opencode-format-tool-call "slack_post" '((channel . "C1") (ts . "1")))
+                   "slack_post [channel=C1, ts=1]"))))
 
 (ert-deftest opencode-test-edit-call-shows-diff ()
   "An edit call displays the diff from its old text to its new one."
