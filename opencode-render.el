@@ -1258,7 +1258,7 @@ showed already a slice at a time, the first at once (see
     (opencode-read-only-setup)
     (opencode--protect-from (copy-marker (point-min)))))
 
-(defvar opencode-transcript-quiet-commands
+(defcustom opencode-transcript-quiet-commands
   '((self-insert-command . insert) (opencode-electric-slash . insert)
     (opencode-add-subagent . insert) (newline . insert) (open-line . insert)
     (electric-newline-and-maybe-indent . insert) (quoted-insert . insert)
@@ -1272,7 +1272,12 @@ Each is (COMMAND . WHERE), WHERE telling what COMMAND changes: `insert'
 inserts at point, `forward' deletes after point, `backward' before it.
 Typing or holding a key in the transcript then changes nothing and
 says nothing; other edits there signal that the text is read-only, and
-killing copies it (see `kill-read-only-ok').")
+killing copies it (see `kill-read-only-ok')."
+  :type '(alist :key-type (symbol :tag "Command")
+                :value-type (choice (const :tag "Inserts at point" insert)
+                                    (const :tag "Deletes after point" forward)
+                                    (const :tag "Deletes before point" backward)))
+  :group 'opencode)
 
 (defconst opencode--region-deleting-commands
   '(delete-forward-char delete-backward-char backward-delete-char-untabify)

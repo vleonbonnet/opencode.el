@@ -45,8 +45,10 @@
   :type 'number
   :group 'opencode)
 
-(defvar opencode-request-log nil
-  "When non-nil, log every request and response in *opencode-requests*.")
+(defcustom opencode-request-log nil
+  "When non-nil, log every request and response in *opencode-requests*."
+  :type 'boolean
+  :group 'opencode)
 
 (cl-defstruct (opencode-error (:constructor opencode-error--make))
   "A failed OpenCode request.

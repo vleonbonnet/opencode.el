@@ -62,8 +62,10 @@
   :type 'number
   :group 'opencode)
 
-(defvar opencode-events-log nil
-  "When non-nil, log every event type in *opencode-events*.")
+(defcustom opencode-events-log nil
+  "When non-nil, log every event type in *opencode-events*."
+  :type 'boolean
+  :group 'opencode)
 
 (defvar opencode-events--handlers (make-hash-table :test #'equal)
   "Event types mapped to the list of their handler functions.")
