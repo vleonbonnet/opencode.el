@@ -104,8 +104,12 @@ METADATA comes with the request; INPUT is the asking tool call's input."
                   (or .parentDir .path
                       (and first (if (string-match-p "\\*" first) (file-name-directory first) first))))))
         ("doom_loop" "Continue after repeated failures")
-        (_ (format "Call %s%s" action
-                   (if resources (format " on %s" (string-join resources ", ")) "")))))))
+        (_ (or (when-let* ((custom (cdr (assoc action opencode-tool-summary-functions))))
+                 (funcall custom input))
+               (format "Call %s%s" action
+                       (if (and resources (not (equal resources '("*"))))
+                           (format " on %s" (string-join resources ", "))
+                         ""))))))))
 
 (defun opencode--permission-prompt (permission input)
   "Return the one-line command or action of PERMISSION with tool INPUT."
@@ -203,6 +207,12 @@ left out.  COMMAND, when it is the only resource, is already shown."
                                          shown ""))))))
         (reverse groups) "")))))
 
+(defconst opencode--permission-host-actions
+  '("shell" "read" "edit" "glob" "grep" "external_directory")
+  "Permission actions acting on the files or processes of the service's host.
+Their expansion names the directory and, for a remote service, the host;
+other tools, such as an MCP server's, run elsewhere.")
+
 (defun opencode--permission-display (permission tool input)
   "Return the expanded operation and context of PERMISSION for TOOL with INPUT."
   (let* ((metadata (plist-get permission :metadata))
@@ -215,9 +225,10 @@ left out.  COMMAND, when it is the only resource, is already shown."
          (opencode-fontify-as (concat "$ " command) 'verbatim)
        (opencode-format-tool-call tool input))
      (opencode-fontify-as
-      (concat "\n\nDirectory  " (if (opencode-service-files-p)
-                                    (abbreviate-file-name (expand-file-name directory)) directory)
-              (unless (opencode-service-files-p) (concat "\nHost       " (opencode-service-label)))
+      (concat (when (member (plist-get permission :action) opencode--permission-host-actions)
+                (concat "\n\nDirectory  " (if (opencode-service-files-p)
+                                              (abbreviate-file-name (expand-file-name directory)) directory)
+                        (unless (opencode-service-files-p) (concat "\nHost       " (opencode-service-label)))))
               (when (eq (alist-get 'background input) t) "\nExecution  Background")
               (when-let* ((shell (alist-get 'shell metadata))) (concat "\nShell      " shell))
               (when-let* ((timeout (or (alist-get 'timeout metadata) (alist-get 'timeout input))))
@@ -338,6 +349,35 @@ The expanded block holds the details; the transient stays compact."
                                             (plist-get permission :metadata)
                                             (plist-get (opencode-block-data overlay) :input)))
       (opencode--permission-mark-block permission))))
+
+(defvar opencode--permission-transient-state)
+
+(defun opencode-refresh-tool-blocks (&rest tools)
+  "Redraw the blocks of calls to TOOLS in every session buffer.
+For a package whose descriptions of these calls, through
+`opencode-tool-summary-functions' and `opencode-tool-display-functions',
+changed since they were drawn, such as once data it looked up arrived.
+A pending permission of such a call gets its title, prompt and
+expansion anew, and an open permission menu its heading."
+  (let (menu)
+    (dolist (service (opencode-services))
+      (opencode-with-service service
+        (dolist (buffer (hash-table-values (opencode-sv opencode-session-buffers)))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (dolist (overlay (opencode-tool-blocks))
+                (when (member (plist-get (opencode-block-data overlay) :tool) tools)
+                  (if-let* ((permission (seq-find (lambda (permission)
+                                                    (eq (opencode--permission-block permission) overlay))
+                                                  opencode-pending-permissions)))
+                      (progn (opencode--permission-mark-block permission)
+                             (when (eq permission (plist-get opencode--permission-transient-state :permission))
+                               (setq menu t)))
+                    (opencode-refresh-block overlay)))))))))
+    (when (and menu (bound-and-true-p transient--prefix)
+               (eq (oref transient--prefix command) 'opencode-permission-transient)
+               (fboundp 'transient--redisplay))
+      (transient--redisplay))))
 
 (defun opencode--permission-forget (permission &optional label face)
   "Drop PERMISSION from the queue, labelling its fallback LABEL in FACE."

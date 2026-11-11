@@ -824,6 +824,17 @@ switch of model changes it."
   (dolist (entry opencode-provider-icons)
     (should (= (length (cdr entry)) 1))))
 
+(ert-deftest opencode-test-tool-display-functions ()
+  "A tool's display function shows its calls in full, or defers to the default with nil."
+  (let ((opencode-tool-display-functions
+         `(("slack_post" . ,(lambda (input) (and (alist-get 'text input) (concat "To C1: " (alist-get 'text input))))))))
+    (should (equal (opencode-format-tool-call "slack_post" '((channel . "C1") (text . "hi")))
+                   "To C1: hi"))
+    (should (equal (opencode-format-tool-call "slack_post" '((channel . "C1") (ts . "1")))
+                   "slack_post [channel=C1, ts=1]"))
+    (should (equal (opencode-format-tool-call "websearch" '((query . "x")))
+                   "websearch \"x\""))))
+
 (ert-deftest opencode-test-edit-call-shows-diff ()
   "An edit call displays the diff from its old text to its new one."
   (should (equal (opencode-format-tool-call "edit" '((path . "notes.txt") (oldString . "a\nb") (newString . "a\nc")))

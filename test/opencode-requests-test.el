@@ -98,6 +98,52 @@
                  "shell" '((command . "pwd")))))
       (should (string-search "Directory  /srv/project\nHost       remote-host" text)))))
 
+(ert-deftest opencode-test-permission-mcp-tool ()
+  "An MCP call's permission uses the tool's own summary and display, without host context."
+  (should (equal (opencode-permission-title "slack_post" '("*") nil '((channel . "C1")))
+                 "Call slack_post"))
+  (should (equal (opencode-permission-title "slack_post" '("C1") nil nil)
+                 "Call slack_post on C1"))
+  (opencode-test-with-server
+   (let* ((id (opencode-test-scenario "text"))
+          (buffer (opencode-test-open-empty id))
+          (target "#general")
+          (opencode-tool-summary-functions
+           `(("slack_post" . ,(lambda (input) (format "Post in %s — %s" target (alist-get 'text input))))))
+          (opencode-tool-display-functions
+           `(("slack_post" . ,(lambda (input)
+                                (opencode-fontify-as (format "To  %s\nText  %s" target (alist-get 'text input))
+                                                     'verbatim)))))
+          (request `((id . "per_mcp") (sessionID . ,id) (action . "slack_post")
+                     (resources "*") (save "*")
+                     (source (type . "tool") (messageID . "msg_mcp") (id . "call_mcp"))
+                     (reasons ((resource . "*") (rule (action . "slack_post") (resource . "*") (effect . "ask")))))))
+     (with-current-buffer buffer
+       (opencode-tool-start "call_mcp" "slack_post" '((channel . "C1") (text . "hi $5")) "running")
+       (opencode-permission-queue request)
+       (let* ((permission (car opencode-pending-permissions))
+              (block (opencode--permission-block permission))
+              (opencode--permission-transient-state (list :buffer buffer :permission permission)))
+         (should (equal (plist-get permission :title) "Post in #general — hi $5"))
+         (should (equal (opencode--permission-description) "Post in #general — hi $5"))
+         (should (string-search "Post in #general" (overlay-get block 'opencode-summary)))
+         (let ((text (opencode--expanded-content block)))
+           (should (string-prefix-p "To  #general\nText  hi $5" text))
+           (should-not (string-search "Directory" text))
+           (should-not (string-search "Host" text))
+           (should (string-search "Approval required\n  slack_post rule \"*\"" text)))
+         ;; The data the descriptions read arrives later.
+         (setq target "#general thread")
+         (opencode-refresh-tool-blocks "slack_post")
+         (should (equal (plist-get permission :title) "Post in #general thread — hi $5"))
+         (should (equal (opencode--permission-description) "Post in #general thread — hi $5"))
+         (should (string-search "Post in #general thread" (overlay-get block 'opencode-summary)))
+         (should (string-prefix-p "To  #general thread" (opencode--expanded-content block)))
+         (opencode-permission-reply permission 'once)
+         (setq target "#random")
+         (opencode-refresh-tool-blocks "slack_post")
+         (should (string-search "Post in #random" (overlay-get block 'opencode-summary))))))))
+
 (ert-deftest opencode-test-permission-reply-request ()
   "Answering sends the decision to the session's reply route."
   (opencode-test-with-server

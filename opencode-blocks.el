@@ -68,6 +68,14 @@ after the tool's boxed label, or nil for the default description."
   :type '(alist :key-type string :value-type function)
   :group 'opencode)
 
+(defcustom opencode-tool-display-functions nil
+  "Alist of tool names and functions displaying their calls in full.
+Each function receives the call input and returns the text an expanded
+block shows for the call, or nil for the default display.  The text is
+read as Markdown unless marked with `opencode-fontify-as'."
+  :type '(alist :key-type string :value-type function)
+  :group 'opencode)
+
 (defcustom opencode-show-tool-output nil
   "When non-nil, write the output of finished tools below their summary."
   :type 'boolean
@@ -612,7 +620,14 @@ longer is, groups its turn's blocks anew (see `opencode-group-runs')."
     (string-trim (buffer-string) "\n+" "\n+")))
 
 (defun opencode-format-tool-call (tool input)
-  "Return the full display of TOOL called with INPUT."
+  "Return the full display of TOOL called with INPUT.
+A function of `opencode-tool-display-functions' for TOOL comes first."
+  (or (when-let* ((custom (cdr (assoc tool opencode-tool-display-functions))))
+        (funcall custom input))
+      (opencode--default-tool-call tool input)))
+
+(defun opencode--default-tool-call (tool input)
+  "Return the built-in full display of TOOL called with INPUT."
   (let-alist input
     (pcase tool
       ("edit" (concat "edit " (opencode-relative-path-for-display (or .path "")) ":\n"
