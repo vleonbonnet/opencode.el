@@ -1648,6 +1648,8 @@ DESCRIPTION: its own shell block shows it already."
 A background job's completion is a block of the job's tool, in the
 error face unless the job completed; any other message is a notice."
   (opencode-open-block 'tool)
+  (opencode-blocks-job-finished (or (alist-get 'jobID metadata) (alist-get 'shellID metadata)
+                                    (alist-get 'childID metadata)) metadata)
   (if-let* ((completion (opencode--background-completion description text metadata)))
       (let* ((state (alist-get 'state metadata))
              (completed (equal state "completed"))

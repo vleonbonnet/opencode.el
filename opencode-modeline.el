@@ -124,9 +124,10 @@ See `opencode--mode-line-registry-part'.")
 (defun opencode--mode-line-registry-part ()
   "Return what the registry tells of this session for its mode line.
 The value is (STATUS SUBAGENTS ARCHIVED): STATUS, `failed' or `done' when
-its last turn ended unseen, else nil; SUBAGENTS, the kinds of
-`opencode-subagent-icons' its subagents are in, `waiting' first; and
-ARCHIVED, non-nil when it is archived.  It is made again only when the
+its last turn ended unseen, `working' while background jobs run, else nil;
+SUBAGENTS, the kinds of `opencode-subagent-icons' its subagents are in,
+`waiting' first; and ARCHIVED, non-nil when it is archived.
+It is made again only when the
 registry changed."
   (let ((key (cons opencode-session-id (opencode-sv opencode-state--revision))))
     (if (equal key (car opencode--mode-line-registry))
@@ -134,7 +135,7 @@ registry changed."
       (let* ((entry (and opencode-session-id (opencode-state-get opencode-session-id)))
              (status (and entry (opencode-state-status entry)))
              (subagents (and opencode-session-id (opencode-state-subagent-statuses opencode-session-id)))
-             (part (list (and (memq status '(failed done)) status)
+             (part (list (and (or (memq status '(failed done)) (plist-get entry :jobs)) status)
                          (delq nil (list (and (memq 'waiting subagents) 'waiting)
                                          (and (or (memq 'working subagents) (memq 'retrying subagents))
                                               'working)))

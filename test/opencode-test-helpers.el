@@ -300,6 +300,16 @@ They are real timer objects, which `timerp' recognizes, never scheduled."
   "Run BODY with an empty session registry of its own, never bootstrapped."
   (declare (indent 0) (debug t))
   `(let ((opencode-state--sessions (make-hash-table :test #'equal))
+         (opencode-jobs--jobs (make-hash-table :test #'equal))
+         (opencode-jobs--sessions (make-hash-table :test #'equal))
+         (opencode-jobs--ready nil)
+         (opencode-jobs--generation 0)
+         (opencode-jobs--listing nil)
+         (opencode-jobs--held nil)
+         (opencode-jobs--again nil)
+         (opencode-jobs--timer nil)
+         (opencode-jobs--delay 1)
+         (opencode-jobs--unsupported nil)
          (opencode-state--children (make-hash-table :test #'equal))
          (opencode-state--stream 'none)
          (opencode-events--greeted nil)
@@ -330,7 +340,7 @@ They are real timer objects, which `timerp' recognizes, never scheduled."
          (opencode-state--cache-held nil)
          (opencode-state--cache-unsupported nil))
      (unwind-protect (progn ,@body)
-       (dolist (timer (list opencode-state--retry-timer opencode-state--cache-timer
+       (dolist (timer (list opencode-jobs--timer opencode-state--retry-timer opencode-state--cache-timer
                             opencode-state--context-timer opencode-state--list-timer))
          (when (timerp timer)
            (cancel-timer timer))))))

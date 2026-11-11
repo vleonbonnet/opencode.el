@@ -49,6 +49,7 @@
 (require 'opencode-common)
 (require 'opencode-look)
 (require 'opencode-render)
+(require 'opencode-jobs)
 
 (defcustom opencode-tool-summary-max-width 500
   "Most characters kept in a collapsed summary line.
@@ -347,12 +348,12 @@ See `opencode-session-status-icons'."
     (opencode-tool-summary tool input 'error icon nil note)))
 
 (defun opencode-tool-background-outcome (data)
-  "Return how the background job of completion block DATA ended, or nil.
-The value is (TEXT . FAILED).  A completion block stands for the job's
-run, so a command that exited non-zero, was killed or timed out failed;
-blocks other than completions give nil."
-  (when-let* ((state (plist-get data :background-state)))
-    (let-alist (plist-get data :metadata)
+  "Return how the background job of block DATA ended, or nil while running.
+The value is (TEXT . FAILED), for a launch or its completion block.
+A command that exited non-zero, was killed or timed out failed."
+  (when-let* ((state (or (plist-get data :background-state) (plist-get data :job-state)))
+              ((not (equal state "running"))))
+    (let-alist (or (plist-get data :job-metadata) (plist-get data :metadata))
       (pcase state
         ("completed"
          (cond (.timeout '("timed out" . t))
@@ -365,8 +366,8 @@ blocks other than completions give nil."
 (defun opencode-tool-background-note (data)
   "Return the note ending the summary of tool block DATA about background jobs.
 A shell command or subagent the model ran in the background ends its
-call at once, still running: its block says so.  The block of its
-completion, posted later, says how it ended.  Other blocks get nil."
+call at once, still running: its block says so.  Once the job ends, its
+launch and completion blocks say how it ended.  Other blocks get nil."
   (if-let* ((outcome (opencode-tool-background-outcome data)))
       (concat (car outcome) " in the background")
     (and (member (plist-get data :tool) '("shell" "subagent"))
@@ -535,7 +536,8 @@ in another color."
   (cond
    ((or (plist-get data :error) (cdr (opencode-tool-background-outcome data))) 'error)
    ((plist-get data :waiting) 'opencode-attention)
-   ((member (plist-get data :status) '("streaming" "running")) 'opencode-tool-running-margin)
+   ((or (equal (plist-get data :job-state) "running")
+        (member (plist-get data :status) '("streaming" "running"))) 'opencode-tool-running-margin)
    ((eq (plist-get data :type) 'reasoning) 'opencode-reasoning-margin-highlight)
    ((eq (plist-get data :type) 'notice) 'opencode-reasoning-margin-highlight)
    (t 'opencode-tool-margin-highlight)))
@@ -592,6 +594,7 @@ longer is, groups its turn's blocks anew (see `opencode-group-runs')."
         (unless (equal (plist-get data key) value)
           (setq data (plist-put data key value) changed t))))
     (when changed
+      (setq data (opencode--block-job-data data))
       (overlay-put overlay 'opencode-data data)
       (opencode-refresh-block overlay))
     changed))
@@ -952,6 +955,46 @@ at its start, and those following output after it, as
 
 ;;;; Tool blocks
 
+(defun opencode--block-job-data (data)
+  "Return block DATA with the current state of the job its call launched."
+  (when-let* (((not (plist-get data :background-state)))
+              ((equal (plist-get data :status) "completed"))
+              (id (opencode-job-id (plist-get data :tool) (plist-get data :metadata)))
+              ((not (plist-get data :job-metadata))))
+    (let* ((job (opencode-job id))
+           (state (or (alist-get 'status job)
+                      (unless (opencode-sv opencode-jobs--ready) "running"))))
+      (setq data (plist-put data :job-state state))
+      (when-let* ((metadata (alist-get 'metadata job)))
+        (setq data (plist-put data :job-metadata metadata)))))
+  data)
+
+(defun opencode-blocks-job-finished (id metadata)
+  "Settle the original blocks of job ID with its terminal completion METADATA."
+  (dolist (overlay (opencode-tool-blocks))
+    (let ((data (opencode-block-data overlay)))
+      (when (and id (member (alist-get 'state metadata) '("completed" "error" "cancelled"))
+                 (not (plist-get data :background-state))
+                 (not (plist-get data :job-settled))
+                 (equal id (opencode-job-id (plist-get data :tool) (plist-get data :metadata))))
+        (opencode-block-update overlay :job-state (alist-get 'state metadata)
+                               :job-metadata metadata :job-settled t)))))
+
+(defun opencode-blocks--jobs-changed (ids)
+  "Reconcile blocks of sessions IDS with their jobs, all open sessions when nil."
+  (dolist (id (or ids (hash-table-keys (opencode-sv opencode-session-buffers))))
+    (when-let* ((buffer (gethash id (opencode-sv opencode-session-buffers)))
+                ((buffer-live-p buffer)))
+      (with-current-buffer buffer
+        (dolist (overlay (opencode-tool-blocks))
+          (let* ((data (opencode-block-data overlay))
+                 (next (opencode--block-job-data (copy-sequence data))))
+            (unless (equal data next)
+              (overlay-put overlay 'opencode-data next)
+              (opencode-refresh-block overlay))))))))
+
+(add-hook 'opencode-jobs-changed-functions #'opencode-blocks--jobs-changed)
+
 (defun opencode-tool-start (id name &optional input status)
   "Write a collapsed tool block for call ID of tool NAME and return its overlay.
 INPUT and STATUS default to an empty input still streaming."
@@ -1033,6 +1076,7 @@ ended, a notice; never a group."
     (let ((data (opencode-block-data overlay)))
       (pcase (plist-get data :type)
         ('tool (and (member (plist-get data :status) '("completed" "error"))
+                    (not (equal (plist-get data :job-state) "running"))
                     (not (plist-get data :waiting))))
         ('reasoning (plist-get data :ended))
         ('notice t)))))

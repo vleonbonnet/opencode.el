@@ -240,6 +240,24 @@ DATA are the members of its data besides `sessionID'."
 
 ;;;; Bootstrap
 
+(ert-deftest opencode-test-state-bootstrap-loads-older-job-owner ()
+  "A job owner older than the recent page is loaded whether jobs or sessions answer first."
+  (dolist (jobs-first '(nil t))
+    (opencode-test-with-state-server
+        (list :sessions (list (opencode-test-state-info "ses_new" :updated 50)
+                              (opencode-test-state-info "ses_old" :updated 1)))
+      (let* ((opencode-state-recent-limit 1)
+             (jobs '(((id . "sh_old") (kind . "shell") (sessionID . "ses_old")
+                      (status . "running") (time (started . 1000)))))
+             (opencode-test-routes
+              (cons (list 'get "/job\\'" (lambda (_) `((data . ,jobs)))) opencode-test-routes)))
+        (when jobs-first (opencode-jobs--list))
+        (opencode-state-ensure)
+        (opencode-test-state-connect)
+        (should (opencode-state-get "ses_new"))
+        (should (eq (opencode-state-status "ses_old") 'working))
+        (should-not (plist-get (opencode-state-get "ses_old") :running))))))
+
 (ert-deftest opencode-test-identifier-time ()
   "Ascending IDs give their creation time back; others give nothing."
   (let ((now (opencode-test-state-time 60000)))
@@ -298,7 +316,8 @@ The message of a failure is fetched only while the failure is unseen."
         (should (= ready 1))
         (opencode-state-ensure (lambda () (cl-incf ready)))
         (should (= ready 2))
-        (let ((list (car (last opencode-test-requests))))
+        (let ((list (seq-find (lambda (request) (equal (plist-get request :path) "/api/session"))
+                              (reverse opencode-test-requests))))
           (should (equal (plist-get list :path) "/api/session"))
           (should (equal (plist-get list :query) '((archived . "false") (order . "desc") (limit . 4)))))
         ;; The archived session is left out; the running one older than the page is fetched.
@@ -1119,7 +1138,8 @@ PROMPT-TOKENS is as for `opencode-test-state-expiry'."
         (opencode-test-state-at 0
           (should-not (opencode-state-cache "ses_a"))
           (opencode-test-state-connect)
-          (should (equal (car (opencode-test-state-requests)) "/api/session"))
+          (should (< (cl-position "/api/session" (opencode-test-state-requests) :test #'equal)
+                     (cl-position "/api/experimental/session/cache" (opencode-test-state-requests) :test #'equal)))
           (let ((listing (seq-find (lambda (request)
                                      (equal (plist-get request :path) "/api/experimental/session/cache"))
                                    opencode-test-requests)))

@@ -76,6 +76,7 @@
 (require 'opencode-common)
 (require 'opencode-events)
 (require 'opencode-http)
+(require 'opencode-jobs)
 
 (defcustom opencode-state-recent-limit nil
   "Number of the newest unarchived sessions loaded when the stream connects, or nil.
@@ -116,7 +117,7 @@ with nil instead: clients then read the registry again."
 
 (defconst opencode-state--keys
   '(:id :title :directory :project-id :parent-id :agent :model :context :context-estimated
-        :running :retry :requests :outcome :error :idle :viewed :archived :created :updated :started)
+        :running :jobs :retry :requests :outcome :error :idle :viewed :archived :created :updated :started)
   "Keys of a registry entry, in order.")
 
 (opencode-defvar-service opencode-state--sessions (make-hash-table :test #'equal)
@@ -336,7 +337,8 @@ An entry is a plist with the keys :id, :title, :directory (normalized),
 :project-id, :parent-id, :agent, :model (a model reference), :context (the
 context size in tokens, or nil; see `opencode-state-context'),
 :context-estimated (non-nil when :context is the service's estimate; see
-`opencode-state-context-estimated-p'), :running,
+`opencode-state-context-estimated-p'), :running (the foreground turn),
+:jobs (running background jobs, as `opencode-jobs' returns them),
 :retry (a plist :attempt :at :message, or nil), :requests (plists :kind
 :id :summary :time, oldest first), :outcome (`succeeded', `failed' or
 `interrupted'), :error (the last failure's message while it is unseen,
@@ -420,10 +422,12 @@ up to which it was viewed, as the service decides for every client."
 `waiting' while a request awaits the user; else while an execution runs,
 `retrying' when it waits for a retry, `working' otherwise; else when
 unread, `failed' when the last turn failed, `done' otherwise; else
-`idle'.  Return nil for an unknown session."
+`idle'.  Running background jobs keep it `working' after the turn ends.
+Return nil for an unknown session."
   (when-let* ((entry (opencode-state--entry entry-or-id)))
     (cond ((plist-get entry :requests) 'waiting)
           ((plist-get entry :running) (if (plist-get entry :retry) 'retrying 'working))
+          ((plist-get entry :jobs) 'working)
           ((opencode-state-unread-p entry)
            (if (eq (plist-get entry :outcome) 'failed) 'failed 'done))
           (t 'idle))))
@@ -436,7 +440,9 @@ known."
   (when-let* ((entry (opencode-state--entry entry-or-id)))
     (pcase (opencode-state-status entry)
       ('waiting (plist-get (car (plist-get entry :requests)) :time))
-      ((or 'working 'retrying) (plist-get entry :started))
+      ((or 'working 'retrying)
+       (or (plist-get entry :started)
+           (opencode-time-seconds (alist-get 'started (alist-get 'time (car (plist-get entry :jobs)))))))
       ((or 'failed 'done) (plist-get entry :idle)))))
 
 (defun opencode-state-cache (id)
@@ -536,6 +542,7 @@ when only one changed, else with nil.  A batch within a batch joins it."
 A stale entry's context size is kept while the service has not updated
 the session since."
   (let ((id (plist-get entry :id)))
+    (setq entry (plist-put entry :jobs (opencode-jobs id)))
     (puthash id t (opencode-sv opencode-state--current))
     (opencode-state--store id (opencode-state--context-carry entry))))
 
@@ -956,6 +963,22 @@ them to, and the next bootstrap covers them."
 
 ;;;; Bootstrap
 
+(defun opencode-state--jobs-changed (ids)
+  "Update the running jobs of sessions IDS, or every owner when nil."
+  (let ((ids (or ids (delete-dups (append (hash-table-keys (opencode-sv opencode-jobs--sessions))
+                                          (hash-table-keys (opencode-sv opencode-state--sessions)))))))
+    (opencode-state--batched
+     (lambda ()
+       (dolist (id ids)
+         (if-let* ((entry (opencode-state-get id)))
+             (opencode-state--store id (plist-put (copy-sequence entry) :jobs (opencode-jobs id)))
+           (when (and (opencode-jobs id) (opencode-state-ready-p)
+                      (not (opencode--remote-service))
+                      (not (gethash id (opencode-sv opencode-state--fetching))))
+             (opencode-state--fetch (list id)))))))))
+
+(add-hook 'opencode-jobs-changed-functions #'opencode-state--jobs-changed)
+
 (defun opencode-state--page-limit (count)
   "Return how many sessions to ask for after COUNT listed, or 0 once enough are."
   (if opencode-state-recent-limit
@@ -977,6 +1000,7 @@ Then list the other sessions from LISTING, a plist (:next :previous
        (dolist (event held)
          (opencode-state--dispatch (opencode-state--event-session event) event t)))))
   (opencode-state--context-schedule)
+  (opencode-state--jobs-changed nil)
   (let ((generation (opencode-sv opencode-state--generation))
         (waiters (reverse (opencode-sv opencode-state--waiters))))
     (setf (opencode-sv opencode-state--waiters) nil
@@ -1213,7 +1237,9 @@ So are the sessions above those it keeps, at any depth (see
           (wanted nil))
       (maphash (lambda (id _entry)
                  (unless (or (gethash id (opencode-sv opencode-state--current)) (gethash id (opencode-sv opencode-state--fetching)))
-                   (if (opencode-state--retained-p id) (push id wanted) (puthash id t stale))))
+                   (if (or (opencode-state--retained-p id) (opencode-jobs id))
+                       (push id wanted)
+                     (puthash id t stale))))
                (opencode-sv opencode-state--sessions))
       (maphash (lambda (id buffer)
                  (when (and (buffer-live-p buffer)
