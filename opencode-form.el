@@ -263,7 +263,9 @@ shows typed answers in place of the option keys."
     (opencode-request-state-changed)))
 
 (defun opencode-form-send (entry &optional cancel)
-  "Reply to form ENTRY with its saved answers, or CANCEL it."
+  "Reply to form ENTRY with its saved answers, or CANCEL it.
+A CANCEL that is a string is what the agent is told of the dismissal;
+otherwise, it is told the form was dismissed."
   (let ((id (plist-get entry :id))
         (buffer (current-buffer)))
     (opencode-dismiss-notifications 'question id)
@@ -285,7 +287,7 @@ shows typed answers in place of the option keys."
                            (opencode-command-keys 'opencode-respond)))))
       (if cancel
           (opencode-request 'delete (format "/api/session/%s/form/%s" opencode-session-id id)
-                            :query '((message . "dismissed"))
+                            :query `((message . ,(if (stringp cancel) cancel "dismissed")))
                             :then (lambda (_) (opencode--form-resolved id)) :else #'failed)
         (opencode-request 'post (format "/api/session/%s/form/%s/reply" opencode-session-id id)
                           :body `((answer . ,(or (opencode--entry-answer entry) (opencode-empty-object))))
@@ -639,6 +641,24 @@ A question transient suspended from this buffer is resumed instead."
               (entry (opencode--form-find :call-id (plist-get data :key))))
     (unless (plist-get entry :submitted) entry)))
 
+(defun opencode-form-dismiss (session-id id message)
+  "Dismiss form ID of session SESSION-ID, telling the agent MESSAGE.
+The session's buffer, when it knows the form, dismisses it as when
+dismissed there; otherwise the dismissal goes straight to the service,
+from the current buffer.  A form already answered or dismissed is left
+alone."
+  (unless (opencode-with-session-buffer session-id
+            (when-let* ((entry (opencode--form-find :id id)))
+              (unless (plist-get entry :submitted)
+                (opencode-form-send entry message))
+              t))
+    (opencode-request 'delete (format "/api/session/%s/form/%s" session-id id)
+                      :query `((message . ,message))
+                      :else (lambda (error)
+                              (unless (memql (opencode-error-status error) '(404 409))
+                                (message "OpenCode question dismissal failed (%s)"
+                                         (opencode-error-describe error)))))))
+
 (defun opencode--form-provider ()
   "Describe this buffer's pending forms for `opencode-respond'."
   (list :kind 'question
@@ -646,6 +666,7 @@ A question transient suspended from this buffer is resumed instead."
         :at-point (when-let* ((entry (opencode--form-at-point)))
                     (lambda () (opencode-respond-form entry)))
         :respond #'opencode-respond-form
+        :dismiss #'opencode-form-dismiss
         :sync (lambda (callback) (opencode-form-sync nil callback))))
 
 (add-to-list 'opencode-request-providers #'opencode--form-provider t)

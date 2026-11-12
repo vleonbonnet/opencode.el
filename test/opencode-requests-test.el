@@ -851,7 +851,7 @@ in `opencode-test-answered' instead."
     (with-current-buffer (opencode-test-open-waiting "question" "form.created")
       (should (opencode-open-forms))
       (opencode-test-type "use red instead")
-      (opencode-test-choosing '(?c ?a ?s)
+      (opencode-test-choosing '(?c ?a ?q)
         (opencode-send-input)
         (should (equal (car opencode-test-asked)
                        "This session waits for your answer to a question; it reads the prompt only once the question is answered or dismissed."))
@@ -867,13 +867,98 @@ in `opencode-test-answered' instead."
         (should (equal opencode-test-answered `((respond ,(current-buffer)))))
         (should-not (opencode-test-sends))
         (should (equal (opencode-test-typed) "use red instead"))
-        ;; Sent anyway, it steers as usual.
+        ;; Queued, it steers as usual, to wait: the question stays.
         (opencode-send-input)
         (should (equal (length opencode-test-asked) 3))
         (pcase-let ((`((prompt . ,body)) (opencode-test-sends)))
           (should (equal (alist-get 'text body) "use red instead"))
           (should (equal (alist-get 'delivery body) "steer")))
+        (should-not (opencode-test-requests-to 'delete (format "/form/%s" (plist-get (car (opencode-open-forms)) :id))))
+        (should (opencode-open-forms))
         (should (equal (opencode-test-typed) ""))))))
+
+(ert-deftest opencode-test-send-while-waiting-menu ()
+  "The choices of a send while a request waits come in order: send, queue, answer, cancel, discard."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-waiting "question" "form.created")
+      (opencode-test-type "go")
+      (let ((offered nil))
+        (cl-letf (((symbol-function 'read-multiple-choice)
+                   (lambda (_prompt choices &rest _)
+                     (setq offered choices)
+                     (assq ?c choices))))
+          (opencode-send-input))
+        (should (equal (mapcar (lambda (choice) (list (car choice) (cadr choice))) offered)
+                       '((?s "send") (?q "queue") (?a "answer") (?c "cancel") (?d "discard"))))))))
+
+(ert-deftest opencode-test-send-dismisses-question ()
+  "Sending past a question dismisses it, telling the agent why, then sends and hands the turn back."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-waiting "question" "form.created")
+      (let* ((form (plist-get (car (opencode-open-forms)) :id))
+             (handed nil)
+             (opencode-handed-back-functions (list (lambda (kind) (push kind handed)))))
+        (opencode-test-type "use red instead")
+        (opencode-test-choosing '(?s)
+          (opencode-send-input))
+        (let ((dismissal (seq-find (lambda (request)
+                                     (and (eq (plist-get request :method) 'delete)
+                                          (string-suffix-p (format "/form/%s" form) (plist-get request :path))))
+                                   opencode-test-requests)))
+          (should dismissal)
+          (should (equal (alist-get 'message (plist-get dismissal :query)) opencode-dismiss-to-send-message)))
+        (pcase-let ((`((prompt . ,body)) (opencode-test-sends)))
+          (should (equal (alist-get 'text body) "use red instead")))
+        (should (equal handed '(prompt)))
+        (should (equal (opencode-test-typed) ""))))))
+
+(ert-deftest opencode-test-send-dismisses-only-once-sent ()
+  "A later check keeping the input leaves the requests waiting."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-waiting "question" "form.created")
+      (let ((opencode-send-checks (append opencode-send-checks (list (lambda (_) 'cancel)))))
+        (opencode-test-type "use red instead")
+        (opencode-test-choosing '(?s)
+          (opencode-send-input))
+        (should-not (opencode-test-requests-to 'delete (format "/form/%s" (plist-get (car (opencode-open-forms)) :id))))
+        (should-not (opencode-test-sends))
+        (should (equal (opencode-test-typed) "use red instead"))))))
+
+(ert-deftest opencode-test-queue-hands-nothing-back ()
+  "Input queued behind a request hands the turn back neither from RET nor through Comint."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-waiting "question" "form.created")
+      (let* ((handed nil)
+             (opencode-handed-back-functions (list (lambda (kind) (push kind handed)))))
+        (opencode-test-choosing '(?q ?q)
+          (opencode-test-type "first")
+          (opencode-send-input)
+          (opencode-test-type "second")
+          (comint-send-input nil t))
+        (should (equal (mapcar (lambda (send) (alist-get 'text (cdr send))) (opencode-test-sends))
+                       '("first" "second")))
+        (should-not handed)))))
+
+(ert-deftest opencode-test-discard-input ()
+  "Discarding deletes the input into the kill ring, its attachments with it, and sends nothing."
+  (opencode-test-with-server
+    (with-current-buffer (opencode-test-open-waiting "question" "form.created")
+      (let ((kill-ring nil))
+        (opencode-test-type "never mind")
+        (opencode-test-choosing '(?d)
+          (opencode-send-input))
+        (should (equal (opencode-test-typed) ""))
+        (should (equal (car kill-ring) "never mind"))
+        (should-not opencode--attachments)
+        (should-not (opencode-test-sends))
+        (should (opencode-open-forms))
+        ;; Input Comint took is discarded the same way.
+        (opencode-test-type "nor this")
+        (opencode-test-choosing '(?d)
+          (comint-send-input nil t))
+        (should (equal (opencode-test-typed) ""))
+        (should (equal (car kill-ring) "nor this"))
+        (should-not (opencode-test-sends))))))
 
 (ert-deftest opencode-test-empty-input-sends-nothing ()
   "RET on an empty or blank input starts no turn."
@@ -888,15 +973,20 @@ in `opencode-test-answered' instead."
         (delete-region (opencode-pmark) (point-max))))))
 
 (ert-deftest opencode-test-send-while-permission-asks ()
-  "A command sent while a permission request waits asks too, naming the request."
+  "A command sent while a permission request waits asks too, naming the request, and sending rejects it with a correction."
   (opencode-test-with-server
     (with-current-buffer (opencode-test-open-waiting "permission" "permission.asked")
-      (opencode-test-type "/review HEAD")
-      (opencode-test-choosing '(?s)
-        (opencode-send-input)
-        (should (string-prefix-p "This session waits for your answer to a permission request;"
-                                (car opencode-test-asked)))
-        (should (equal (mapcar #'car (opencode-test-sends)) '(command)))))))
+      (let ((permission (car opencode-pending-permissions)))
+        (opencode-test-type "/review HEAD")
+        (opencode-test-choosing '(?s)
+          (opencode-send-input)
+          (should (string-prefix-p "This session waits for your answer to a permission request;"
+                                   (car opencode-test-asked)))
+          (should (equal (opencode-test-requests-to
+                          'post (format "/permission/%s/reply" (plist-get permission :id)))
+                         `(((decision . "reject") (message . ,opencode-dismiss-to-send-message)))))
+          (should-not opencode-pending-permissions)
+          (should (equal (mapcar #'car (opencode-test-sends)) '(command))))))))
 
 (ert-deftest opencode-test-send-while-waiting-without-asking ()
   "Queued input, shell commands and sends without a check go out unasked, to wait."
@@ -1006,6 +1096,25 @@ BACKGROUND runs the child in the background, as for
           (should-not (opencode-test-sends))
           (should (equal (opencode-test-typed) "never mind")))))))
 
+(ert-deftest opencode-test-send-dismisses-subagent-request ()
+  "Sending past a subagent's request rejects it in the subagent's buffer, then sends to the parent."
+  (opencode-test-with-server
+    (let* ((child (opencode-test-scenario "subagent-child"))
+           (buffer (opencode-test-open-subagent-asking))
+           (child-buffer (gethash child opencode-session-buffers))
+           (permission (car (buffer-local-value 'opencode-pending-permissions child-buffer))))
+      (with-current-buffer buffer
+        (setq opencode-test-requests nil)
+        (opencode-test-type "never mind")
+        (opencode-test-choosing '(?s)
+          (opencode-send-input))
+        (should (equal (opencode-test-requests-to
+                        'post (format "/api/session/%s/permission/%s/reply" child (plist-get permission :id)))
+                       `(((decision . "reject") (message . ,opencode-dismiss-to-send-message)))))
+        (with-current-buffer child-buffer (should-not opencode-pending-permissions))
+        (pcase-let ((`((prompt . ,body)) (opencode-test-sends)))
+          (should (equal (alist-get 'text body) "never mind")))))))
+
 (ert-deftest opencode-test-send-while-background-subagent-asks ()
   "A subagent run in the background holds up nothing: its parent sends at once, and still answers it."
   (opencode-test-with-server
@@ -1086,7 +1195,21 @@ BACKGROUND runs the child in the background, as for
         ;; A registry that no longer follows the service is not trusted.
         (let ((opencode-state--ready nil))
           (should-not (opencode-awaited-requests))
-          (should-not (opencode-tree-requests)))))))
+          (should-not (opencode-tree-requests)))
+        ;; Sending dismisses those it waits on through the service, each to its session.
+        (setq opencode-test-requests nil)
+        (opencode-test-choosing '(?s)
+          (opencode-send-input))
+        (should (equal (opencode-test-requests-to 'post (format "/api/session/%s/permission/per_parent/reply" parent))
+                       `(((decision . "reject") (message . ,opencode-dismiss-to-send-message)))))
+        (let ((dismissal (seq-find (lambda (request) (eq (plist-get request :method) 'delete))
+                                   opencode-test-requests)))
+          (should (equal (plist-get dismissal :path) (format "/api/session/%s/form/frm_child" child)))
+          (should (equal (alist-get 'message (plist-get dismissal :query)) opencode-dismiss-to-send-message)))
+        (should-not (seq-find (lambda (request) (string-search "background" (plist-get request :path)))
+                              opencode-test-requests))
+        (pcase-let ((`((prompt . ,body)) (opencode-test-sends)))
+          (should (equal (alist-get 'text body) "go on")))))))
 
 ;;;; Answering a subagent's request from its parent
 

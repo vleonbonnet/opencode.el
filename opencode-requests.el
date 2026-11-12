@@ -55,9 +55,12 @@
 Each returns, in the current buffer, nil or a plist with :kind (`question'
 or `permission'), :pending (the requests awaiting an answer, plists each
 with its :id), :at-point (a function answering the request at point, or
-nil), :respond (a function answering the oldest request) and :sync (a
-function reconciling the buffer's requests with the server, then calling
-the function it receives with no argument), tried in order.")
+nil), :respond (a function answering the oldest request), :dismiss (a
+function of a session ID, the ID of a request of its kind and a message
+for the agent, dismissing the request so that the agent goes on, told
+the message, whichever buffer is current) and :sync (a function
+reconciling the buffer's requests with the server, then calling the
+function it receives with no argument), tried in order.")
 
 (defvar-local opencode--pending-children nil
   "Child session IDs, oldest first, whose requests await the user.")
@@ -353,9 +356,11 @@ lists below this session."
 ;; does a step running a subagent in the foreground, which ends with the
 ;; subagent's turn, itself held up by its own requests and foreground
 ;; subagents.  A prompt sent meanwhile thus waits, unread, and is neither
-;; an answer nor a dismissal, so `opencode-send-input' asks first.  A
-;; subagent run in the background ended its call at once: its requests
-;; hold up only itself, and a prompt to its parent is read as usual.
+;; an answer nor a dismissal, so `opencode-send-input' asks first: to
+;; dismiss the requests and send, the agents asking told why and going
+;; on, or to send the prompt to wait, among others.  A subagent run in
+;; the background ended its call at once: its requests hold up only
+;; itself, and a prompt to its parent is read as usual.
 
 (defun opencode--runs-in-foreground-p (session-id child-id)
   "Return non-nil when session SESSION-ID waits for its subagent CHILD-ID to end.
@@ -435,6 +440,33 @@ registry knew of it; a subagent's in the subagent's buffer."
 
 (defvar opencode--send-cancel-quietly)
 
+(defcustom opencode-dismiss-to-send-message
+  "The user dismissed this request to send you a new prompt instead."
+  "What an agent is told of its request dismissed for input sent past it.
+Sending a prompt or a command while the session waits on requests may
+dismiss them first (see `opencode-check-pending-requests'): a permission
+request is rejected with this, a question dismissed with it, and the
+agent asking goes on, told why."
+  :type 'string
+  :group 'opencode)
+
+(defun opencode-dismiss-awaited (requests &optional message)
+  "Dismiss REQUESTS, as `opencode-awaited-requests' returns them.
+Each request goes to the session asking, a subagent's to the subagent,
+whose buffer, when it knows the request, shows it settled as when
+answered there.  A permission request is rejected and a question
+dismissed, each telling the agent MESSAGE, by default
+`opencode-dismiss-to-send-message', so that the agent goes on with
+it.  A dismissal that fails is told, its request still waiting."
+  (let ((message (or message opencode-dismiss-to-send-message)))
+    (dolist (request requests)
+      (when-let* ((dismiss (seq-some (lambda (provider)
+                                       (let ((state (funcall provider)))
+                                         (and (eq (plist-get state :kind) (plist-get request :kind))
+                                              (plist-get state :dismiss))))
+                                     opencode-request-providers)))
+        (funcall dismiss (plist-get request :session) (plist-get request :id) message)))))
+
 (defun opencode-check-pending-requests (request)
   "Ask what to do with input REQUEST while the session waits on the user.
 A send check (see `opencode-send-checks'): a prompt or command that
@@ -442,8 +474,11 @@ steers this session while it, or a subagent it runs in the foreground,
 waits on a permission request or a question would wait unread until
 that is answered or dismissed (see `opencode-awaited-requests').  A
 subagent run in the background holds up nothing, so its requests never
-ask.  Answering opens the request and keeps the input,
-as cancelling does; sending anyway sends it to wait.  Queued input
+ask.  Sending dismisses the requests (see `opencode-dismiss-awaited')
+once every check let the input go, the agents asking going on, and
+sends it; queueing sends it to wait, setting `opencode-send-waits';
+answering opens the request and keeps the input, as cancelling does;
+discarding deletes the input.  Queued input
 \(`opencode-queue-input', or `opencode-prompt-delivery' set to `queue')
 waits for the end of the turn anyway, and shell commands run at once,
 so neither asks.  Sends that run no check, such as scheduled ones
@@ -453,14 +488,20 @@ through `opencode-session-send', wait the same way."
               (requests (opencode-awaited-requests)))
     (pcase (car (read-multiple-choice
                  (opencode--describe-awaited requests)
-                 '((?a "answer" "Answer it now; the input stays at the prompt")
-                   (?s "send anyway" "Send now; this session reads it once the request is settled")
-                   (?c "cancel" "Keep the input at the prompt"))))
-      (?s nil)
+                 '((?s "send" "Dismiss the requests and send now; the agents asking go on, told why")
+                   (?q "queue" "Send now; this session reads it once the requests are settled")
+                   (?a "answer" "Answer it now; the input stays at the prompt")
+                   (?c "cancel" "Keep the input at the prompt")
+                   (?d "discard" "Delete the input; it goes to the kill ring"))))
+      (?s (push (lambda () (opencode-dismiss-awaited requests)) opencode-send-commit-functions)
+          nil)
+      (?q (setq opencode-send-waits t)
+          nil)
       (?a (opencode--answer-awaited requests)
           ;; The request it opens says enough.
           (setq opencode--send-cancel-quietly t)
           'cancel)
+      (?d 'discard)
       (_ 'cancel))))
 
 ;; First, so that no other check asks before this one.

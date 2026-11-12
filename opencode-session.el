@@ -131,10 +131,12 @@ Each receives what handed it back: `prompt' or `command', input sent
 from the buffer's prompt; `permission', a permission request accepted,
 or rejected with a correction the agent goes on with; `question', a
 form answered.  A permission rejected plainly, which ends the agent's
-step, and a form dismissed do not count, nor does a prompt another
-package sends with `opencode-session-send'.  They run as the input or
-the answer leaves, before the service took it, as the transcript shows
-it answered then; an error of one function does not stop the others.")
+step, and a form dismissed do not count, nor does input sent to wait on
+a request the session awaits (see `opencode-send-waits'), nor a prompt
+another package sends with `opencode-session-send'.  They run as the
+input or the answer leaves, before the service took it, as the
+transcript shows it answered then; an error of one function does not
+stop the others.")
 
 (defun opencode-handed-back (kind)
   "Run `opencode-handed-back-functions' with KIND in the current session buffer."
@@ -3033,8 +3035,25 @@ restored from the archive first, as for `opencode-session-send'."
 (defvar opencode-send-checks nil
   "Functions checking input before it is sent, in order.
 Each is called in the session buffer with the plist `opencode-input-request'
-returns and returns nil to send it, `cancel' to keep it in the prompt, or
-an alist of metadata to attach to it.")
+returns and returns nil to send it, `cancel' to keep it in the prompt,
+`discard' to delete it, or an alist of metadata to attach to it.  A check
+letting input go that will wait on the user sets `opencode-send-waits';
+one acting for the input once it goes adds to
+`opencode-send-commit-functions'.")
+
+(defvar opencode-send-waits nil
+  "Non-nil once a send check let input go that waits on a request.
+The input then waits, unread, for a permission request or a question
+the session awaits to be settled: the session does not have its turn
+back, and the input runs no `opencode-handed-back-functions'.  Callers
+of `opencode-check-send' bind it to nil around the call and read it
+after.")
+
+(defvar opencode-send-commit-functions nil
+  "Functions a send check adds, run once every check let the input go.
+They take no argument.  A check acting for the input, such as
+dismissing the requests it would wait on, acts only once no later check
+keeps or discards the input.  `opencode-check-send' binds it.")
 
 (defvar opencode--send-decision nil
   "Outcome of the checks of the input being sent: t, or metadata to attach.")
@@ -3107,20 +3126,27 @@ consider the turn the switch leads to."
      (t (list :kind 'prompt :text string)))))
 
 (defun opencode-check-send (request)
-  "Run the send checks on REQUEST; return `cancel', or the metadata to attach.
+  "Run the send checks on REQUEST; return `cancel', `discard', or the metadata.
 REQUEST is a plist like the one `opencode-input-request' returns.  The
 checks may ask questions, so callers run them from a command, before
-any asynchronous step.  `opencode-before-send-functions' run first."
+any asynchronous step.  `opencode-before-send-functions' run first.
+`cancel' keeps the input, `discard' deletes it; otherwise it goes, with
+the metadata to attach, `opencode-send-commit-functions' run, and
+`opencode-send-waits', which callers bind, tells whether it waits on a
+request."
   (if (eq 'cancel (run-hook-with-args-until-success 'opencode-before-send-functions
                                                     (list :kind (plist-get request :kind)
                                                           :text (plist-get request :text)
                                                           :name (plist-get request :name))))
       'cancel
     (let ((metadata nil)
-          (checks opencode-send-checks))
-      (while (and checks (not (eq metadata 'cancel)))
+          (checks opencode-send-checks)
+          (opencode-send-commit-functions nil))
+      (while (and checks (not (memq metadata '(cancel discard))))
         (let ((result (funcall (pop checks) request)))
-          (setq metadata (if (eq result 'cancel) 'cancel (append metadata result)))))
+          (setq metadata (if (memq result '(cancel discard)) result (append metadata result)))))
+      (unless (memq metadata '(cancel discard))
+        (mapc #'funcall (reverse opencode-send-commit-functions)))
       metadata)))
 
 (defvar opencode--send-cancel-quietly nil
@@ -3148,18 +3174,28 @@ sent: the region, else the line at point, goes to
           ;; An empty prompt would start a turn about nothing.
           (message "Nothing to send")
         (let* ((opencode--send-cancel-quietly nil)
+               (opencode-send-waits nil)
                (decision (opencode-check-send (opencode-input-request input))))
-          (if (eq decision 'cancel)
-              (unless opencode--send-cancel-quietly
-                (message "Not sent"))
-            (opencode--send-checked-input (or decision t)))))))))
+          (pcase decision
+            ('cancel
+             (unless opencode--send-cancel-quietly
+               (message "Not sent")))
+            ('discard (opencode--discard-input))
+            (_ (opencode--send-checked-input (or decision t) opencode-send-waits)))))))))
 
-(defun opencode--send-checked-input (decision)
+(defun opencode--discard-input ()
+  "Delete the input at the prompt, its attachments with it, into the kill ring."
+  (when-let* ((input (opencode--take-input)))
+    (kill-new (substring-no-properties (plist-get input :text))))
+  (message "Discarded; the input is in the kill ring"))
+
+(defun opencode--send-checked-input (decision &optional waits)
   "Have Comint send the input at the prompt, checked with DECISION.
-DECISION is t, or the metadata the checks attach.  An archived session
-is restored first: the input waits at the prompt, where it can still
-be edited, and is sent as if RET were pressed again there; were the
-restore refused, it stays."
+DECISION is t, or the metadata the checks attach; WAITS is what the
+checks set `opencode-send-waits' to.  An archived session is restored
+first: the input waits at the prompt, where it can still be edited, and
+is sent as if RET were pressed again there; were the restore refused,
+it stays."
   (let ((delivery opencode-prompt-delivery)
         (settled nil))
     (opencode--after-restore
@@ -3170,6 +3206,7 @@ restore refused, it stays."
        (if (string-blank-p (buffer-substring-no-properties (opencode-pmark) (point-max)))
            (message "Nothing to send")
          (let ((opencode--send-decision decision)
+               (opencode-send-waits waits)
                (opencode-prompt-delivery delivery))
            (opencode--comint-send))))
      (lambda (error)
@@ -3375,7 +3412,10 @@ Comint sent."
 
 (defun opencode--send-input (_process string)
   "Send STRING typed at the prompt: a prompt, a /command or a !shell command.
-Input that did not go through `opencode-send-input' is checked here.  The
+Input that did not go through `opencode-send-input' is checked here: a
+check keeping it puts it back, one discarding it puts it in the kill
+ring.  Input left waiting on a request (see `opencode-send-waits') does
+not hand the turn back.  The
 input of a prompt or a command gets the ID of the message it makes once
 the service delivers it, which reverting and forking at point need; a
 shell command makes no prompt, only a shell message and its result,
@@ -3389,9 +3429,11 @@ that can go with a prompt again (see `opencode--mark-sent-attachments')."
   (let* ((opencode--sending-input nil)
          (request (opencode-input-request string))
          (string (plist-get request :text))
+         (opencode-send-waits (and opencode--send-decision opencode-send-waits))
          (decision (or opencode--send-decision (opencode-check-send request)))
+         (kept (memq decision '(cancel discard)))
          (metadata (and (consp decision) decision))
-         (deferred (and (not (eq decision 'cancel))
+         (deferred (and (not kept)
                         (eq (plist-get request :kind) 'prompt)
                         (opencode--defer-prompt-p)))
          (input (and deferred (opencode--sent-input-text string)))
@@ -3407,26 +3449,32 @@ that can go with a prompt again (see `opencode--mark-sent-attachments')."
       (opencode--forget-attachment-labels comint-last-input-start comint-last-input-end)
       (opencode--mark-sent-attachments comint-last-input-start comint-last-input-end)
       (setq region (cons comint-last-input-start comint-last-input-end)))
-    (when (and region (not (eq decision 'cancel)) (memq (plist-get request :kind) '(prompt command)))
+    (when (and region (not kept) (memq (plist-get request :kind) '(prompt command)))
       (opencode-group-earlier-turn (car region)))
-    (if (eq decision 'cancel)
-        (opencode--restore-input string)
-      (setq opencode--attachments nil
-            opencode--temp-files nil)
-      (when (memq (plist-get request :kind) '(prompt command))
-        (opencode-handed-back (plist-get request :kind)))
-      (pcase (plist-get request :kind)
-        ('command
-         (opencode-session-command (plist-get request :name) (plist-get request :arguments)
-                                   :metadata metadata :region region
-                                   :then (lambda (_) (mapc #'delete-file temp-files))))
-        ('shell
-         (opencode--session-shell (substring string 1)))
-        ('prompt
-         (opencode-session-send string :files files :agents agents :skills skills :metadata metadata
-                                :region region :input input
-                                :then (lambda (_) (mapc (lambda (file) (ignore-errors (delete-file file)))
-                                                        temp-files))))))))
+    (pcase decision
+      ('cancel (opencode--restore-input string))
+      ('discard
+       (setq opencode--attachments nil)
+       (kill-new string)
+       (message "Discarded; the input is in the kill ring"))
+      (_
+       (setq opencode--attachments nil
+             opencode--temp-files nil)
+       (when (and (memq (plist-get request :kind) '(prompt command))
+                  (not opencode-send-waits))
+         (opencode-handed-back (plist-get request :kind)))
+       (pcase (plist-get request :kind)
+         ('command
+          (opencode-session-command (plist-get request :name) (plist-get request :arguments)
+                                    :metadata metadata :region region
+                                    :then (lambda (_) (mapc #'delete-file temp-files))))
+         ('shell
+          (opencode--session-shell (substring string 1)))
+         ('prompt
+          (opencode-session-send string :files files :agents agents :skills skills :metadata metadata
+                                 :region region :input input
+                                 :then (lambda (_) (mapc (lambda (file) (ignore-errors (delete-file file)))
+                                                         temp-files)))))))))
 
 (defun opencode--sent-input-text (string)
   "Return STRING, the prompt Comint took, as `opencode-old-input' returns one.

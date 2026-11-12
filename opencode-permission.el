@@ -586,6 +586,23 @@ place (see `opencode-respond-session'), it always shows its menu."
       (seq-find (lambda (permission) (equal (alist-get 'id (plist-get permission :source)) id))
                 opencode-pending-permissions))))
 
+(defun opencode-permission-dismiss (session-id id message)
+  "Reject permission request ID of session SESSION-ID, telling the agent MESSAGE.
+The session's buffer, when it knows the request, rejects it as when
+rejected there with a correction; otherwise the rejection goes straight
+to the service, from the current buffer."
+  (unless (opencode-with-session-buffer session-id
+            (when-let* ((permission (seq-find (lambda (permission) (equal (plist-get permission :id) id))
+                                              opencode-pending-permissions)))
+              (opencode-permission-reply permission 'reject message)
+              t))
+    (opencode-request 'post (format "/api/session/%s/permission/%s/reply" session-id id)
+                      :body `((decision . "reject") (message . ,message))
+                      :else (lambda (error)
+                              (unless (eql (opencode-error-status error) 404)
+                                (message "OpenCode permission rejection failed (%s)"
+                                         (opencode-error-describe error)))))))
+
 (defun opencode--permission-provider ()
   "Describe this buffer's pending permissions for `opencode-respond'."
   (list :kind 'permission
@@ -593,6 +610,7 @@ place (see `opencode-respond-session'), it always shows its menu."
         :at-point (when-let* ((permission (opencode--permission-at-point)))
                     (lambda () (opencode-respond-permission permission)))
         :respond #'opencode-respond-permission
+        :dismiss #'opencode-permission-dismiss
         :sync (lambda (callback) (opencode-permission-sync nil callback))))
 
 (add-to-list 'opencode-request-providers #'opencode--permission-provider)
