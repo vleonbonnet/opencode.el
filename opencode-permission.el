@@ -40,6 +40,7 @@
 ;;; Code:
 
 (require 'opencode-blocks)
+(require 'opencode-changes)
 (require 'opencode-common)
 (require 'opencode-events)
 (require 'opencode-http)
@@ -221,7 +222,9 @@ other tools, such as an MCP server's, run elsewhere.")
          (reasons (opencode-permission-reasons-text (plist-get permission :reasons) command)))
     (concat
      (if (and (equal tool "shell") command)
-         (opencode-fontify-as (concat "$ " command) 'verbatim)
+         (concat (opencode-shell-command-display command)
+                 (when-let* ((changes (opencode-shell-predicted-changes command)))
+                   (concat "\n\n" changes)))
        (opencode-format-tool-call tool input))
      (opencode-fontify-as
       (concat (when (member (plist-get permission :action) opencode--permission-host-actions)

@@ -46,6 +46,7 @@
 (require 'opencode-state)
 (require 'opencode-render)
 (require 'opencode-links)
+(require 'opencode-changes)
 (require 'opencode-blocks)
 (require 'opencode-notify)
 (require 'opencode-session)

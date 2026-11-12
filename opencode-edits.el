@@ -34,7 +34,10 @@
 ;; Lisp, the regions given to `opencode-org-indent-function' in Org, the
 ;; edited lines elsewhere.  Indentation-sensitive modes are left alone.
 ;; Transcripts loaded from the server never run these hooks, so a reloaded
-;; or forked session does not reformat files edited long ago.
+;; or forked session does not reformat files edited long ago.  The files
+;; a shell command changed, as the service reports them, are only checked
+;; at the end of the turn: what a command writes, a formatter's output
+;; among others, is left as it wrote it.
 ;;
 ;; When the turn ends, `opencode-files-finished-editing-functions' run
 ;; with every file it edited, one after another; by default Flycheck
@@ -366,9 +369,10 @@ reindent the top-level forms the ranges overlap, and others the lines."
 
 (defun opencode-tool-edited-files (tool input metadata)
   "Return (FILE . RANGES) for each file a finished TOOL call changed.
-INPUT and METADATA are the call's; FILE is relative to the session."
+INPUT and METADATA are the call's; FILE is relative to the session.
+A shell command's are the files the service reports it changed."
   (pcase tool
-    ((or "edit" "patch")
+    ((or "edit" "patch" "shell")
      (seq-keep (lambda (entry)
                  (let-alist entry
                    (unless (equal .status "deleted")
@@ -382,7 +386,9 @@ INPUT and METADATA are the call's; FILE is relative to the session."
 (defun opencode--edits-tool-finished (overlay)
   "Run the edit hooks for the files the finished tool call of OVERLAY changed.
 Only a live turn's calls count: a replayed transcript's never do; and
-only the local files' sessions: another host's files are not here."
+only the local files' sessions: another host's files are not here.  A
+shell command's files are only checked when the turn ends: what it
+wrote, a formatter's output among others, is not reformatted."
   (let ((data (opencode-block-data overlay)))
     (when (and (opencode-service-files-p)
                (equal (plist-get data :status) "completed")
@@ -392,12 +398,10 @@ only the local files' sessions: another host's files are not here."
                                                  (plist-get data :metadata)))
         (when-let* ((file (opencode-resolve-file-reference (car entry))))
           (cl-pushnew file opencode--files-edited-this-turn :test #'equal)
-          (dolist (function opencode-file-edited-functions)
-            (condition-case err
-                (opencode-without-asking
-                  (funcall function file (cdr entry)))
-              (error (message "OpenCode: %s failed on %s: %s" function
-                              (abbreviate-file-name file) (error-message-string err))))))))))
+          (dolist (function (unless (equal (plist-get data :tool) "shell") opencode-file-edited-functions))
+            (with-demoted-errors "OpenCode: an edit hook failed: %S"
+              (opencode-without-asking
+                (funcall function file (cdr entry))))))))))
 
 (add-hook 'opencode-blocks-finished-functions #'opencode--edits-tool-finished)
 

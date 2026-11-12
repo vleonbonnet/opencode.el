@@ -67,6 +67,25 @@
                    '(("new.txt"))))
     (should-not (opencode-tool-edited-files "read" '((path . "notes.txt")) nil))))
 
+(ert-deftest opencode-test-shell-changes-checked-not-formatted ()
+  "The files a live shell call reports changing wait for the turn's checks, unformatted."
+  (opencode-test-with-server
+   (let* ((file (make-temp-file "opencode-shell" nil ".txt" "two\n"))
+          (opencode-test-edits nil)
+          (opencode-file-edited-functions (list #'opencode-test-record-edit)))
+     (unwind-protect
+         (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "shell"))
+           (let ((opencode-session-status 'busy))
+             (opencode-tool-start "call_sed" "shell" '((command . "sed -i s/one/two/ x.txt")) "running")
+             (opencode-tool-update "call_sed" :status "completed"
+                                   :metadata `((status . "completed")
+                                               (files ((file . ,file) (status . "modified")
+                                                       (patch . "@@ -1 +1 @@\n-one\n+two\n"))
+                                                      ((file . "gone.txt") (status . "deleted") (patch . "")))))
+             (should (equal opencode--files-edited-this-turn (list file)))
+             (should-not opencode-test-edits)))
+       (delete-file file)))))
+
 (ert-deftest opencode-test-live-edits-run-hooks ()
   "A live turn's edits run the per-file hooks, then the finished hooks report back."
   (opencode-test-with-server

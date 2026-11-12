@@ -77,6 +77,23 @@
             (should-not (text-property-not-all start end 'display nil)))
           (opencode-collapse-block block))))))
 
+(ert-deftest opencode-test-expanded-heredoc-in-its-language ()
+  "A heredoc body reads as code in its language between the command's literal lines."
+  (opencode-test-with-input
+    (let ((command "python3 - <<'EOF'\nimport os\nEOF\necho **done**"))
+      (opencode-tool-start "call_heredoc" "shell" `((command . ,command)) "running")
+      (let ((block (opencode-block "call_heredoc")))
+        (opencode-expand-block block)
+        (font-lock-fontify-region (point-min) (point-max))
+        (let* ((content (overlay-get block 'opencode-content-overlay))
+               (start (overlay-start content))
+               (text (buffer-substring-no-properties start (overlay-end content)))
+               (import (+ start (string-search "import" text)))
+               (done (+ start (string-search "echo **done**" text))))
+          (should (string-prefix-p "$ python3 - <<'EOF'\n```python\nimport os\n```\nEOF\necho **done**" text))
+          (should (memq 'font-lock-keyword-face (ensure-list (get-text-property import 'face))))
+          (should-not (opencode-test-hidden done (+ done (length "echo **done**")))))))))
+
 (ert-deftest opencode-test-transcript-markup-hidden ()
   "Markup before the input stays hidden: sent prompts read as quotes, their \"> \" unseen."
   (opencode-test-with-input

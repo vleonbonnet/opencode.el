@@ -44,8 +44,7 @@
 
 ;;; Code:
 
-(require 'diff)
-(require 'diff-mode)
+(require 'opencode-changes)
 (require 'opencode-common)
 (require 'opencode-look)
 (require 'opencode-render)
@@ -559,7 +558,12 @@ in another color."
                              (opencode-question-answer-description input (plist-get data :answers))))
      ((equal (plist-get data :status) "streaming")
       (opencode-tool-summary tool input face nil "…"))
-     (t (opencode-tool-summary tool input face nil nil (opencode-tool-background-note data))))))
+     (t (opencode-tool-summary tool input face nil nil
+                               (let ((notes (delq nil (list (opencode-tool-background-note data)
+                                                            (and (member tool '("shell" "write"))
+                                                                 (opencode-changes-note (plist-get data :metadata)
+                                                                                        (equal tool "write")))))))
+                                 (and notes (string-join notes " · "))))))))
 
 (defun opencode-block-summary (overlay)
   "Return the summary block OVERLAY shows for its data, or nil to keep its own.
@@ -601,26 +605,6 @@ longer is, groups its turn's blocks anew (see `opencode-group-runs')."
 
 ;;;; Expansion
 
-(defun opencode--format-edit-diff (old new)
-  "Return the unified diff body from OLD to NEW."
-  (with-temp-buffer
-    (let ((old-buffer (current-buffer)))
-      (insert old "\n")
-      (with-temp-buffer
-        (let ((new-buffer (current-buffer)))
-          (insert new "\n")
-          (with-temp-buffer
-            (diff-no-select old-buffer new-buffer nil t (current-buffer))
-            ;; The diff buffer is read-only, in Diff mode.
-            (let ((inhibit-read-only t))
-              (goto-char (point-min))
-              (forward-line 3)
-              (delete-region (point-min) (point))
-              (goto-char (point-max))
-              (forward-line -2)
-              (delete-region (point) (point-max))
-              (buffer-string))))))))
-
 (defun opencode--format-patch (patch-text)
   "Return PATCH-TEXT with file names relative to the project, for display."
   (with-temp-buffer
@@ -634,31 +618,48 @@ longer is, groups its turn's blocks anew (see `opencode-group-runs')."
       (replace-match (save-match-data (opencode-relative-path-for-display (match-string 2))) t t nil 2))
     (string-trim (buffer-string) "\n+" "\n+")))
 
-(defun opencode-format-tool-call (tool input)
+(defun opencode-format-tool-call (tool input &optional metadata)
   "Return the full display of TOOL called with INPUT.
-A function of `opencode-tool-display-functions' for TOOL comes first."
+A function of `opencode-tool-display-functions' for TOOL comes first.
+METADATA is what the finished call reported, nil before."
   (or (opencode-call-tool-function opencode-tool-display-functions tool input)
-      (opencode--default-tool-call tool input)))
+      (opencode--default-tool-call tool input metadata)))
 
-(defun opencode--default-tool-call (tool input)
-  "Return the built-in full display of TOOL called with INPUT."
+(defun opencode--default-tool-call (tool input &optional metadata)
+  "Return the built-in full display of TOOL called with INPUT.
+METADATA is what the call reported: a shell command shows the file
+changes reported once it ran, or those predicted before, and a write
+the diff it reports."
   (let-alist input
     (pcase tool
       ("edit" (concat "edit " (opencode-relative-path-for-display (or .path "")) ":\n"
                       (opencode-fenced-block
                        (opencode--format-edit-diff (or .oldString "") (or .newString "")) "diff")))
       ("patch" (concat "patch:\n" (opencode-fenced-block (opencode--format-patch (or .patchText "")) "diff")))
-      ("write" (concat "write " (opencode-relative-path-for-display (or .path "")) ":\n"
-                       (opencode-fenced-block (or .content "") "text")))
+      ("write"
+       (let ((change (car (opencode-changes-files metadata))))
+         (concat "write " (opencode-relative-path-for-display (or .path "")) ":\n"
+                 (if-let* (((equal (alist-get 'status change) "modified"))
+                           (hunks (opencode-changes--hunks (alist-get 'patch change))))
+                     (opencode-fenced-block hunks "diff")
+                   (opencode-fenced-block (or .content "") (or (and .path (opencode-changes-file-language .path))
+                                                               "text"))))))
       ("read" (if .offset
                   (format "read `%s:%s`%s" (opencode-relative-path-for-display .path) .offset
                           (if .limit (format " limit=%s" .limit) ""))
                 (format "read `%s`" (opencode-relative-path-for-display (or .path "")))))
-      ("shell" (opencode-fontify-as
-                (concat (format "$ %s" .command)
-                        (when .workdir (format "\n# in %s" (opencode-relative-path-for-display .workdir)))
-                        (when .background "\n# in the background"))
-                'verbatim))
+      ("shell"
+       (let ((command (or .command ""))
+             (reported (opencode-reported-changes metadata)))
+         (concat (opencode-shell-command-display
+                  command
+                  (delq nil (list (when .workdir (format "# in %s" (opencode-relative-path-for-display .workdir)))
+                                  (when .background "# in the background"))))
+                 (when-let* ((changes (or reported
+                                          ;; A finished call reported what it changed, if anything.
+                                          (unless (equal (alist-get 'status metadata) "completed")
+                                            (opencode-shell-predicted-changes command)))))
+                   (concat "\n\n" changes)))))
       ((or "grep" "glob") (concat (format "%s %S" tool (or .pattern ""))
                                   (when .path (format " in %s" .path))
                                   (when .include (format " (%s)" .include))))
@@ -705,7 +706,7 @@ Each receives the block data and returns a string, or nil to defer.")
                   (if (equal tool "subagent")
                       (list (alist-get 'prompt input) output)
                     (list (or (plist-get data :permission-display)
-                              (opencode-format-tool-call tool input))
+                              (opencode-format-tool-call tool input (plist-get data :metadata)))
                           (and output (not (string-empty-p output))
                                (opencode-fenced-block output "text")))))
             "\n"))))))
