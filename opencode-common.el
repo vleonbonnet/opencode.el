@@ -456,6 +456,67 @@ A remote service's directory is its own root: its host's files are not here."
                       default-directory)))
                  cache))))
 
+(defvar opencode--project-keys (make-hash-table :test #'equal)
+  "Directories mapped to (TIME . KEY), their project keys as last read.")
+
+(defun opencode--native-file-name (file)
+  "Return FILE as Emacs names it on this system.
+On Windows, MSYS's /c/... is c:/..., as MSYS2's Git writes the files
+naming a linked worktree's Git directory."
+  (if (and (eq system-type 'windows-nt)
+           (string-match "\\`/\\([a-zA-Z]\\)\\(/\\|\\'\\)" file))
+      (concat (match-string 1 file) ":/" (substring file (match-end 0)))
+    file))
+
+(defun opencode--git-main-checkout (directory)
+  "Return the main checkout of the Git repository of DIRECTORY, or nil.
+It is read from the files Git keeps, without running Git: a linked
+worktree's .git file names its Git directory, whose commondir names the
+repository's.  A repository whose common directory is not a checkout's
+.git, as a bare one or a submodule's, is named by that directory."
+  (when-let* ((root (locate-dominating-file directory ".git"))
+              (dotgit (expand-file-name ".git" root)))
+    (if (file-directory-p dotgit)
+        (file-name-as-directory (expand-file-name root))
+      (when-let* ((gitdir (with-temp-buffer
+                            (insert-file-contents dotgit nil 0 4096)
+                            (when (re-search-forward "^gitdir: *\\(.+?\\) *$" nil t)
+                              (expand-file-name (opencode--native-file-name (match-string 1)) root))))
+                  (common (directory-file-name
+                           (let ((file (expand-file-name "commondir" gitdir)))
+                             (if (file-readable-p file)
+                                 (with-temp-buffer
+                                   (insert-file-contents file nil 0 4096)
+                                   (expand-file-name (opencode--native-file-name (string-trim (buffer-string)))
+                                                     gitdir))
+                               gitdir)))))
+        (file-name-as-directory
+         (if (equal (file-name-nondirectory common) ".git") (file-name-directory common) common))))))
+
+(defun opencode-project-key (&optional directory)
+  "Return the key of the project of DIRECTORY, by which choices made there are kept.
+DIRECTORY defaults to the current location.  For the local service, it
+is the main checkout of DIRECTORY's Git repository, normalized, which
+the repository's linked worktrees share; outside Git, its project root
+\(see `opencode-project-directory').  For a remote service, its name and
+DIRECTORY as it spells it: its host's files are not here.  A key read in
+the last `opencode--directory-name-ttl' seconds is not read again."
+  (if-let* ((service (opencode--remote-service)))
+      (concat (opencode-svc-name service) ":"
+              (opencode-normalize-directory (or directory (opencode-location) "/")))
+    (let* ((directory (opencode-normalize-directory (or directory default-directory)))
+           (now (float-time))
+           (known (gethash directory opencode--project-keys)))
+      (if (and known (< (abs (- now (car known))) opencode--directory-name-ttl))
+          (cdr known)
+        (let ((key (opencode-normalize-directory
+                    (or (ignore-errors (opencode--git-main-checkout directory))
+                        (opencode--local-project-directory directory)))))
+          (when (> (hash-table-count opencode--project-keys) 1000)
+            (clrhash opencode--project-keys))
+          (puthash directory (cons now key) opencode--project-keys)
+          key)))))
+
 (defun opencode-time-seconds (milliseconds)
   "Return epoch MILLISECONDS as a float number of seconds, or nil."
   (and (numberp milliseconds) (/ milliseconds 1000.0)))

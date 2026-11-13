@@ -162,6 +162,23 @@ however many, must not make that model the one new sessions start on.
 See `opencode-new-session-model'.")
 (add-to-list 'savehist-additional-variables 'opencode-last-model)
 
+(defvar opencode-project-picks nil
+  "Model reference chosen last in each project, newest first, as (PROJECT . MODEL).
+PROJECT is the `opencode-project-key' of the directory of the session
+the model was chosen for, as `opencode-last-model' is chosen.  A new
+session of a project runs `opencode-last-model' served by the provider
+of the project's pick; see `opencode-last-pick'.")
+(add-to-list 'savehist-additional-variables 'opencode-project-picks)
+
+(defconst opencode--project-picks-limit 100
+  "Count of projects `opencode-project-picks' keeps, those chosen in last.")
+
+(defvar opencode-model-identity-function #'opencode-model-identity
+  "Function telling the model a model reference or catalog entry stands for.
+It is called with one, an alist with `id' and `providerID', and returns
+a value that is `equal' for two providers serving the same model, though
+they may spell its identifier differently.  See `opencode-last-pick'.")
+
 (defvar-local opencode-session-info nil
   "Session info alist as last fetched from the server.")
 
@@ -1003,27 +1020,85 @@ ELSE receives the `opencode-error' of a failed request."
 (defun opencode-new-session-model (agent &optional directory)
   "Return the model reference a new session of AGENT in DIRECTORY starts on.
 AGENT nil stands for DIRECTORY's default agent.  The model the agent
-pins comes first, as switching to that agent would select it, then
-`opencode-last-model', the model chosen last, unless the model catalog
-proves it unavailable (`opencode-model-unavailable-p'), as while its
-provider is down: it is kept, to apply again once the provider is back.
+pins comes first, as switching to that agent would select it, then the
+model chosen last, served by the provider chosen last in DIRECTORY's
+project (`opencode-last-pick'), unless the model catalog proves it
+unavailable (`opencode-model-unavailable-p'), as while its provider is
+down: it is kept, to apply again once the provider is back.
 Nil leaves the choice to the service.  Agents and models are read from
 the cached catalogs."
   (or (alist-get 'model (opencode-agent-info (or agent (opencode-default-agent directory))
                                              directory))
-      (and opencode-last-model
-           (not (opencode-model-unavailable-p opencode-last-model directory))
-           opencode-last-model)))
+      (opencode-last-pick directory)))
+
+(defun opencode-model-identity (model)
+  "Return the identifier of MODEL, a model reference or catalog entry, without provider.
+The default `opencode-model-identity-function'."
+  (alist-get 'id model))
+
+(defun opencode-record-pick (model &optional directory)
+  "Make MODEL, a model reference, the model chosen last, in DIRECTORY's project too.
+It becomes `opencode-last-model', and the pick of the project of
+DIRECTORY, the current location by default, in `opencode-project-picks'."
+  (setq opencode-last-model model)
+  (when-let* ((directory (or directory (opencode-location)))
+              (project (opencode-project-key directory)))
+    (setq opencode-project-picks
+          (seq-take (cons (cons project model)
+                          (seq-remove (lambda (entry) (equal (car entry) project))
+                                      opencode-project-picks))
+                    opencode--project-picks-limit))))
+
+(defun opencode--served-by (model provider &optional directory)
+  "Return MODEL served by PROVIDER, as DIRECTORY's model catalog lists it, or nil.
+MODEL is a model reference, PROVIDER a provider ID.  MODEL itself when
+PROVIDER serves it; else PROVIDER's entry of the same model, as
+`opencode-model-identity-function' tells, which the cached catalog
+must list.  MODEL's variant stays when that entry offers it."
+  (cond
+   ((null model) nil)
+   ((equal (alist-get 'providerID model) provider) model)
+   (t
+    (when-let* ((identity (funcall opencode-model-identity-function model))
+                (entry (seq-find (lambda (entry)
+                                   (and (equal (alist-get 'providerID entry) provider)
+                                        (equal (funcall opencode-model-identity-function entry) identity)))
+                                 (opencode-catalog 'model directory))))
+      `((id . ,(alist-get 'id entry))
+        (providerID . ,provider)
+        ,@(when-let* ((variant (alist-get 'variant model))
+                      ((seq-find (lambda (offered) (equal (alist-get 'id offered) variant))
+                                 (alist-get 'variants entry))))
+            `((variant . ,variant))))))))
+
+(defun opencode-last-pick (&optional directory)
+  "Return the model reference chosen last, as a new session in DIRECTORY runs it.
+That is `opencode-last-model', the model and variant chosen last in any
+project, served by the provider chosen last in DIRECTORY's project (see
+`opencode-project-picks'), when that provider serves it too; else the
+model chosen last in the project; else `opencode-last-model'.  A pick
+the model catalog proves unavailable, as while its provider is down, is
+skipped (see `opencode-model-unavailable-p'), and nil returned when
+every one is.  The provider is told to serve the same model by the
+cached catalog: before it is fetched, the project's own pick applies."
+  (let* ((own (alist-get (opencode-project-key directory) opencode-project-picks nil nil #'equal))
+         (candidates (if own
+                         (list (opencode--served-by opencode-last-model (alist-get 'providerID own) directory)
+                               own opencode-last-model)
+                       (list opencode-last-model))))
+    (seq-find (lambda (model) (and model (not (opencode-model-unavailable-p model directory))))
+              candidates)))
 
 (cl-defun opencode-session-create (&key (directory default-directory) title agent model
-                                        callback else no-display)
+                                        (pick t) callback else no-display)
   "Create a session in DIRECTORY and open it.
 TITLE, AGENT and MODEL (a model reference) are optional; MODEL defaults
-to `opencode-new-session-model'.  A MODEL given is chosen: once the
-session exists, it becomes `opencode-last-model'.  CALLBACK runs in the
-new buffer with its info; ELSE receives the `opencode-error' of a failed
-request, which is otherwise reported.  NO-DISPLAY leaves every window
-alone."
+to `opencode-new-session-model'.  A MODEL given is chosen, unless PICK
+is nil: once the session exists, it becomes the model chosen last, in
+DIRECTORY's project too (see `opencode-record-pick').  CALLBACK runs in
+the new buffer with its info; ELSE receives the `opencode-error' of a
+failed request, which is otherwise reported.  NO-DISPLAY leaves every
+window alone."
   (let ((directory (opencode-normalize-directory directory))
         (else (or else (lambda (error) (opencode-report-error (opencode-error-describe error))))))
     (cl-flet ((create ()
@@ -1035,8 +1110,8 @@ alone."
                            ,@(when agent `((agent . ,agent)))
                            ,@(when runs `((model . ,runs))))
                    :then (lambda (response)
-                           (when model
-                             (setq opencode-last-model model))
+                           (when (and model pick)
+                             (opencode-record-pick model directory))
                            (opencode-session-open (opencode-request-data response)
                                                   :no-display no-display
                                                   :callback callback :else else))
@@ -4050,11 +4125,12 @@ service would select any name.  Without ELSE, failures are reported."
 
 (cl-defun opencode-switch-model (model &key then else)
   "Switch this session to MODEL, a model reference, and make it the last pick.
+It becomes the pick of the session's project too (`opencode-record-pick').
 THEN runs in the buffer once the service took the switch; ELSE receives
 the `opencode-error' of a refused one, which is otherwise reported.  The
 buffer records MODEL at once, as the selection event may trail the reply."
   (opencode--require-session)
-  (setq opencode-last-model model)
+  (opencode-record-pick model (opencode-location))
   (if (opencode-same-model-p model opencode-session-model)
       (when then (funcall then))
     (opencode-request 'post (format "/api/session/%s/model" opencode-session-id)

@@ -519,16 +519,143 @@ Prompts of a session running another model, as a reply in an older
 session or a scheduled prompt, leave `opencode-last-model' alone; a
 switch of model changes it."
   (opencode-test-with-server
-    (let ((picked '((id . "gpt-6-luna") (providerID . "openai")))
-          (other '((id . "claude-opus-5-5") (providerID . "ai-gateway-anthropic") (variant . "high"))))
-      (let ((opencode-last-model picked))
-        (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
-          (setq opencode-session-model other)
-          (opencode-session-send "hello")
-          (opencode-session-send "scheduled check" :show t :accept-thinking-loss t)
-          (should (equal opencode-last-model picked))
-          (opencode-switch-model '((id . "gpt-6-sol") (providerID . "openai")) :then #'ignore)
-          (should (equal opencode-last-model '((id . "gpt-6-sol") (providerID . "openai")))))))))
+   (let ((picked '((id . "gpt-6-luna") (providerID . "openai")))
+         (other '((id . "claude-opus-5-5") (providerID . "ai-gateway-anthropic") (variant . "high"))))
+     (let ((opencode-last-model picked))
+       (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
+         (setq opencode-session-model other)
+         (opencode-session-send "hello")
+         (opencode-session-send "scheduled check" :show t :accept-thinking-loss t)
+         (should (equal opencode-last-model picked))
+         (opencode-switch-model '((id . "gpt-6-sol") (providerID . "openai")) :then #'ignore)
+         (should (equal opencode-last-model '((id . "gpt-6-sol") (providerID . "openai"))))
+         ;; The switch is the pick of the session's project too.
+         (should (equal opencode-project-picks
+                        (list (cons (opencode-project-key (opencode-location))
+                                    '((id . "gpt-6-sol") (providerID . "openai")))))))))))
+
+(ert-deftest opencode-test-project-key ()
+  "Linked worktrees share their main checkout's key; a folder outside Git keys itself.
+The files Git keeps are read, without running Git."
+  (let* ((root (file-name-as-directory (make-temp-file "opencode-projects-" t)))
+         (main (file-name-as-directory (expand-file-name "main" root)))
+         (worktree (file-name-as-directory (expand-file-name "feature" root)))
+         (plain (file-name-as-directory (expand-file-name "plain" root)))
+         (opencode--project-keys (make-hash-table :test #'equal)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name ".git/worktrees/feature" main) t)
+          (make-directory (expand-file-name "src/deep" main) t)
+          (make-directory (expand-file-name "lib" worktree) t)
+          (make-directory plain t)
+          (with-temp-file (expand-file-name ".git" worktree)
+            (insert "gitdir: " (expand-file-name ".git/worktrees/feature" main) "\n"))
+          (with-temp-file (expand-file-name ".git/worktrees/feature/commondir" main)
+            (insert "../..\n"))
+          (let ((key (opencode-normalize-directory main)))
+            (should (equal (opencode-project-key main) key))
+            (should (equal (opencode-project-key (expand-file-name "src/deep" main)) key))
+            (should (equal (opencode-project-key worktree) key))
+            (should (equal (opencode-project-key (expand-file-name "lib" worktree)) key)))
+          (should (equal (opencode-project-key plain) (opencode-normalize-directory plain))))
+      (delete-directory root t))))
+
+(defconst opencode-test-shared-models
+  '(((id . "claude-opus-5.5") (providerID . "github-copilot")
+     (variants . [((id . "high")) ((id . "max"))]))
+    ((id . "claude-opus-5-5") (providerID . "prodsec-gateway")
+     (variants . [((id . "high"))]))
+    ((id . "gpt-6-sol") (providerID . "github-copilot")
+     (variants . [((id . "low")) ((id . "high"))]))
+    ((id . "gpt-6-sol") (providerID . "secateur-gateway")
+     (variants . [((id . "low")) ((id . "high")) ((id . "xhigh"))]))
+    ((id . "glm-6") (providerID . "secateur-gateway")))
+  "Model catalog of `opencode-test-project-provider': models several providers serve.")
+
+(ert-deftest opencode-test-project-provider ()
+  "A project's new sessions run the model chosen last, served by the project's provider.
+Failing that provider's offering of the model, the project's own pick
+applies, else the model chosen last; one the catalog lacks is skipped."
+  (opencode-test-with-server
+   (let* ((root (file-name-as-directory (make-temp-file "opencode-projects-" t)))
+          (drover (file-name-as-directory (expand-file-name "drover" root)))
+          (aegis (file-name-as-directory (expand-file-name "aegis" root)))
+          (other (file-name-as-directory (expand-file-name "other" root)))
+          (opencode--project-keys (make-hash-table :test #'equal))
+          (opencode-last-model nil)
+          (opencode-model-identity-function
+           (lambda (model) (string-replace "." "-" (alist-get 'id model))))
+          (catalog opencode-test-shared-models)
+          (opencode-test-routes
+           (cons (list 'get "\\`/api/model\\'" (lambda (_) `((data . ,(vconcat catalog)))))
+                 opencode-test-routes)))
+     (unwind-protect
+         (cl-flet ((fetch ()
+                     (clrhash opencode--catalogs)
+                     (dolist (directory (list drover aegis other))
+                       (opencode-catalog-fetch 'model #'ignore directory))))
+           (dolist (directory (list drover aegis other))
+             (make-directory directory t))
+           (fetch)
+           (should-not (opencode-last-pick drover))
+           (opencode-record-pick '((id . "claude-opus-5.5") (providerID . "github-copilot") (variant . "max"))
+                                 drover)
+           (opencode-record-pick '((id . "claude-opus-5-5") (providerID . "prodsec-gateway") (variant . "high"))
+                                 aegis)
+           (should (equal opencode-last-model
+                          '((id . "claude-opus-5-5") (providerID . "prodsec-gateway") (variant . "high"))))
+           ;; The model chosen last, spelt as Copilot spells it, with the effort it offers.
+           (should (equal (opencode-last-pick drover)
+                          '((id . "claude-opus-5.5") (providerID . "github-copilot") (variant . "high"))))
+           (should (equal (opencode-last-pick aegis) opencode-last-model))
+           (should (equal (opencode-last-pick other) opencode-last-model))
+           ;; The effort Copilot lacks gives its default.
+           (opencode-record-pick '((id . "gpt-6-sol") (providerID . "secateur-gateway") (variant . "xhigh"))
+                                 aegis)
+           (should (equal (opencode-last-pick drover) '((id . "gpt-6-sol") (providerID . "github-copilot"))))
+           ;; A model Copilot does not serve: Drover's own pick.
+           (opencode-record-pick '((id . "glm-6") (providerID . "secateur-gateway")) aegis)
+           (should (equal (opencode-last-pick drover)
+                          '((id . "claude-opus-5.5") (providerID . "github-copilot") (variant . "max"))))
+           ;; Before the catalog is fetched, nothing tells Copilot serves it.
+           (opencode-record-pick '((id . "gpt-6-sol") (providerID . "secateur-gateway")) aegis)
+           (clrhash opencode--catalogs)
+           (should (equal (opencode-last-pick drover)
+                          '((id . "claude-opus-5.5") (providerID . "github-copilot") (variant . "max"))))
+           ;; Copilot down: the model chosen last, on its own provider.
+           (setq catalog (seq-remove (lambda (model) (equal (alist-get 'providerID model) "github-copilot"))
+                                     opencode-test-shared-models))
+           (fetch)
+           (should (equal (opencode-last-pick drover) '((id . "gpt-6-sol") (providerID . "secateur-gateway"))))
+           ;; Every pick gone: the service decides.
+           (setq catalog '(((id . "big-pickle") (providerID . "opencode"))))
+           (fetch)
+           (should-not (opencode-last-pick drover))
+           (should (equal (mapcar #'car opencode-project-picks)
+                          (list (opencode-project-key aegis) (opencode-project-key drover)))))
+       (delete-directory root t)))))
+
+(ert-deftest opencode-test-create-records-project-pick ()
+  "A session created on a model makes it its project's pick, unless told not to choose it."
+  (opencode-test-with-server
+   (let* ((info (alist-get 'data (opencode-test-fixture
+                                  (format "session-%s.json" (opencode-test-scenario "text")))))
+          (opencode-test-routes
+           (cons (list 'post "\\`/api/session\\'" (lambda (_) `((data . ,info))))
+                 (opencode-test-agent-routes)))
+          (picked '((id . "gpt-6-luna") (providerID . "openai")))
+          (opencode-last-model picked)
+          (explicit '((id . "gpt-6-sol") (providerID . "openai"))))
+     (cl-flet ((create (&rest arguments)
+                 (apply #'opencode-session-create :directory opencode-test-workspace :no-display t arguments)
+                 (kill-buffer (gethash (alist-get 'id info) opencode-session-buffers))))
+       (create :model explicit :pick nil)
+       (should (equal opencode-last-model picked))
+       (should-not opencode-project-picks)
+       (create :model explicit)
+       (should (equal opencode-last-model explicit))
+       (should (equal opencode-project-picks
+                      (list (cons (opencode-project-key opencode-test-workspace) explicit))))))))
 
 (ert-deftest opencode-test-create-capital-drive ()
   "A session is created in its directory spelled with a capital drive letter."

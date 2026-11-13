@@ -422,6 +422,7 @@ session registry starts empty and follows events once a test dispatches
              (opencode--resync-running nil)
              (opencode--resync-active nil)
              (opencode--projects nil)
+             (opencode-project-picks nil)
              (opencode-last-session-buffer nil)
              (opencode-alerted-sessions nil)
              (opencode-test-notifications nil)
