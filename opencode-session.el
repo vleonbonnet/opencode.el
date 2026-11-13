@@ -1230,8 +1230,9 @@ Each is (EVENT . FUNCTION), FUNCTION applying EVENT in this buffer.")
   "Note that the transcript is in sync up to its end, unless a message is open."
   (when (and opencode--newest-message (null opencode--open-messages)
              (get-buffer-process (current-buffer)))
-    ;; Before the idle prompt, which is rewritten after any new message.
-    (let ((end (or (opencode-idle-start) (opencode-pmark)))
+    ;; Before the idle prompt, which is rewritten after any new message,
+    ;; and before the text ending the transcript without one.
+    (let ((end (or (opencode-idle-start) (opencode-end-text-start) (opencode-pmark)))
           (before (opencode--finished-end))
           (response (plist-get opencode--synced :response)))
       (if (markerp opencode-synced-end)
@@ -1320,12 +1321,18 @@ Each is (EVENT . FUNCTION), FUNCTION applying EVENT in this buffer.")
 
 (defun opencode--hold ()
   "Withhold this buffer's session events until `opencode--release'."
+  (opencode-lift-end-text)
   (setq opencode--holding t))
 
 (defun opencode--when-live (event function)
-  "Call FUNCTION, applying EVENT in this buffer, now or once events are released."
+  "Call FUNCTION, applying EVENT in this buffer, now or once events are released.
+Text ending the transcript without a prompt gives way to it first (see
+`opencode-lift-end-text'): what an event writes or reads at the end of
+the transcript never meets it."
   (if opencode--holding
       (push (cons event function) opencode--held-events)
+    (when opencode--end-text
+      (opencode-lift-end-text t))
     (funcall function)))
 
 (defun opencode--release ()
@@ -2518,6 +2525,7 @@ now.  CALLBACK receives `:unknown' when the request fails."
   "Delete what is written after the point where this buffer is in sync.
 The input stays.  Messages written there are written again from the
 service's, from the state the transcript had at that point."
+  (opencode-lift-end-text)
   (let ((start (marker-position opencode-synced-end))
         (process (get-buffer-process (current-buffer)))
         (response (plist-get opencode--synced :response))

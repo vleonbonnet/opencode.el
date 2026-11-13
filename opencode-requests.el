@@ -517,6 +517,7 @@ through `opencode-session-send', wait the same way."
 
 (defun opencode-request-state-changed (&optional session-id)
   "Propagate the pending state of SESSION-ID, this buffer's by default, to its parents.
+Its buffer shows anew where it stands (see `opencode-session-summary-update').
 Changes are gathered into one timer; each sync recomputes the state."
   (when-let* ((session-id (or session-id opencode-session-id)))
     (cl-pushnew session-id (opencode-sv opencode--sync-sessions) :test #'equal)
@@ -537,7 +538,12 @@ The sessions are SERVICE's, nil for the local one."
     (setf (opencode-sv opencode--sync-sessions) nil)
     (dolist (session-id sessions)
       (with-demoted-errors "OpenCode subagent request sync: %S"
-        (opencode--sync-parents session-id)))))
+        (opencode--sync-parents session-id))
+      ;; A session waiting for its user shows where it stands.
+      (when-let* ((buffer (gethash session-id (opencode-sv opencode-session-buffers)))
+                  ((buffer-live-p buffer)))
+        (with-demoted-errors "OpenCode summary: %S"
+          (opencode-session-summary-update buffer))))))
 
 (defun opencode--child-pending-p (session-id)
   "Return non-nil when the open buffer of SESSION-ID awaits an answer."

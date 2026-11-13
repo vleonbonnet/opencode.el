@@ -131,6 +131,58 @@ the transcript ends there."
             (or (previous-single-property-change start 'opencode-idle-text) (point-min))
           start)))))
 
+(defvar-local opencode--end-text nil
+  "Marker at the start of the text ending the transcript without a prompt, or nil.
+Such text, written by `opencode-write-end-text' while no idle prompt
+shows, such as where a session waiting on its user stands, is no part
+of the transcript: it is deleted before anything is written after it
+\(see `opencode-lift-end-text').")
+
+(defvar opencode--end-text-lifted-function nil
+  "Function called with no argument once the text ending the transcript gave way.
+It gives way to output, an event applied or input sent, and may be
+written again once they stop (see `opencode-lift-end-text').")
+
+(defun opencode-end-text-start ()
+  "Return where the text ending the transcript without a prompt starts, or nil.
+See `opencode-write-end-text'."
+  (when-let* ((marker opencode--end-text)
+              ((eq (marker-buffer marker) (current-buffer)))
+              ((get-buffer-process (current-buffer)))
+              ((< marker (opencode-pmark))))
+    (marker-position marker)))
+
+(defun opencode-write-end-text (text)
+  "Write TEXT after the transcript, where no idle prompt shows.
+It replaces the text written so before, and gives way to anything
+written after the transcript: output, an event applied, the idle
+prompt, input sent (see `opencode-lift-end-text')."
+  (opencode-lift-end-text)
+  (let ((start (opencode-pmark)))
+    (opencode-output text)
+    ;; Text inserted where it starts, as by expanding the block before
+    ;; it, belongs to the transcript.
+    (setq opencode--end-text (copy-marker start t))))
+
+(defun opencode-lift-end-text (&optional give-way)
+  "Delete the text ending the transcript without a prompt; return non-nil if there was some.
+GIVE-WAY non-nil says that something is about to be written after the
+transcript: output, an event or input sent.  The text gives way to it,
+and `opencode--end-text-lifted-function' is called, which may write it
+again once that stops."
+  (when opencode--end-text
+    (let ((start (opencode-end-text-start)))
+      (set-marker opencode--end-text nil)
+      (setq opencode--end-text nil)
+      (when start
+        (let ((inhibit-read-only t))
+          (opencode-delete-overlays start (opencode-pmark))
+          (delete-region start (opencode-pmark))
+          (set-marker (process-mark (get-buffer-process (current-buffer))) start))
+        (when (and give-way opencode--end-text-lifted-function)
+          (funcall opencode--end-text-lifted-function))
+        t))))
+
 ;;;; Points following output
 
 ;; Comint keeps the points at the process mark after the output it
@@ -149,12 +201,14 @@ That call saw them before anything changed, so inner calls leave them.")
   "Return where the positions following output start in this buffer.
 They are at the end of the transcript or in the input: from the start
 of the idle prompt's area ending the transcript (see
-`opencode-idle-start'), else from the process mark.  Without a process,
-only the end follows."
+`opencode-idle-start'), or of the text ending it without a prompt (see
+`opencode-end-text-start'), else from the process mark.  Without a
+process, only the end follows."
   (save-restriction
     (widen)
     (cond ((not (get-buffer-process (current-buffer))) (point-max))
           ((opencode-idle-start))
+          ((opencode-end-text-start))
           (t (opencode-pmark)))))
 
 (defun opencode-area-start ()
@@ -312,6 +366,9 @@ with a large `gc-cons-threshold'.  This one reuses its markers."
         (setq string (funcall (car functions) string)))
       (setq functions (cdr functions))))
   (when string
+    ;; Output goes after the transcript: text ending it gives way.
+    (when opencode--end-text
+      (opencode-lift-end-text t))
     (let ((inhibit-read-only t)
           ;; The point should float after any insertion.
           (saved-point (if (and (markerp opencode--output-point)
@@ -486,8 +543,10 @@ transcript already ends with a prompt.  The prompt displays as the
 margin's bar alone, on the row where it starts the input: neither an
 invisible prompt, which would hide the strings of the overlays starting
 where it starts, such as the pending area's, nor a line prefix, which
-would draw the bar on their first row."
+would draw the bar on their first row.  Text ending the transcript
+without a prompt goes first (see `opencode-write-end-text')."
   (unless (opencode-prompt-shown-p)
+    (opencode-lift-end-text)
     (when-let* ((text (and opencode--idle-text-function (funcall opencode--idle-text-function))))
       (opencode-output text))
     (let ((start (opencode-pmark)))

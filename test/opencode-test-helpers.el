@@ -481,6 +481,16 @@ The fake service's inboxes follow their events (see `opencode-test-inbox')."
         (setq done (equal (alist-get 'type event) type))))
     events))
 
+(defun opencode-test-open-waiting (scenario event)
+  "Open SCENARIO's session as it streamed, up to its first EVENT; return its buffer."
+  (let* ((id (opencode-test-scenario scenario))
+         (buffer (opencode-test-open-empty id)))
+    (opencode-test-dispatch-until (opencode-test-events id) event)
+    (with-current-buffer buffer
+      (should (eq opencode-session-status 'busy))
+      (setq opencode-test-requests nil))
+    buffer))
+
 (defun opencode-test-inbox-events (session id text &optional metadata)
   "Return the events admitting, then delivering, prompt ID of SESSION with TEXT and METADATA."
   `(((type . "session.inbox.enqueued")

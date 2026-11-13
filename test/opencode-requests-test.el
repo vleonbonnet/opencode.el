@@ -835,16 +835,6 @@ in `opencode-test-answered' instead."
                                         (plist-get request :body))))
                               opencode-test-requests))))
 
-(defun opencode-test-open-waiting (scenario event)
-  "Open SCENARIO's session as it streamed, up to its first EVENT; return its buffer."
-  (let* ((id (opencode-test-scenario scenario))
-         (buffer (opencode-test-open-empty id)))
-    (opencode-test-dispatch-until (opencode-test-events id) event)
-    (with-current-buffer buffer
-      (should (eq opencode-session-status 'busy))
-      (setq opencode-test-requests nil))
-    buffer))
-
 (ert-deftest opencode-test-send-while-question-asks ()
   "Sending while a question waits asks first: answering or cancelling keeps the input."
   (opencode-test-with-server

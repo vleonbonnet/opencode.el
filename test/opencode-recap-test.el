@@ -363,6 +363,204 @@ was just redisplayed: its rows are read from what it drew."
                 (should (eq (car (last faces)) 'opencode-request-margin-highlight))
                 (should-not (memq 'opencode-request-margin-highlight (butlast faces)))))))))))
 
+;;;; While the session waits for its user
+
+(defun opencode-test-recap-waiting-p ()
+  "Return non-nil when the summary ends the transcript, the session waiting, without a prompt."
+  (and (not (opencode-prompt-shown-p))
+       (opencode-end-text-start)
+       (string-prefix-p "※ " (opencode-test-recap))))
+
+(defun opencode-test-recap-return ()
+  "Run the timer showing the summary again, as once output stopped; return non-nil if armed."
+  (when (timerp opencode--recap-return)
+    (let ((arguments (timer--args opencode--recap-return)))
+      (cancel-timer opencode--recap-return)
+      (apply #'opencode-recap--return arguments)
+      t)))
+
+(defun opencode-test-recap-forget-return ()
+  "Cancel the timer showing the summary again, if armed."
+  (when (timerp opencode--recap-return)
+    (cancel-timer opencode--recap-return)
+    (setq opencode--recap-return nil)))
+
+(defvar opencode-test-recap-waited 0
+  "How many times a waiting session was seen showing its summary.")
+
+(defmacro opencode-test-recap-waiting (scenario event &rest body)
+  "Run BODY in SCENARIO's session streamed up to its first EVENT, a request asked.
+The requests' state is synced, as its timer does, so that the summary
+shows; `rest' is bound to the events left."
+  (declare (indent 2) (debug t))
+  `(let* ((id (opencode-test-scenario ,scenario))
+          (buffer (opencode-test-open-empty id))
+          (rest (opencode-test-dispatch-until (opencode-test-events id) ,event)))
+     (ignore rest)
+     (with-current-buffer buffer
+       (unwind-protect
+           (progn
+             (should (eq opencode-session-status 'busy))
+             (opencode--flush-sync)
+             ,@body)
+         (opencode-test-recap-forget-return)))))
+
+(ert-deftest opencode-test-recap-shows-while-permission-waits ()
+  "A session waiting on a permission shows its summary ending the transcript, until it is answered."
+  (opencode-test-with-server
+    (opencode-test-with-recap "Cleaning up: removing junk.txt needs approval."
+      (opencode-test-recap-waiting "permission" "permission.asked"
+        (should (opencode-test-recap-waiting-p))
+        (should (equal (opencode-test-recap) "※ Cleaning up: removing junk.txt needs approval.\n\n"))
+        ;; After the call asking, a blank line before it, read-only, the input empty after it.
+        (should (string-match-p "Run rm junk.txt.*\n\n※ Cleaning up"
+                                (buffer-substring-no-properties (point-min) (opencode-pmark))))
+        (should (get-text-property (opencode-test-find "Cleaning up") 'read-only))
+        (should (eq (get-text-property (opencode-test-find "Cleaning up") 'font-lock-face)
+                    'opencode-session-summary))
+        (should (equal (opencode-test-input buffer) ""))
+        ;; Told the same, nothing is written.
+        (let ((tick (buffer-modified-tick)))
+          (opencode-session-summary-update)
+          (should (= (buffer-modified-tick) tick)))
+        ;; Told anew, it changes in place.
+        (setq opencode-test-recap-value "Revised.")
+        (opencode-session-summary-update)
+        (should (equal (opencode-test-recap) "※ Revised.\n\n"))
+        (should (= 1 (how-many "※" (point-min) (point-max))))
+        ;; An event applied gives way to it; it shows again once events stop.
+        (opencode-test-dispatch (list (opencode-test-event id "session.usage.updated" "evt_usage"
+                                                           '(cost . 0.5))))
+        (should-not (opencode-session-summary-string))
+        (should-not (string-search "Revised." (buffer-string)))
+        (should (opencode-test-recap-return))
+        (should (opencode-test-recap-waiting-p))
+        ;; Answered, it goes.
+        (opencode-test-dispatch-until rest "permission.replied")
+        (opencode-test-recap-return)
+        (opencode--flush-sync)
+        (should-not (opencode-session-summary-string))
+        (should-not (string-search "Revised." (buffer-string)))))))
+
+(ert-deftest opencode-test-recap-none-while-only-busy ()
+  "A turn running, no request waiting, shows no summary, whatever the function tells."
+  (opencode-test-with-server
+    (opencode-test-with-recap "Busy."
+      (opencode-test-recap-waiting "permission" "session.tool.called"
+        (should-not (opencode-pending-request-p))
+        (let ((asked opencode-test-recap-asked))
+          (opencode-session-summary-update)
+          (should (= opencode-test-recap-asked asked)))
+        (should-not (opencode-session-summary-string))
+        (should-not (string-search "Busy." (buffer-string)))))))
+
+(ert-deftest opencode-test-recap-gives-way-to-output ()
+  "Output written while a session waits goes after the transcript; the summary shows again once it stopped."
+  (opencode-test-with-server
+    (opencode-test-with-recap "Waiting for approval."
+      (opencode-test-recap-waiting "permission" "permission.asked"
+        (should (opencode-test-recap-waiting-p))
+        (let ((transcript (buffer-substring-no-properties (point-min) (opencode-end-text-start))))
+          (opencode-output-notice "Still running")
+          (should-not (opencode-session-summary-string))
+          (should-not (string-search "Waiting for approval." (buffer-string)))
+          (should (string-prefix-p transcript (buffer-substring-no-properties (point-min) (opencode-pmark))))
+          (should (timerp opencode--recap-return))
+          ;; Output since it gave way puts it off.
+          (opencode-output-notice "More output")
+          (should (opencode-test-recap-return))
+          (should-not (opencode-session-summary-string))
+          (should (opencode-test-recap-return))
+          (should (opencode-test-recap-waiting-p))
+          (should (< (opencode-test-find "More output") (opencode-test-find "Waiting for approval."))))))))
+
+(ert-deftest opencode-test-recap-quoted-while-waiting ()
+  "RET on the summary of a waiting session gives its line, as on the transcript."
+  (opencode-test-with-server
+    (opencode-test-with-recap "Waiting for approval to remove junk.txt."
+      (opencode-test-recap-waiting "permission" "permission.asked"
+        (let* ((given nil)
+               (opencode-old-input-function (lambda (text _buffer) (setq given text))))
+          (goto-char (opencode-test-find "to remove"))
+          (opencode-send-input)
+          (should (equal given "※ Waiting for approval to remove junk.txt."))
+          (should (opencode-test-recap-waiting-p)))))))
+
+(ert-deftest opencode-test-recap-gives-way-to-input-sent ()
+  "A prompt queued while a session waits never leaves the summary in the transcript."
+  (opencode-test-with-server
+    (opencode-test-with-recap "Waiting for an answer."
+      (opencode-test-recap-waiting "question" "form.created"
+        (should (opencode-test-recap-waiting-p))
+        (goto-char (point-max))
+        (insert "use red instead")
+        (cl-letf (((symbol-function 'read-multiple-choice)
+                   (lambda (_prompt choices &rest _) (assq ?q choices))))
+          (opencode-send-input))
+        (should (equal (opencode-test-input buffer) ""))
+        (should-not (string-search "Waiting for an answer." (buffer-string)))
+        (should (opencode-test-recap-return))
+        (should (opencode-test-recap-waiting-p))
+        (should (= 1 (how-many "Waiting for an answer\\." (point-min) (point-max))))))))
+
+(ert-deftest opencode-test-recap-question-then-idle ()
+  "Once the turn of a session that waited ends, one summary shows, at its idle prompt."
+  (opencode-test-with-server
+    (opencode-test-with-recap "Asks which colour to use."
+      (opencode-test-recap-waiting "question" "form.created"
+        (should (opencode-test-recap-waiting-p))
+        (setq opencode-test-recap-value "Done: painted it red.")
+        (opencode-test-dispatch-until rest "session.execution.succeeded")
+        (opencode-test-recap-return)
+        (opencode--flush-sync)
+        (should (opencode-test-recap-at-prompt-p))
+        (should (equal (opencode-test-recap) "※ Done: painted it red.\n\n"))
+        (should (= 1 (how-many "※" (point-min) (point-max))))
+        (should-not (string-search "Asks which colour" (buffer-string)))))))
+
+(ert-deftest opencode-test-recap-waiting-leaves-transcript ()
+  "A session shown its summary whenever it waits ends with the transcript it has without one."
+  (cl-flet ((stream (function)
+              (opencode-test-with-server
+                (let ((opencode-session-summary-function function))
+                  (let* ((id (opencode-test-scenario "question"))
+                         (buffer (opencode-test-open-empty id)))
+                    (with-current-buffer buffer
+                      (dolist (event (opencode-test-events id))
+                        (opencode-test-dispatch (list event))
+                        (opencode-test-recap-return)
+                        (opencode--flush-sync)
+                        (when (opencode-end-text-start)
+                          (cl-incf opencode-test-recap-waited)))
+                      (opencode-test-recap-forget-return)
+                      (let ((opencode-session-summary-function nil))
+                        (opencode-session-summary-update))
+                      (opencode-test-text buffer)))))))
+    (let ((opencode-test-recap-waited 0))
+      (should (equal (stream (lambda () "Waiting, or done."))
+                     (stream nil)))
+      ;; Once each of its three questions.
+      (should (>= opencode-test-recap-waited 3)))))
+
+(ert-deftest opencode-test-recap-waiting-withheld ()
+  "Withholding events deletes the summary of a waiting session; it shows again once they are applied."
+  (opencode-test-with-server
+    (opencode-test-with-recap "Waiting for approval."
+      (opencode-test-recap-waiting "permission" "permission.asked"
+        (should (opencode-test-recap-waiting-p))
+        ;; Settled, the transcript is in sync up to the summary, not past it.
+        (let ((opencode--open-messages nil))
+          (opencode--settle))
+        (should (<= opencode-synced-end (opencode-end-text-start)))
+        (opencode--hold)
+        (should-not (opencode-session-summary-string))
+        (should-not (string-search "Waiting for approval." (buffer-string)))
+        (opencode-session-summary-update)
+        (should-not (opencode-session-summary-string))
+        (opencode--release)
+        (opencode-session-summary-update)
+        (should (opencode-test-recap-waiting-p))))))
+
 ;;;; Catching up and reloading
 
 (ert-deftest opencode-test-recap-catch-up ()
