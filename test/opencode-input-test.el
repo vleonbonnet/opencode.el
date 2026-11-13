@@ -173,6 +173,42 @@ Each label stands for its attachment, which the next prompt carries."
          (opencode-send-input))
        (should (equal handed '(command prompt)))))))
 
+(ert-deftest opencode-test-send-input-tells-input-sent ()
+  "Prompts and commands sent from the prompt are told with their text and start."
+  (opencode-test-with-server
+   (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
+     (let* ((sent nil)
+            (opencode-input-sent-functions
+             (list (lambda (kind text start)
+                     (push (list kind text (and start (buffer-substring-no-properties
+                                                       start (+ start (length text)))))
+                           sent)))))
+       (dolist (input '("!ls" "Hello there" "/review now"))
+         (goto-char (point-max))
+         (insert input)
+         (opencode-send-input))
+       (should (equal (reverse sent) '((prompt "Hello there" "Hello there")
+                                       (command "/review now" "/review now"))))
+       (setq sent nil)
+       (let ((opencode-send-checks (list (lambda (_) 'cancel))))
+         (insert "Kept")
+         (opencode-send-input))
+       (should-not sent)))))
+
+(ert-deftest opencode-test-input-sent-quit-keeps-send ()
+  "A function of `opencode-input-sent-functions' quitting leaves the prompt sent."
+  (opencode-test-with-server
+   (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
+     (let* ((later nil)
+            (opencode-input-sent-functions (list (lambda (&rest _) (signal 'quit nil))
+                                                 (lambda (&rest _) (setq later t)))))
+       (goto-char (point-max))
+       (insert "Hello")
+       (opencode-send-input)
+       (should (equal (alist-get 'text (opencode-test-sent-prompt)) "Hello"))
+       (should-not later)
+       (should (equal (opencode-test-typed-input) ""))))))
+
 (ert-deftest opencode-test-comint-send-input-restores-archived ()
   "`comint-send-input' in an archived session's buffer restores it first, as RET does."
   (opencode-test-with-server

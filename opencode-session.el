@@ -142,6 +142,19 @@ stop the others.")
   "Run `opencode-handed-back-functions' with KIND in the current session buffer."
   (opencode-events--run-hook 'opencode-handed-back-functions kind))
 
+(defvar opencode-input-sent-functions nil
+  "Functions called in a session buffer with input typed at its prompt, once sent.
+Each receives KIND, `prompt' or `command', TEXT, the input as typed, and
+START, where TEXT begins in the buffer, or nil when it left the
+transcript to show as pending (see `opencode--defer-prompt-p').  Input
+sent to wait on a request counts, unlike for
+`opencode-handed-back-functions'; input a check kept or discarded, a
+shell command and a prompt another package sends with
+`opencode-session-send' do not.  They run in the command that sent the
+input, after its request went out, so that they may ask the user: a
+quit stops the functions left, never the send.  An error of one
+function does not stop the others.")
+
 (defvar opencode-step-failed-functions nil
   "Functions called with `session.step.failed' data; non-nil handles its display.")
 
@@ -3557,7 +3570,14 @@ that can go with a prompt again (see `opencode--mark-sent-attachments')."
           (opencode-session-send string :files files :agents agents :skills skills :metadata metadata
                                  :region region :input input
                                  :then (lambda (_) (mapc (lambda (file) (ignore-errors (delete-file file)))
-                                                         temp-files)))))))))
+                                                         temp-files)))))
+       (when (memq (plist-get request :kind) '(prompt command))
+         (condition-case nil
+             (opencode-events--run-hook 'opencode-input-sent-functions (plist-get request :kind)
+                                        (substring-no-properties string)
+                                        (and region (marker-position (car region))))
+           ;; Comint has more to do once the input is sent.
+           (quit nil)))))))
 
 (defun opencode--sent-input-text (string)
   "Return STRING, the prompt Comint took, as `opencode-old-input' returns one.

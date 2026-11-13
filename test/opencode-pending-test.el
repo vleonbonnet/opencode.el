@@ -98,6 +98,16 @@ cancellation event before answering, `quiet' answers without one,
 
 ;;;; Showing
 
+(ert-deftest opencode-test-pending-tells-input-sent ()
+  "A prompt sent while a turn runs is told sent, with no start in the buffer."
+  (opencode-test-with-server
+   (let ((sent nil))
+     (with-current-buffer (opencode-test-busy-buffer (opencode-test-scenario "text"))
+       (let ((opencode-input-sent-functions
+              (list (lambda (kind text start) (push (list kind text start) sent)))))
+         (opencode-test-type-and-send "look closer"))
+       (should (equal sent '((prompt "look closer" nil))))))))
+
 (ert-deftest opencode-test-pending-shows-until-delivered ()
   "A prompt sent while a turn runs shows as pending at once, then once in the transcript."
   (opencode-test-with-server
