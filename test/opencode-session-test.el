@@ -146,11 +146,6 @@ failure, which its message keeps."
       (set-face-attribute 'opencode-tool-margin-highlight nil :foreground finished))))
 
 ;; The shell scenario runs one command in the background; the service posts its completion as a synthetic message.
-(defun opencode-test-summary-text (overlay)
-  "Return the summary line of block OVERLAY, without properties."
-  (with-current-buffer (overlay-buffer overlay)
-    (buffer-substring-no-properties (overlay-start overlay) (1- (overlay-end overlay)))))
-
 (defun opencode-test-shell-messages (function)
   "Return the shell scenario's messages, its synthetic ones passed through FUNCTION."
   (mapcan (lambda (message)
@@ -974,7 +969,8 @@ applies, else the model chosen last; one the catalog lacks is skipped."
 (ert-deftest opencode-test-execute-describes-its-calls ()
   "A code mode program is described by the calls it made, by its first line before the first."
   (let* ((opencode-tool-summary-functions
-          `(("slack_post" . ,(lambda (input) (format "Post in %s" (alist-get 'channel input))))))
+          `(("slack_post" . ,(lambda (input) (format "Post in %s" (alist-get 'channel input))))
+            ("slack_health" . ,(lambda (_) "Check the connection"))))
          (input '((code . "const e = 1;\nreturn await tools.slack.post({channel: \"C1\"})")))
          (post '((tool . "slack.post") (status . "completed") (input (channel . "C1"))))
          (eval '((tool . "anvil-eval.emacs-eval-read") (status . "error") (input (expression . "(+ 1 2)")))))
@@ -985,9 +981,9 @@ applies, else the model chosen last; one the catalog lacks is skipped."
                                      :status "completed" :metadata metadata))))))
       (should (string-suffix-p " const e = 1;" (summary nil)))
       (should (string-suffix-p " Post in C1" (summary `((toolCalls ,post)))))
-      (should (string-suffix-p " anvil-eval.emacs-eval-read (+ 1 2) · 1 call failed"
+      (should (string-suffix-p " anvil-eval.emacs-eval-read (+ 1 2) · 1 failed"
                                (summary `((toolCalls ,eval)))))
-      (should (string-suffix-p " slack.post ×2 · anvil-eval.emacs-eval-read · 1 call failed"
+      (should (string-suffix-p " 3 calls · 2 slack.post · 1 anvil-eval.emacs-eval-read · 1 failed"
                                (summary `((toolCalls ,post ,eval ,post)))))
       (should (string-suffix-p " …" (summary `((toolCalls ,post)) :status "streaming")))
       ;; A program that throws ends its call as a success.
@@ -997,6 +993,11 @@ applies, else the model chosen last; one the catalog lacks is skipped."
                   'error))
       (should (string-suffix-p " Post in C1" (summary `((toolCalls ,post)) :error '((message . "boom"))))))
     (should (opencode-block-calls-p `(:tool "execute" :metadata ((toolCalls ,post))) '("slack_post")))
+    ;; A call without arguments is described by its tool's function too.
+    (should (string-suffix-p " slack.health  Check the connection"
+                             (substring-no-properties
+                              (opencode-child-summary '(:type tool :child 0 :tool "slack_health"
+                                                              :path "slack.health" :status "completed")))))
     (should (opencode-block-calls-p '(:tool "slack_post") '("slack_post")))
     (should-not (opencode-block-calls-p `(:tool "execute" :metadata ((toolCalls ,eval))) '("slack_post")))
     (should (equal (substring-no-properties
@@ -1008,48 +1009,84 @@ applies, else the model chosen last; one the catalog lacks is skipped."
     (should (equal (opencode-execute-input-lines nil '("a" "b")) "resources: a, b"))))
 
 (ert-deftest opencode-test-execute-shows-its-calls ()
-  "An expanded code mode program shows each call it made as its tool shows it, then the program."
+  "A code mode program's block holds its calls as child blocks, drawn as their tools draw them, then the program."
   (opencode-test-with-server
-    (let* ((session (opencode-test-scenario "text"))
-           (buffer (opencode-test-open-empty session))
-           (base `((sessionID . ,session) (assistantMessageID . "msg_code") (id . "call_code")))
-           (code "return await tools.slack.post({channel: \"C1\", text: \"hi\"})")
-           (call-input '((channel . "C1") (text . "hi")))
-           (opencode-tool-summary-functions
-            `(("slack_post" . ,(lambda (input) (format "Post in %s — %s" (alist-get 'channel input)
-                                                       (alist-get 'text input))))))
-           (opencode-tool-display-functions
-            `(("slack_post" . ,(lambda (input)
-                                 (opencode-fontify-as (format "To  %s\nText  %s" (alist-get 'channel input)
-                                                              (alist-get 'text input))
-                                                      'verbatim))))))
-      (opencode-test-turn session "started")
-      (opencode-test-dispatch
-       `(((type . "session.tool.input.started") (data ,@base (name . "execute")))
-         ((type . "session.tool.called") (data ,@base (input (code . ,code))))))
-      (with-current-buffer buffer
-        (let ((block (opencode-block "call_code")))
-          (should (string-suffix-p code (opencode-test-summary-text block)))
-          (opencode-test-dispatch
-           `(((type . "session.tool.progress")
-              (data ,@base (metadata (toolCalls ((tool . "slack.post") (status . "running")
-                                                 (input ,@call-input))))))))
-          (should (string-suffix-p "Post in C1 — hi" (opencode-test-summary-text block)))
-          (opencode-test-dispatch
-           `(((type . "session.tool.success")
-              (data ,@base (content ((type . "text") (text . "ok")))
-                    (metadata (toolCalls ((tool . "slack.post") (status . "completed") (input ,@call-input))
-                                         ((tool . "fetch") (status . "error")
-                                          (input (method . "GET") (url . "https://example.com")))))))))
-          (should (string-suffix-p "slack.post · fetch · 1 call failed" (opencode-test-summary-text block)))
-          (should (eq (opencode-block-face (opencode-block-data block)) 'opencode-tool-margin-highlight))
-          (should (equal (substring-no-properties (opencode--expanded-content block))
-                         (concat (opencode-session-status-glyph 'done) " slack.post\nTo  C1\nText  hi\n\n"
-                                 (opencode-session-status-glyph 'failed) " fetch\nmethod: GET\nurl: https://example.com\n\n"
-                                 "```javascript\n" code "\n```\n```text\nok\n```")))
-          (opencode-block-update block :metadata '((toolCalls) (error . t)))
-          (should (eq (opencode-block-face (opencode-block-data block)) 'error))
-          (should (string-search "1 failed" (opencode-group-summary (list block)))))))))
+   (let* ((session (opencode-test-scenario "text"))
+          (buffer (opencode-test-open-empty session))
+          (base `((sessionID . ,session) (assistantMessageID . "msg_code") (id . "call_code")))
+          (code "return await tools.slack.post({channel: \"C1\", text: \"hi\"})")
+          (call-input '((channel . "C1") (text . "hi")))
+          (opencode-tool-summary-functions
+           `(("slack_post" . ,(lambda (input) (format "Post in %s — %s" (alist-get 'channel input)
+                                                      (alist-get 'text input))))))
+          (opencode-tool-display-functions
+           `(("slack_post" . ,(lambda (input)
+                                (opencode-fontify-as (format "To  %s\nText  %s" (alist-get 'channel input)
+                                                             (alist-get 'text input))
+                                                     'verbatim))))))
+     (opencode-test-turn session "started")
+     (opencode-test-dispatch
+      `(((type . "session.tool.input.started") (data ,@base (name . "execute")))
+        ((type . "session.tool.called") (data ,@base (input (code . ,code))))))
+     (with-current-buffer buffer
+       (let ((block (opencode-block "call_code")))
+         ;; Live, the program's block is open, its program alone so far.
+         (should (overlay-get block 'opencode-expanded))
+         (should (equal (opencode-test-children block) '(program)))
+         (should (string-suffix-p code (opencode-test-summary-text block)))
+         (opencode-test-dispatch
+          `(((type . "session.tool.progress")
+             (data ,@base (metadata (toolCalls ((tool . "slack.post") (status . "running")
+                                                (input ,@call-input))))))))
+         (should (string-suffix-p "Post in C1 — hi" (opencode-test-summary-text block)))
+         (should (equal (opencode-test-children block) '(0 program)))
+         (let ((post (car (overlay-get block 'opencode-children))))
+           (should (string-suffix-p " slack.post  Post in C1 — hi" (opencode-test-summary-text post)))
+           (should (equal (overlay-get post 'before-string)
+                          (concat "  " (opencode-disclosure-string nil 'opencode-tool-running-margin))))
+           (should (eq (opencode-block-face (opencode-block-data post)) 'opencode-tool-running-margin))
+           (opencode-expand-block post))
+         (opencode-test-dispatch
+          `(((type . "session.tool.success")
+             (data ,@base (content ((type . "text") (text . "ok")))
+                   (metadata (toolCalls ((tool . "slack.post") (status . "completed") (input ,@call-input))
+                                        ((tool . "fetch") (status . "error")
+                                         (input (method . "GET") (url . "https://example.com")))))))))
+         (should (string-suffix-p "2 calls · 1 slack.post · 1 fetch · 1 failed" (opencode-test-summary-text block)))
+         (should (eq (opencode-block-face (opencode-block-data block)) 'opencode-tool-margin-highlight))
+         (should (equal (opencode-test-children block) '(0 1 program)))
+         (pcase-let ((`(,post ,fetch ,program) (overlay-get block 'opencode-children)))
+           ;; The call expanded while it ran stays so as the block is drawn again.
+           (should (overlay-get post 'opencode-expanded))
+           (should (string-search "slack.post  Post in C1 — hi\nTo  C1\nText  hi\n"
+                                  (opencode-test-text buffer)))
+           (should (eq (opencode-block-face (opencode-block-data fetch)) 'error))
+           (should (string-suffix-p " fetch  \uf057 GET https://example.com" (opencode-test-summary-text fetch)))
+           (should (string-suffix-p " program  return await tools.slack.post({channel: \"C1\", text: \"hi\"})"
+                                    (opencode-test-summary-text program)))
+           (opencode-expand-block program)
+           (should (string-suffix-p (concat "```javascript\n" code "\n```\n```text\nok\n```")
+                                    (substring-no-properties (opencode--expanded-content program))))
+           (should (= (opencode--block-end block) (opencode--block-end program)))
+           ;; A point in a child stays in it as the block is drawn again.
+           (goto-char (+ (overlay-start program) 5)))
+         (opencode-block-update block :output "ok again")
+         (let ((program (nth 2 (overlay-get block 'opencode-children))))
+           (should (overlay-get program 'opencode-expanded))
+           (should (= (point) (+ (overlay-start program) 5)))
+           (should (string-search "ok again" (opencode-test-text buffer))))
+         ;; A program that throws ends its call as a success, which fails it.
+         (opencode-block-update block :metadata '((toolCalls) (error . t)))
+         (should (eq (opencode-block-face (opencode-block-data block)) 'error))
+         (should (eq (opencode-block-face (opencode-block-data (car (overlay-get block 'opencode-children))))
+                     'error))
+         (should (string-search "1 failed" (opencode-group-summary (list block))))
+         (opencode-collapse-block block)
+         (should-not (overlay-get block 'opencode-children))
+         (should-not (seq-some (lambda (overlay) (overlay-get overlay 'opencode-parent))
+                               (overlays-in (point-min) (point-max))))
+         (opencode-expand-block block)
+         (should (overlay-get (car (overlay-get block 'opencode-children)) 'opencode-expanded)))))))
 
 (ert-deftest opencode-test-fit-flush-fits-what-windows-show ()
   "Summaries written while redisplay is inhibited are fitted where windows show them.

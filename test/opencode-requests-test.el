@@ -147,7 +147,7 @@
          (should (string-search "Post in #random" (overlay-get block 'opencode-summary))))))))
 
 (ert-deftest opencode-test-permission-code-mode-call ()
-  "A code mode program's call asks as itself, with its own input, and shows the program after it."
+  "A code mode program's call asks as itself, with its own input, its child block waiting."
   (opencode-test-with-server
    (let* ((id (opencode-test-scenario "text"))
           (buffer (opencode-test-open-empty id))
@@ -174,21 +174,37 @@
        (let* ((permission (car opencode-pending-permissions))
               (block (opencode--permission-block permission))
               (opencode--permission-transient-state (list :buffer buffer :permission permission)))
-         (should (equal (plist-get permission :title) "Post in #general — hi"))
-         (should (equal (plist-get permission :input) call-input))
-         (should (equal (opencode--permission-description) "Post in #general — hi"))
-         (should (string-search "Post in #general — hi" (overlay-get block 'opencode-summary)))
-         (let ((text (substring-no-properties (opencode--expanded-content block))))
-           (should (string-prefix-p "To  #general\nText  hi\n\nApproval required\n  slack_post rule \"*\"" text))
-           (should (string-suffix-p (concat "\n\nProgram\n```javascript\n" code "\n```") text))
-           (should-not (string-search "Directory" text)))
-         (setq target "#general thread")
-         (opencode-refresh-tool-blocks "slack_post")
-         (should (equal (plist-get permission :title) "Post in #general thread — hi"))
-         (should (string-prefix-p "To  #general thread" (opencode--expanded-content block)))
-         (opencode-permission-reply permission 'once)
-         (should-not (plist-get (opencode-block-data block) :permission-display))
-         (should (string-search "Post in #general thread — hi" (overlay-get block 'opencode-summary))))))))
+         (cl-flet ((call () (car (overlay-get block 'opencode-children))))
+           (should (equal (plist-get permission :title) "Post in #general — hi"))
+           (should (equal (plist-get permission :input) call-input))
+           (should (equal (opencode--permission-description) "Post in #general — hi"))
+           (should (string-search "Post in #general — hi" (overlay-get block 'opencode-summary)))
+           ;; The call's child waits, and shows the request under it.
+           (should (eq (opencode-block-face (opencode-block-data (call))) 'opencode-attention))
+           (should (string-suffix-p (concat (substring-no-properties (opencode-pending-prompt-icon))
+                                            " Post in #general — hi")
+                                    (opencode-test-summary-text (call))))
+           (let ((text (substring-no-properties (opencode--expanded-content (call)))))
+             (should (string-prefix-p "To  #general\nText  hi\n\nApproval required\n  slack_post rule \"*\"" text))
+             (should-not (string-search "Directory" text)))
+           (goto-char (overlay-start (call)))
+           (should (eq (opencode--permission-at-point) permission))
+           (setq target "#general thread")
+           (opencode-refresh-tool-blocks "slack_post")
+           (should (equal (plist-get permission :title) "Post in #general thread — hi"))
+           (should (string-prefix-p "To  #general thread" (opencode--expanded-content (call))))
+           (opencode-permission-reply permission 'once)
+           (should-not (plist-get (opencode-block-data block) :permission-display))
+           (should-not (plist-get (opencode-block-data (call)) :waiting))
+           (should (string-search "Post in #general thread — hi" (overlay-get block 'opencode-summary)))
+           ;; A request for a call not listed yet has a child of its own.
+           (opencode-permission-queue
+            `((id . "per_edit") (sessionID . ,id) (action . "edit") (resources "worktree")
+              (source (type . "tool") (messageID . "msg_code") (id . "call_code"))))
+           (should (equal (opencode-test-children block) '(0 request program)))
+           (let ((request (nth 1 (overlay-get block 'opencode-children))))
+             (should (string-search " edit " (opencode-test-summary-text request)))
+             (should (string-search "Edit worktree" (opencode-test-summary-text request))))))))))
 
 (ert-deftest opencode-test-permission-code-mode-call-input ()
   "A code mode call is described by its listed input when the request carries none, else by what it asks."
@@ -207,10 +223,12 @@
   (should (equal (opencode-permission-call-input "slack_post" '((input (text . "a"))) nil) '((text . "a"))))
   (should (equal (substring-no-properties
                   (opencode--permission-display '(:action "opencode_read_mcp_resource" :resources ("s:u"))
-                                                "opencode_read_mcp_resource" '((server . "s") (uri . "u"))
-                                                '((code . "x"))))
-                 (concat "opencode_read_mcp_resource\nserver: s\nuri: u\n\nApproval required\n"
-                         "  opencode_read_mcp_resource\n\nProgram\n```javascript\nx\n```"))))
+                                                "opencode_read_mcp_resource" '((server . "s") (uri . "u")) t))
+                 "server: s\nuri: u\n\nApproval required\n  opencode_read_mcp_resource"))
+  (should (equal (substring-no-properties
+                  (opencode--permission-display '(:action "opencode_list_mcp_resources" :resources ("*"))
+                                                "opencode_list_mcp_resources" nil t))
+                 "Approval required\n  opencode_list_mcp_resources")))
 
 (ert-deftest opencode-test-permission-replied-functions ()
   "Packages hear of an answer once the service took it, never of one it refused."

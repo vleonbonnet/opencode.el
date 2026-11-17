@@ -525,6 +525,16 @@ The fake service's inboxes follow their events (see `opencode-test-inbox')."
   (with-current-buffer buffer
     (string-trim-right (buffer-substring-no-properties (point-min) (point-max)))))
 
+(defun opencode-test-summary-text (overlay)
+  "Return the summary line of block OVERLAY, without properties."
+  (with-current-buffer (overlay-buffer overlay)
+    (buffer-substring-no-properties (overlay-start overlay) (1- (overlay-end overlay)))))
+
+(defun opencode-test-children (block)
+  "Return the keys of the child blocks of BLOCK, a code mode program's, in order."
+  (mapcar (lambda (child) (overlay-get child 'opencode-child-key))
+          (overlay-get block 'opencode-children)))
+
 (defun opencode-test-find (text)
   "Return the position of the first TEXT in the current buffer."
   (save-excursion

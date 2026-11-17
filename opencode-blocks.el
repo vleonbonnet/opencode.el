@@ -36,8 +36,9 @@
 ;;   by status: blue while running, orange while waiting on the user,
 ;;   the error face on failure.  Formatting a diff or a patch waits for
 ;;   expansion.
-;; - A code mode program's block describes the tool calls the program
-;;   makes, which its metadata lists, rather than its JavaScript.
+;; - A code mode program's block holds the tool calls the program makes,
+;;   which its metadata lists, as child blocks, and its JavaScript as
+;;   the last.
 ;;
 ;; The arrow is an overlay `before-string', never buffer text: text on an
 ;; overlay boundary drifts out from under it when edited.  Summaries are
@@ -161,7 +162,7 @@ quotes the line as on any line of the transcript (see
     ("shell" "\ue795")                         ; nf-dev-terminal
     ("grep" "\uf002")                          ; nf-fa-search
     ("glob" "\uf0c5")                          ; nf-fa-files_o
-    ((or "websearch" "webfetch") "\uf0ac")     ; nf-fa-globe
+    ((or "websearch" "webfetch" "fetch") "\uf0ac") ; nf-fa-globe
     ("question" "\uf059")                      ; nf-fa-question_circle
     ("skill" "\uf02d")                         ; nf-fa-book
     ("execute" "\uf121")                       ; nf-fa-code
@@ -274,6 +275,7 @@ showing."
           ((or "grep" "glob") (format "%S" (or .pattern "?")))
           ("websearch" (format "%S" (or .query "?")))
           ("webfetch" (or .url "?"))
+          ("fetch" (format "%s %s" (or .method "GET") (or .url "?")))
           ("question" (opencode-question-description input))
           ("skill" (or .id "?"))
           ("execute" (or (and (stringp .code) (car (split-string (string-trim .code) "\n")))
@@ -281,13 +283,14 @@ showing."
           ("subagent" (format "%s: %s" (capitalize (or .agent "subagent")) (or .description "")))
           (_ (opencode--generic-tool-description input))))))
 
-(defun opencode-tool-summary (tool input face &optional status-icon description note)
+(defun opencode-tool-summary (tool input face &optional status-icon description note label)
   "Return the one-line summary of TOOL called with INPUT, colored as FACE.
 STATUS-ICON goes between the boxed label and the description, which
-DESCRIPTION replaces; NOTE follows the description.  Whitespace is
-flattened so a multi-line argument cannot break the line.  A failing
-description falls back to the generic one: the block must exist for a
-permission to expand it."
+DESCRIPTION replaces; NOTE follows the description.  LABEL, when
+non-nil, replaces the tool's own in the box.  Whitespace is flattened
+so a multi-line argument cannot break the line.  A failing description
+falls back to the generic one: the block must exist for a permission to
+expand it."
   (let* ((description
           (or description
               (condition-case err
@@ -297,7 +300,7 @@ permission to expand it."
                           (truncate-string-to-width (error-message-string err) 200 nil nil "…"))
                  (opencode--generic-tool-description input)))))
          (full (concat (opencode-boxed-label (opencode-tool-icon tool input)
-                                             (opencode-tool-short-label tool) face)
+                                             (or label (opencode-tool-short-label tool)) face)
                        (when status-icon (concat " " status-icon))
                        " "
                        (string-trim (replace-regexp-in-string "[ \t\n\r]+" " " (or description "")))
@@ -383,12 +386,19 @@ launch and completion blocks say how it ended.  Other blocks get nil."
 ;; JavaScript program, and the program calls the other tools.  The
 ;; call's metadata lists those calls in `toolCalls' as they start and
 ;; end, each with its path in the program, such as slack.send_message,
-;; its status and its input.  Its block describes them, through the
+;; its status and its input.  The program's block holds them as child
+;; blocks, each drawn as its tool's call would be, through the
 ;; functions of `opencode-tool-summary-functions' and
-;; `opencode-tool-display-functions' for their tools, as it would
-;; describe them called directly; the program comes after them.  A
-;; permission one of them asks names it as the service does,
-;; slack_send_message, and comes from the execute call.
+;; `opencode-tool-display-functions', and the program as the last.  It
+;; is expanded while its turn is the latest, as the calls would show
+;; made directly, and collapsed once a later prompt is written, as
+;; groups are made.  The children are drawn from the block's data with
+;; its expansion, so a transcript written again shows them alike; the
+;; children expanded are remembered on the block.  A permission one of
+;; the calls asks names it as the service does, slack_send_message, and
+;; comes from the execute call.
+
+(defvar opencode--replaying)
 
 (defun opencode-execute-call-name (path)
   "Return the tool name of PATH, a tool's path in a code mode program.
@@ -404,26 +414,39 @@ Each is an alist with the call's `tool' path, `status' and `input'."
     (and (proper-list-p calls)
          (seq-filter (lambda (call) (and (consp call) (stringp (alist-get 'tool call)))) calls))))
 
+(defun opencode-execute-container-p (data)
+  "Return non-nil when block DATA is that of a code mode program, which holds child blocks."
+  (and (equal (plist-get data :tool) "execute")
+       (not (plist-get data :child))))
+
 (defun opencode-execute-failed-p (data)
   "Return non-nil when tool block DATA is a code mode program that failed.
 A program that throws still ends its call as a success, its metadata
 saying it failed."
-  (and (equal (plist-get data :tool) "execute")
+  (and (opencode-execute-container-p data)
        (eq (alist-get 'error (plist-get data :metadata)) t)))
+
+(defun opencode--call-description (name input)
+  "Return the description of a call of tool NAME with INPUT, or nil.
+The function of `opencode-tool-summary-functions' for NAME gives it,
+else, when there is INPUT, the built-in one."
+  (or (opencode-call-tool-function opencode-tool-summary-functions name input)
+      (and input (opencode-tool-description name input))))
 
 (defun opencode-execute-call-description (call)
   "Return the one-line description of CALL, a tool call of a code mode program.
 The function of `opencode-tool-summary-functions' for its tool gives it,
-else its path followed by its input's generic description."
+else its path followed by the built-in description of its input."
   (let-alist call
-    (or (opencode-call-tool-function opencode-tool-summary-functions (opencode-execute-call-name .tool) .input)
-        (if .input (concat .tool " " (opencode--generic-tool-description .input)) .tool))))
+    (let ((name (opencode-execute-call-name .tool)))
+      (or (opencode-call-tool-function opencode-tool-summary-functions name .input)
+          (if .input (concat .tool " " (opencode-tool-description name .input)) .tool)))))
 
 (defun opencode-execute-description (input metadata)
   "Return the description of the code mode program INPUT whose call has METADATA.
 A program that made one call is described as that call, one that made
-several by their tools, each with how many times it was called.  Before
-its first call, it is described by its first line."
+several as a group is: how many calls, then how many of each tool.
+Before its first call, it is described by its first line."
   (let ((calls (opencode-execute-calls metadata)))
     (cond
      ((null calls) (opencode-tool-description "execute" input))
@@ -434,14 +457,14 @@ its first call, it is described by its first line."
               (if entry
                   (cl-incf (cdr entry))
                 (push (cons (alist-get 'tool call) 1) counts))))
-          (mapconcat (lambda (entry)
-                       (if (> (cdr entry) 1) (format "%s ×%d" (car entry) (cdr entry)) (car entry)))
-                     (nreverse counts) " · "))))))
+          (concat (format "%d calls · " (length calls))
+                  (mapconcat (lambda (entry) (format "%d %s" (cdr entry) (car entry)))
+                             (nreverse counts) " · ")))))))
 
 (defun opencode--execute-summary (data)
   "Return the description of tool block DATA when it runs a code mode program, else nil.
 A failing description gives nil, so the block keeps the default one."
-  (when (equal (plist-get data :tool) "execute")
+  (when (opencode-execute-container-p data)
     (condition-case err
         (opencode-execute-description (plist-get data :input) (plist-get data :metadata))
       (error
@@ -454,11 +477,7 @@ A failing description gives nil, so the block keeps the default one."
   (let ((failed (seq-count (lambda (call) (equal (alist-get 'status call) "error"))
                            (opencode-execute-calls metadata))))
     (when (> failed 0)
-      (opencode-face-string (format "%d %s failed" failed (if (= failed 1) "call" "calls")) 'error))))
-
-(defun opencode-execute-status-icon (status)
-  "Return the icon of a code mode program's tool call whose status is STATUS."
-  (opencode-session-status-glyph (pcase status ("completed" 'done) ("error" 'failed) (_ 'working))))
+      (opencode-face-string (format "%d failed" failed) 'error))))
 
 (defun opencode--json-value (value)
   "Return VALUE, read from the service's JSON, ready for `json-serialize'.
@@ -508,28 +527,214 @@ when there is nothing to show."
   "Return the program of code mode INPUT as a JavaScript code block."
   (opencode-fenced-block (or (alist-get 'code input) (format "%S" input)) "javascript"))
 
-(defun opencode-execute-display (input metadata)
-  "Return the full display of the code mode program INPUT whose call has METADATA.
-Each tool call the program made comes first, under its status and path,
-then the program."
-  (string-join
-   (append (mapcar (lambda (call)
-                     (let-alist call
-                       (concat (opencode-fontify-as (concat (opencode-execute-status-icon .status) " " .tool)
-                                                    'verbatim)
-                               (when-let* ((display (opencode-execute-call-display
-                                                     (opencode-execute-call-name .tool) .input)))
-                                 (concat "\n" display)))))
-                   (opencode-execute-calls metadata))
-           (list (opencode-execute-program input)))
-   "\n\n"))
-
 (defun opencode-block-calls-p (data tools)
   "Return non-nil when tool block DATA calls one of TOOLS, itself or from its program."
   (or (member (plist-get data :tool) tools)
-      (and (equal (plist-get data :tool) "execute")
+      (and (opencode-execute-container-p data)
            (seq-some (lambda (call) (member (opencode-execute-call-name (alist-get 'tool call)) tools))
                      (opencode-execute-calls (plist-get data :metadata))))))
+
+;;;;; Child blocks
+
+(defun opencode--waiting-call (calls action)
+  "Return the index in CALLS of the last one running a call of tool ACTION, or nil."
+  (let (found)
+    (seq-do-indexed (lambda (call index)
+                      (when (and (equal (alist-get 'status call) "running")
+                                 (equal (opencode-execute-call-name (alist-get 'tool call)) action))
+                        (setq found index)))
+                    calls)
+    found))
+
+(defun opencode-execute-children (data)
+  "Return the data of the child blocks of code mode block DATA, in order.
+Each call the program made is one, keyed by its index, and the program
+the last, keyed `program'.  The call a pending permission is for
+carries it; a permission for a call not listed yet gets a child of its
+own, keyed `request', before the program.  Each has the program's :key,
+which names the call permissions come from."
+  (let* ((key (plist-get data :key))
+         (calls (opencode-execute-calls (plist-get data :metadata)))
+         (action (and (plist-get data :waiting) (plist-get data :waiting-action)))
+         (waiting (and action (opencode--waiting-call calls action)))
+         (request (and action
+                       (list :waiting t :waiting-kind (plist-get data :waiting-kind)
+                             :waiting-summary (plist-get data :waiting-summary)
+                             :permission-display (plist-get data :permission-display)))))
+    (append
+     (seq-map-indexed
+      (lambda (call index)
+        (let-alist call
+          (append (list :type 'tool :child index :key key :path .tool
+                        :tool (opencode-execute-call-name .tool) :input .input
+                        :status .status :failed (equal .status "error"))
+                  (and (eql index waiting) request))))
+      calls)
+     (when (and action (not waiting))
+       (list (append (list :type 'tool :child 'request :key key :path action :tool action
+                           :input (plist-get data :waiting-input) :status "running")
+                     request)))
+     (list (list :type 'tool :child 'program :key key :tool "execute"
+                 :input (plist-get data :input) :status (plist-get data :status)
+                 :output (plist-get data :output)
+                 :failed (or (plist-get data :error) (opencode-execute-failed-p data)))))))
+
+(defun opencode-child-summary (data)
+  "Return the summary line of DATA, a child block of a code mode program's block.
+A call shows its path in its box, the program \"program\"."
+  (let ((face (opencode-block-face data))
+        (icon (cond ((plist-get data :waiting) (opencode-pending-prompt-icon))
+                    ((plist-get data :failed) (opencode-face-string "\uf057" 'error))))) ; nf-fa-times_circle
+    (if (eq (plist-get data :child) 'program)
+        (opencode-tool-summary "execute" (plist-get data :input) face icon
+                               (and (equal (plist-get data :status) "streaming") "…") nil "program")
+      (opencode-tool-summary (plist-get data :tool) (plist-get data :input) face icon
+                             (or (plist-get data :waiting-summary)
+                                 (opencode--call-description (plist-get data :tool) (plist-get data :input))
+                                 "")
+                             nil (plist-get data :path)))))
+
+(defun opencode-child-content (data)
+  "Return the expansion of DATA, a child block of a code mode program's block.
+A call shows as its tool's display shows it, or its pending permission;
+the program shows with its output."
+  (if (eq (plist-get data :child) 'program)
+      (let ((output (plist-get data :output)))
+        (string-join (delq nil (list (opencode-execute-program (plist-get data :input))
+                                     (and output (not (string-empty-p output))
+                                          (opencode-fenced-block output "text"))))
+                     "\n"))
+    (or (plist-get data :permission-display)
+        (opencode-execute-call-display (plist-get data :tool) (plist-get data :input)))))
+
+(defconst opencode--child-indent "  "
+  "Indentation of the child blocks of a code mode program's block.")
+
+(defun opencode--arrow (overlay expanded face)
+  "Return the arrow of block OVERLAY, EXPANDED or not, colored by FACE, after its indentation."
+  (concat (overlay-get overlay 'opencode-indent) (opencode-disclosure-string expanded face)))
+
+(defun opencode--attach-children (overlay start)
+  "Make child blocks of the lines from START, the expansion of code mode block OVERLAY.
+Each line is that of one of its children (see `opencode-execute-children');
+those expanded before are expanded again."
+  (let ((children nil))
+    (save-excursion
+      (goto-char start)
+      (dolist (data (opencode-execute-children (opencode-block-data overlay)))
+        (let* ((line-start (point))
+               (line-end (progn (forward-line 1) (point))))
+          (push (opencode--collapsible-overlay line-start line-end
+                                               (buffer-substring line-start (1- line-end))
+                                               (opencode-block-face data) data overlay)
+                children))))
+    (setq children (nreverse children))
+    (overlay-put overlay 'opencode-children children)
+    (let ((open (overlay-get overlay 'opencode-open-children)))
+      (dolist (child children)
+        (when (memql (overlay-get child 'opencode-child-key) open)
+          (opencode-expand-block child))))))
+
+(defun opencode--delete-children (overlay)
+  "Delete the child blocks of OVERLAY, whose expansion is about to go."
+  (dolist (child (overlay-get overlay 'opencode-children))
+    (dolist (fit (overlay-get child 'opencode-fit-overlays))
+      (delete-overlay (cdr fit)))
+    (when-let* ((content (overlay-get child 'opencode-content-overlay)))
+      (delete-overlay content))
+    (delete-overlay child))
+  (overlay-put overlay 'opencode-children nil))
+
+(defun opencode--child-toggled (overlay)
+  "Note on its parent that child block OVERLAY was expanded or collapsed.
+The parent remembers it, and its expansion covers the child's, which
+may end it."
+  (when-let* ((parent (overlay-get overlay 'opencode-parent))
+              ((overlay-buffer parent)))
+    (let ((key (overlay-get overlay 'opencode-child-key))
+          (open (overlay-get parent 'opencode-open-children)))
+      (overlay-put parent 'opencode-open-children
+                   (if (overlay-get overlay 'opencode-expanded)
+                       (cl-adjoin key open)
+                     (remove key open))))
+    (when-let* ((content (overlay-get parent 'opencode-content-overlay))
+                ((overlay-buffer content)))
+      (move-overlay content (overlay-start content)
+                    (max (overlay-end content) (opencode--block-end overlay))))
+    (opencode--refit-group-of parent)))
+
+(defun opencode--child-anchor (overlay position)
+  "Return where POSITION lies in the expansion of code mode block OVERLAY, or nil.
+The value is (KEY . OFFSET): OFFSET characters into the child keyed
+KEY, or into the expansion when KEY is nil."
+  (when-let* ((content (overlay-get overlay 'opencode-content-overlay))
+              ((overlay-buffer content))
+              ((<= (overlay-start content) position))
+              ((< position (overlay-end content))))
+    (if-let* ((child (seq-find (lambda (child)
+                                 (and (overlay-buffer child)
+                                      (<= (overlay-start child) position)
+                                      (< position (opencode--block-end child))))
+                               (overlay-get overlay 'opencode-children))))
+        (cons (overlay-get child 'opencode-child-key) (- position (overlay-start child)))
+      (cons nil (- position (overlay-start content))))))
+
+(defun opencode--child-position (overlay anchor)
+  "Return the position ANCHOR names in the expansion of OVERLAY, or nil.
+ANCHOR is a value of `opencode--child-anchor'; a child no longer there
+counts as the expansion's start."
+  (when-let* ((content (overlay-get overlay 'opencode-content-overlay))
+              ((overlay-buffer content)))
+    (if-let* ((key (car anchor))
+              (child (seq-find (lambda (child) (eql (overlay-get child 'opencode-child-key) key))
+                               (overlay-get overlay 'opencode-children))))
+        (min (+ (overlay-start child) (cdr anchor)) (1- (opencode--block-end child)))
+      (min (+ (overlay-start content) (if (car anchor) 0 (cdr anchor)))
+           (max (overlay-start content) (1- (overlay-end content)))))))
+
+(defun opencode--expansion-anchors (overlay)
+  "Return the points and window starts in the expansion of OVERLAY, anchored to its children.
+Each is (SET ANCHOR), SET a function of a position putting it back."
+  (let ((anchors nil))
+    (when-let* ((anchor (opencode--child-anchor overlay (point))))
+      (push (list #'goto-char anchor) anchors))
+    (dolist (window (get-buffer-window-list nil nil t))
+      (when-let* ((anchor (opencode--child-anchor overlay (window-point window))))
+        (push (list (lambda (position) (set-window-point window position)) anchor) anchors))
+      (when-let* ((anchor (opencode--child-anchor overlay (window-start window))))
+        (push (list (lambda (position)
+                      (set-window-start window (save-excursion (goto-char position) (line-beginning-position)) t))
+                    anchor)
+              anchors)))
+    anchors))
+
+(defun opencode--restore-anchors (overlay anchors)
+  "Put the points and window starts of ANCHORS back in the expansion of OVERLAY."
+  (pcase-dolist (`(,set ,anchor) anchors)
+    (when-let* ((position (opencode--child-position overlay anchor)))
+      (funcall set position))))
+
+(defun opencode--close-programs (from to)
+  "Collapse the code mode blocks between FROM and TO, a turn becoming an earlier one."
+  (dolist (overlay (opencode-tool-blocks))
+    (when (and (overlay-get overlay 'opencode-expanded)
+               (<= from (overlay-start overlay)) (< (overlay-start overlay) to)
+               (opencode-execute-container-p (opencode-block-data overlay)))
+      (opencode-collapse-block overlay))))
+
+(defun opencode-open-replayed-programs ()
+  "Expand the code mode blocks of the latest turn written from the service.
+A transcript is written collapsed; those of its latest turn show as
+they did live."
+  (dolist (overlay (opencode-tool-blocks))
+    (when (overlay-get overlay 'opencode-open-pending)
+      (overlay-put overlay 'opencode-open-pending nil)
+      (when (and (null (opencode--earlier-turn (overlay-start overlay)))
+                 (not (overlay-get overlay 'opencode-group)))
+        (opencode-call-preserving-viewport (current-buffer)
+                                           (lambda () (opencode-expand-block overlay)))))))
+
+(add-hook 'opencode-session-replayed-hook #'opencode-open-replayed-programs)
 
 ;;;; Reasoning summaries
 
@@ -640,17 +845,24 @@ every summary replacement."
     (opencode-output (opencode--summary-text (concat summary "\n")))
     (opencode--collapsible-overlay start (opencode-pmark) summary face data)))
 
-(defun opencode--collapsible-overlay (start end summary face data)
+(defun opencode--collapsible-overlay (start end summary face data &optional parent)
   "Return the overlay of a collapsed block whose SUMMARY line spans START..END.
 FACE colors its arrow and margin; DATA is kept on it.  Text inserted at
-START goes before it."
+START goes before it.  PARENT, when non-nil, is the block whose
+expansion holds this one, a child indented under it whose properties
+win over the expansion's."
   (let ((overlay (make-overlay start end nil t nil))
         (margin (opencode-margin face)))
+    (when parent
+      (overlay-put overlay 'opencode-parent parent)
+      (overlay-put overlay 'opencode-child-key (plist-get data :child))
+      (overlay-put overlay 'opencode-indent opencode--child-indent)
+      (overlay-put overlay 'priority 2))
     (overlay-put overlay 'opencode-collapsible t)
     (overlay-put overlay 'opencode-expanded nil)
     (overlay-put overlay 'opencode-data data)
     (overlay-put overlay 'opencode-summary summary)
-    (overlay-put overlay 'before-string (opencode-disclosure-string nil face))
+    (overlay-put overlay 'before-string (opencode--arrow overlay nil face))
     (overlay-put overlay 'keymap opencode-collapsible-keymap)
     (overlay-put overlay 'line-prefix margin)
     (overlay-put overlay 'wrap-prefix margin)
@@ -683,14 +895,14 @@ in another color."
   (let ((margin (opencode-margin face)))
     (overlay-put overlay 'face nil)
     (overlay-put overlay 'before-string
-                 (opencode-disclosure-string (overlay-get overlay 'opencode-expanded) face))
+                 (opencode--arrow overlay (overlay-get overlay 'opencode-expanded) face))
     (overlay-put overlay 'line-prefix margin)
     (overlay-put overlay 'wrap-prefix margin)))
 
 (defun opencode-block-face (data)
   "Return the display face of block DATA."
   (cond
-   ((or (plist-get data :error) (opencode-execute-failed-p data)
+   ((or (plist-get data :error) (plist-get data :failed) (opencode-execute-failed-p data)
         (cdr (opencode-tool-background-outcome data))) 'error)
    ((plist-get data :waiting) 'opencode-attention)
    ((or (equal (plist-get data :job-state) "running")
@@ -737,7 +949,9 @@ A notice's summary is given once, as it is written."
     (pcase (plist-get data :type)
       ('reasoning (opencode-reasoning-summary (plist-get data :text) (plist-get data :hidden-kind)
                                               (plist-get data :dropped)))
-      ('tool (opencode-tool-collapsed-summary data))
+      ('tool (if (plist-get data :child)
+                 (opencode-child-summary data)
+               (opencode-tool-collapsed-summary data)))
       ('group (opencode-group-summary (plist-get data :members))))))
 
 (defun opencode-refresh-block (overlay)
@@ -793,8 +1007,8 @@ METADATA is what the finished call reported, nil before."
 (defun opencode--default-tool-call (tool input &optional metadata)
   "Return the built-in full display of TOOL called with INPUT.
 METADATA is what the call reported: a shell command shows the file
-changes reported once it ran, or those predicted before, a write the
-diff it reports, and a code mode program the tool calls it made."
+changes reported once it ran, or those predicted before, and a write
+the diff it reports."
   (let-alist input
     (pcase tool
       ("edit" (concat "edit " (opencode-relative-path-for-display (or .path "")) ":\n"
@@ -830,7 +1044,7 @@ diff it reports, and a code mode program the tool calls it made."
                                   (when .include (format " (%s)" .include))))
       ("websearch" (format "websearch %S" .query))
       ("webfetch" (format "webfetch %s" .url))
-      ("execute" (opencode-execute-display input metadata))
+      ("execute" (opencode-execute-program input))
       (_ (if (= 1 (length input))
              (let ((value (format "%s" (cdar input))))
                (format "%s%s%s" tool (if (string-search "\n" value) "\n" " ") value))
@@ -866,15 +1080,22 @@ Each receives the block data and returns a string, or nil to defer.")
          (let ((tool (plist-get data :tool))
                (input (plist-get data :input))
                (output (plist-get data :output)))
-           (string-join
-            (delq nil
-                  (if (equal tool "subagent")
-                      (list (alist-get 'prompt input) output)
-                    (list (or (plist-get data :permission-display)
-                              (opencode-format-tool-call tool input (plist-get data :metadata)))
-                          (and output (not (string-empty-p output))
-                               (opencode-fenced-block output "text")))))
-            "\n"))))))
+           (cond
+            ((plist-get data :child) (opencode-child-content data))
+            ;; Its children's lines, which become blocks once written.
+            ((opencode-execute-container-p data)
+             (mapconcat (lambda (child) (opencode--summary-text (opencode-child-summary child)))
+                        (opencode-execute-children data) "\n"))
+            (t
+             (string-join
+              (delq nil
+                    (if (equal tool "subagent")
+                        (list (alist-get 'prompt input) output)
+                      (list (or (plist-get data :permission-display)
+                                (opencode-format-tool-call tool input (plist-get data :metadata)))
+                            (and output (not (string-empty-p output))
+                                 (opencode-fenced-block output "text")))))
+              "\n"))))))))
 
 (defun opencode--expanded-content (overlay)
   "Return the full expansion text of OVERLAY, error included."
@@ -886,37 +1107,46 @@ Each receives the block data and returns a string, or nil to defer.")
                  "\n\n")))
 
 (defun opencode--insert-expansion (overlay position)
-  "Insert OVERLAY's expansion at POSITION and record its content overlay."
+  "Insert OVERLAY's expansion at POSITION and record its content overlay.
+A child's expansion is indented under it and wins over its parent's; a
+code mode program's lines become its child blocks."
   (let ((content (opencode--expanded-content overlay))
-        (face (opencode-block-face (opencode-block-data overlay))))
+        (face (opencode-block-face (opencode-block-data overlay)))
+        (indent (overlay-get overlay 'opencode-indent)))
     (if (string-empty-p content)
         (overlay-put overlay 'opencode-content-overlay nil)
       (let* ((end (opencode-insert-output-at position (concat content "\n")))
              ;; Exclude output later inserted at either boundary.
              (content-overlay (make-overlay position end nil t nil))
-             (margin (opencode-margin face)))
+             (margin (concat (opencode-margin face) (and indent (concat indent "  ")))))
         (overlay-put content-overlay 'evaporate t)
         ;; Own the margin, or a tight following block would lend its own.
         (overlay-put content-overlay 'line-prefix margin)
         (overlay-put content-overlay 'wrap-prefix margin)
-        (overlay-put content-overlay 'priority 1)
+        (overlay-put content-overlay 'priority (if indent 2 1))
         (overlay-put content-overlay 'opencode-summary overlay)
-        (overlay-put overlay 'opencode-content-overlay content-overlay)))))
+        (overlay-put overlay 'opencode-content-overlay content-overlay)
+        (when (opencode-execute-container-p (opencode-block-data overlay))
+          (opencode--attach-children overlay position))))))
 
 (defun opencode--refresh-expanded (overlay)
   "Rewrite OVERLAY's expansion after its data changed.
 Points in the old expansion stay at its start, and those following
-output after it, as `opencode-call-preserving-viewport' keeps them.
-A group's expansion is its blocks, which stay."
+output after it, as `opencode-call-preserving-viewport' keeps them;
+those in a code mode program's child stay where they were in it.  A
+group's expansion is its blocks, which stay."
   (when (and (overlay-get overlay 'opencode-expanded)
              (not (opencode-group-p overlay)))
     (let ((old (overlay-get overlay 'opencode-content-overlay))
+          (anchors (and (opencode-execute-container-p (opencode-block-data overlay))
+                        (opencode--expansion-anchors overlay)))
           (inhibit-read-only t))
       ;; Told apart before the deletion, which brings the points of an
       ;; expansion ending the output to the process mark.
       (opencode-call-preserving-viewport
        (current-buffer)
        (lambda ()
+         (opencode--delete-children overlay)
          (if (and (overlayp old) (overlay-buffer old))
              (let ((start (overlay-start old))
                    (end (overlay-end old)))
@@ -924,7 +1154,8 @@ A group's expansion is its blocks, which stay."
                (delete-region start end)
                (opencode--insert-expansion overlay start))
            (opencode--insert-expansion overlay (overlay-end overlay)))
-         (opencode--refit-group-of overlay))))))
+         (opencode--refit-group-of overlay)))
+      (opencode--restore-anchors overlay anchors))))
 
 (defun opencode-collapsible-at (position)
   "Return the collapsible summary overlay at POSITION, if any."
@@ -932,12 +1163,13 @@ A group's expansion is its blocks, which stay."
             (overlays-at position)))
 
 (defun opencode-block-at (position)
-  "Return the summary overlay of the block whose summary or content is at POSITION."
+  "Return the summary overlay of the block whose summary or content is at POSITION.
+In a child's expansion, that is the child."
   (or (opencode-collapsible-at position)
       (seq-some (lambda (overlay)
                   (let ((summary (overlay-get overlay 'opencode-summary)))
                     (and (overlayp summary) (overlay-buffer summary) summary)))
-                (overlays-at position))))
+                (overlays-at position t))))
 
 (defun opencode-expand-block (overlay)
   "Expand OVERLAY's block unless it is already expanded.
@@ -950,7 +1182,8 @@ A group shows its blocks, as they were."
           (opencode--group-show overlay t)
         (opencode--insert-expansion overlay (overlay-end overlay))
         (opencode--refit-group-of overlay))
-      (overlay-put overlay 'before-string (opencode-disclosure-string t face)))))
+      (overlay-put overlay 'before-string (opencode--arrow overlay t face))
+      (opencode--child-toggled overlay))))
 
 (defun opencode--refit-group-of (overlay)
   "Make the group of block OVERLAY, if any, hide it as it is now."
@@ -976,6 +1209,7 @@ A group hides its blocks again."
       (if (and (overlayp content) (overlay-buffer content) pmark
                (< (overlay-start content) pmark (overlay-end content)))
           (message "Cannot collapse an expansion that contains later output")
+        (opencode--delete-children overlay)
         (when (and (overlayp content) (overlay-buffer content))
           (let ((start (overlay-start content))
                 (end (overlay-end content)))
@@ -984,8 +1218,9 @@ A group hides its blocks again."
         (overlay-put overlay 'opencode-content-overlay nil)
         (overlay-put overlay 'opencode-expanded nil)
         (overlay-put overlay 'before-string
-                     (opencode-disclosure-string nil (opencode-block-face (opencode-block-data overlay))))
-        (opencode--refit-group-of overlay))))))
+                     (opencode--arrow overlay nil (opencode-block-face (opencode-block-data overlay))))
+        (opencode--refit-group-of overlay)
+        (opencode--child-toggled overlay))))))
 
 (defun opencode-toggle-block (&optional position)
   "Expand or collapse the block whose summary is at POSITION or point."
@@ -1172,6 +1407,11 @@ INPUT and STATUS default to an empty input still streaming."
                                                  (opencode-block-face data) data)))
         (puthash id overlay opencode--blocks)
         (run-hook-with-args 'opencode-blocks-attach-functions overlay)
+        ;; A program's calls show while its turn is the latest.
+        (when (opencode-execute-container-p data)
+          (if (bound-and-true-p opencode--replaying)
+              (overlay-put overlay 'opencode-open-pending t)
+            (opencode-expand-block overlay)))
         overlay)))
 
 (defun opencode-tool-update (id &rest properties)
@@ -1409,6 +1649,7 @@ expanded.  Points left in the text a group hides go to its summary."
           (progn
             (dolist (overlay (overlays-in from to))
               (when (and (overlay-get overlay 'opencode-collapsible)
+                         (not (overlay-get overlay 'opencode-parent))
                          (<= from (overlay-start overlay)) (< (overlay-start overlay) to))
                 (if (opencode-group-p overlay)
                     (progn (push overlay groups)
@@ -1443,9 +1684,14 @@ turn, after the last prompt, gives nil."
 (defun opencode-group-earlier-turn (prompt-start)
   "Group the blocks of the turn that the prompt at PROMPT-START follows.
 That turn runs from the end of the prompt before, or the start of the
-buffer, to PROMPT-START (see `opencode-group-runs')."
-  (opencode-group-runs (or (previous-single-property-change prompt-start 'opencode-prompt) (point-min))
-                       prompt-start))
+buffer, to PROMPT-START (see `opencode-group-runs').  Its code mode
+programs collapse first, their calls no longer the latest."
+  (let ((from (or (previous-single-property-change prompt-start 'opencode-prompt) (point-min)))
+        (to (copy-marker prompt-start)))
+    (opencode-without-undo
+      (opencode--close-programs from to))
+    (opencode-group-runs from to)
+    (set-marker to nil)))
 
 (defun opencode--regroup-after-change (overlay)
   "Group anew the turn of block OVERLAY when the change of its data matters.

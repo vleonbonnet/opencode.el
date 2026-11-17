@@ -347,6 +347,66 @@ Run in a graphical Emacs, with the user's font and theme when given."
   "Return TEXT up to MARKER, a string it holds."
   (substring text 0 (string-search marker text)))
 
+(defconst opencode-test-program-calls
+  '(((tool . "slack.get_user") (status . "completed") (input (name_or_id . "U1")))
+    ((tool . "anvil-eval.emacs-eval-read") (status . "completed") (input (expression . "emacs-version"))))
+  "The tool calls of the code mode program of `opencode-test-program-content'.")
+
+(defun opencode-test-program-content ()
+  "Return the content of a code mode program's call that made two calls."
+  `((type . "tool") (id . "call_g02p") (name . "execute")
+    (state (status . "completed") (input (code . "const e = 1;\nreturn e"))
+           (content ((type . "text") (text . "1")))
+           (metadata (toolCalls ,@opencode-test-program-calls)))))
+
+(ert-deftest opencode-test-program-open-while-latest ()
+  "A code mode program shows its calls while its turn is the latest, live or reloaded, and closes after."
+  (opencode-test-with-transcript (opencode-test-group-turn 1)
+    (let* ((id (opencode-test-session))
+           (step '((assistantMessageID . "msg_g02a")))
+           (call '((id . "call_g02p"))))
+      (with-current-buffer (opencode-test-open id)
+        (opencode-test-dispatch
+         (append
+          (opencode-test-inbox-events id "msg_g02u" "Question 2")
+          (list (opencode-test-event id "session.execution.started" "evt_g02s")
+                (apply #'opencode-test-event id "session.step.started" "evt_g02b" step)
+                (apply #'opencode-test-event id "session.tool.input.started" "evt_g02i"
+                       '(name . "execute") (append call step))
+                (apply #'opencode-test-event id "session.tool.called" "evt_g02c"
+                       '(input (code . "const e = 1;\nreturn e")) (append call step))
+                (apply #'opencode-test-event id "session.tool.progress" "evt_g02g"
+                       `(metadata (toolCalls ,(car opencode-test-program-calls))) (append call step))
+                (apply #'opencode-test-event id "session.tool.success" "evt_g02d"
+                       '(content ((type . "text") (text . "1")))
+                       `(metadata (toolCalls ,@opencode-test-program-calls)) (append call step)))))
+        (opencode-test-answer id "msg_g02a" "Answer 2.")
+        (opencode-test-turn id "succeeded")
+        (let ((block (opencode-block "call_g02p")))
+          (should (overlay-get block 'opencode-expanded))
+          (should (equal (opencode-test-children block) '(0 1 program)))
+          (should (string-search "2 calls · 1 slack.get_user · 1 anvil-eval.emacs-eval-read"
+                                 (opencode-test-summary-text block))))
+        (setq opencode-test-transcript
+              (append (opencode-test-group-turn 1)
+                      (list (opencode-test-prompt "msg_g02u" "Question 2")
+                            (opencode-test-step "msg_g02a" (opencode-test-program-content)
+                                                '((type . "text") (text . "Answer 2."))))))
+        (should (equal (opencode-test-look) (opencode-test-fresh-look id)))
+        ;; A later prompt closes it, as a reload draws it.
+        (opencode-test-dispatch (opencode-test-inbox-events id "msg_g03u" "Question 3"))
+        (let ((block (opencode-block "call_g02p")))
+          (should-not (overlay-get block 'opencode-expanded))
+          (should-not (overlay-get block 'opencode-children)))
+        (setq opencode-test-transcript
+              (append opencode-test-transcript (list (opencode-test-prompt "msg_g03u" "Question 3"))))
+        (let ((live (opencode-test-look))
+              (fresh (opencode-test-fresh-look id)))
+          (should (equal (nth 2 live) (nth 2 fresh)))
+          (dotimes (index 2)
+            (should (equal (opencode-test-before "Question 3" (nth index live))
+                           (opencode-test-before "Question 3" (nth index fresh))))))))))
+
 (ert-deftest opencode-test-group-catch-up-as-reload ()
   "Catching up after a reconnection groups as a buffer opened afresh does."
   (opencode-test-with-transcript (opencode-test-group-turn 1)

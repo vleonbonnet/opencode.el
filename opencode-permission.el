@@ -25,9 +25,9 @@
 ;; A permission request names the tool call that asked, so it marks that
 ;; call's block in the attention face, with a readable action.  Expanding
 ;; it shows the operation, its context and the asking rules.  A call a
-;; code mode program makes asks from the program's block, which then
-;; shows that call, as its tool would show it called directly, then the
-;; program.
+;; code mode program makes asks from the program's block, whose child
+;; block for that call then waits, showing the call as its tool would
+;; show it called directly.
 ;; The transient holds just a one-line command or action and its controls.
 ;; A request whose block has not arrived yet prints a fallback line that
 ;; the block replaces.  The transient
@@ -249,43 +249,38 @@ left out.  COMMAND, when it is the only resource, is already shown."
 Their expansion names the directory and, for a remote service, the host;
 other tools, such as an MCP server's, run elsewhere.")
 
-(defun opencode--permission-display (permission tool input &optional program)
+(defun opencode--permission-display (permission tool input &optional nested)
   "Return the expanded operation and context of PERMISSION for TOOL with INPUT.
-PROGRAM, when non-nil, is the input of the code mode program making the
-call, shown after it."
+NESTED non-nil says a code mode program makes the call: its child block,
+whose line names it, shows this under it."
   (let* ((metadata (plist-get permission :metadata))
          (command (or (alist-get 'command metadata) (alist-get 'command input)))
          (directory (or (alist-get 'cwd metadata) (alist-get 'workdir input)
                         (opencode-location) default-directory))
          (reasons (opencode-permission-reasons-text (plist-get permission :reasons) command)))
-    (concat
-     (cond
-      ((and (equal tool "shell") command)
-       (concat (opencode-shell-command-display command)
-               (when-let* ((changes (opencode-shell-predicted-changes command)))
-                 (concat "\n\n" changes))))
-      (program
-       (or (opencode-call-tool-function opencode-tool-display-functions tool input)
-           (opencode-fontify-as
-            (concat tool (when-let* ((lines (opencode-execute-input-lines input (plist-get permission :resources))))
-                           (concat "\n" lines)))
-            'verbatim)))
-      (t (opencode-format-tool-call tool input)))
-     (opencode-fontify-as
-      (concat (when (member (plist-get permission :action) opencode--permission-host-actions)
-                (concat "\n\nDirectory  " (if (opencode-service-files-p)
-                                              (abbreviate-file-name (expand-file-name directory)) directory)
-                        (unless (opencode-service-files-p) (concat "\nHost       " (opencode-service-label)))))
-              (when (eq (alist-get 'background input) t) "\nExecution  Background")
-              (when-let* ((shell (alist-get 'shell metadata))) (concat "\nShell      " shell))
-              (when-let* ((timeout (or (alist-get 'timeout metadata) (alist-get 'timeout input)))
-                          ((numberp timeout)))
-                (format "\nTimeout    %s" (if (zerop timeout) "Unlimited" (format "%s ms" timeout))))
-              (or reasons (concat "\n\nApproval required\n  " (plist-get permission :action)))
-              (when-let* ((message (plist-get permission :message))) (concat "\n  " message)))
-      'verbatim)
-     (when program
-       (concat "\n\n" (opencode-fontify-as "Program" 'verbatim) "\n" (opencode-execute-program program))))))
+    (string-trim-left
+     (concat
+      (cond
+       ((and (equal tool "shell") command)
+        (concat (opencode-shell-command-display command)
+                (when-let* ((changes (opencode-shell-predicted-changes command)))
+                  (concat "\n\n" changes))))
+       (nested (opencode-execute-call-display tool input (plist-get permission :resources)))
+       (t (opencode-format-tool-call tool input)))
+      (opencode-fontify-as
+       (concat (when (member (plist-get permission :action) opencode--permission-host-actions)
+                 (concat "\n\nDirectory  " (if (opencode-service-files-p)
+                                               (abbreviate-file-name (expand-file-name directory)) directory)
+                         (unless (opencode-service-files-p) (concat "\nHost       " (opencode-service-label)))))
+               (when (eq (alist-get 'background input) t) "\nExecution  Background")
+               (when-let* ((shell (alist-get 'shell metadata))) (concat "\nShell      " shell))
+               (when-let* ((timeout (or (alist-get 'timeout metadata) (alist-get 'timeout input)))
+                           ((numberp timeout)))
+                 (format "\nTimeout    %s" (if (zerop timeout) "Unlimited" (format "%s ms" timeout))))
+               (or reasons (concat "\n\nApproval required\n  " (plist-get permission :action)))
+               (when-let* ((message (plist-get permission :message))) (concat "\n  " message)))
+       'verbatim))
+     "\n+")))
 
 ;;;; Queue
 
@@ -302,7 +297,8 @@ call, shown after it."
 (defun opencode--permission-mark-block (permission)
   "Mark PERMISSION's tool block as waiting; return the block.
 The expanded block holds the details; the transient stays compact.  A
-call made by a code mode program shows as itself, then the program."
+call made by a code mode program shows as its child block, under the
+program's, which names the call's tool (:waiting-action) and input."
   (when-let* ((overlay (opencode--permission-block permission)))
     (let* ((data (opencode-block-data overlay))
            (action (plist-get permission :action))
@@ -316,9 +312,9 @@ call made by a code mode program shows as itself, then the program."
       (plist-put permission :prompt (opencode--permission-prompt permission input))
       (opencode-block-update overlay :waiting t :waiting-kind 'permission
                              :waiting-summary (plist-get permission :title) :waiting-description nil
+                             :waiting-action (and nested action) :waiting-input (and nested input)
                              :permission-display (if nested
-                                                     (opencode--permission-display permission action input
-                                                                                   (plist-get data :input))
+                                                     (opencode--permission-display permission action input t)
                                                    (opencode--permission-display permission tool input))))
     (overlay-put overlay 'help-echo
                  (format "Permission pending: %s.  %s responds."
@@ -330,7 +326,8 @@ call made by a code mode program shows as itself, then the program."
   (when-let* ((overlay (opencode--permission-block permission)))
     (when (eq (plist-get (opencode-block-data overlay) :waiting-kind) 'permission)
       (opencode-block-update overlay :waiting nil :waiting-kind nil :waiting-description nil
-                             :waiting-summary nil :permission-display nil)
+                             :waiting-summary nil :waiting-action nil :waiting-input nil
+                             :permission-display nil)
       (overlay-put overlay 'help-echo nil))))
 
 (defun opencode--permission-fallback (permission)
