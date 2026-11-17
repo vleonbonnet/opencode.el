@@ -971,6 +971,86 @@ applies, else the model chosen last; one the catalog lacks is skipped."
                  (concat "edit notes.txt:\n"
                          (opencode-fenced-block "@@ -1,2 +1,2 @@\n a\n-b\n+c\n" "diff")))))
 
+(ert-deftest opencode-test-execute-describes-its-calls ()
+  "A code mode program is described by the calls it made, by its first line before the first."
+  (let* ((opencode-tool-summary-functions
+          `(("slack_post" . ,(lambda (input) (format "Post in %s" (alist-get 'channel input))))))
+         (input '((code . "const e = 1;\nreturn await tools.slack.post({channel: \"C1\"})")))
+         (post '((tool . "slack.post") (status . "completed") (input (channel . "C1"))))
+         (eval '((tool . "anvil-eval.emacs-eval-read") (status . "error") (input (expression . "(+ 1 2)")))))
+    (cl-flet ((summary (metadata &rest data)
+                (substring-no-properties
+                 (opencode-tool-collapsed-summary
+                  (append data (list :type 'tool :tool "execute" :input input
+                                     :status "completed" :metadata metadata))))))
+      (should (string-suffix-p " const e = 1;" (summary nil)))
+      (should (string-suffix-p " Post in C1" (summary `((toolCalls ,post)))))
+      (should (string-suffix-p " anvil-eval.emacs-eval-read (+ 1 2) · 1 call failed"
+                               (summary `((toolCalls ,eval)))))
+      (should (string-suffix-p " slack.post ×2 · anvil-eval.emacs-eval-read · 1 call failed"
+                               (summary `((toolCalls ,post ,eval ,post)))))
+      (should (string-suffix-p " …" (summary `((toolCalls ,post)) :status "streaming")))
+      ;; A program that throws ends its call as a success.
+      (should (string-search "\uf057 Post in C1" (summary `((toolCalls ,post) (error . t)))))
+      (should (eq (opencode-block-face `(:type tool :tool "execute" :status "completed"
+                                               :metadata ((toolCalls ,post) (error . t))))
+                  'error))
+      (should (string-suffix-p " Post in C1" (summary `((toolCalls ,post)) :error '((message . "boom"))))))
+    (should (opencode-block-calls-p `(:tool "execute" :metadata ((toolCalls ,post))) '("slack_post")))
+    (should (opencode-block-calls-p '(:tool "slack_post") '("slack_post")))
+    (should-not (opencode-block-calls-p `(:tool "execute" :metadata ((toolCalls ,eval))) '("slack_post")))
+    (should (equal (substring-no-properties
+                    (opencode-execute-input-lines
+                     '((ids "a" "b") (opts (deep . t)) (n . 3) (none) (body . "line 1\nline 2\n"))))
+                   (concat "ids: [\"a\",\"b\"]\nopts: {\"deep\":true}\nn: 3\nnone: null\n"
+                           "body:\n  line 1\n  line 2")))
+    (should-not (opencode-execute-input-lines nil '("*")))
+    (should (equal (opencode-execute-input-lines nil '("a" "b")) "resources: a, b"))))
+
+(ert-deftest opencode-test-execute-shows-its-calls ()
+  "An expanded code mode program shows each call it made as its tool shows it, then the program."
+  (opencode-test-with-server
+    (let* ((session (opencode-test-scenario "text"))
+           (buffer (opencode-test-open-empty session))
+           (base `((sessionID . ,session) (assistantMessageID . "msg_code") (id . "call_code")))
+           (code "return await tools.slack.post({channel: \"C1\", text: \"hi\"})")
+           (call-input '((channel . "C1") (text . "hi")))
+           (opencode-tool-summary-functions
+            `(("slack_post" . ,(lambda (input) (format "Post in %s — %s" (alist-get 'channel input)
+                                                       (alist-get 'text input))))))
+           (opencode-tool-display-functions
+            `(("slack_post" . ,(lambda (input)
+                                 (opencode-fontify-as (format "To  %s\nText  %s" (alist-get 'channel input)
+                                                              (alist-get 'text input))
+                                                      'verbatim))))))
+      (opencode-test-turn session "started")
+      (opencode-test-dispatch
+       `(((type . "session.tool.input.started") (data ,@base (name . "execute")))
+         ((type . "session.tool.called") (data ,@base (input (code . ,code))))))
+      (with-current-buffer buffer
+        (let ((block (opencode-block "call_code")))
+          (should (string-suffix-p code (opencode-test-summary-text block)))
+          (opencode-test-dispatch
+           `(((type . "session.tool.progress")
+              (data ,@base (metadata (toolCalls ((tool . "slack.post") (status . "running")
+                                                 (input ,@call-input))))))))
+          (should (string-suffix-p "Post in C1 — hi" (opencode-test-summary-text block)))
+          (opencode-test-dispatch
+           `(((type . "session.tool.success")
+              (data ,@base (content ((type . "text") (text . "ok")))
+                    (metadata (toolCalls ((tool . "slack.post") (status . "completed") (input ,@call-input))
+                                         ((tool . "fetch") (status . "error")
+                                          (input (method . "GET") (url . "https://example.com")))))))))
+          (should (string-suffix-p "slack.post · fetch · 1 call failed" (opencode-test-summary-text block)))
+          (should (eq (opencode-block-face (opencode-block-data block)) 'opencode-tool-margin-highlight))
+          (should (equal (substring-no-properties (opencode--expanded-content block))
+                         (concat (opencode-session-status-glyph 'done) " slack.post\nTo  C1\nText  hi\n\n"
+                                 (opencode-session-status-glyph 'failed) " fetch\nmethod: GET\nurl: https://example.com\n\n"
+                                 "```javascript\n" code "\n```\n```text\nok\n```")))
+          (opencode-block-update block :metadata '((toolCalls) (error . t)))
+          (should (eq (opencode-block-face (opencode-block-data block)) 'error))
+          (should (string-search "1 failed" (opencode-group-summary (list block)))))))))
+
 (ert-deftest opencode-test-fit-flush-fits-what-windows-show ()
   "Summaries written while redisplay is inhibited are fitted where windows show them.
 A transcript written whole changes thousands: those far from what a

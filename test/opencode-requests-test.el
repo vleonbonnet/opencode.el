@@ -146,6 +146,97 @@
          (opencode-refresh-tool-blocks "slack_post")
          (should (string-search "Post in #random" (overlay-get block 'opencode-summary))))))))
 
+(ert-deftest opencode-test-permission-code-mode-call ()
+  "A code mode program's call asks as itself, with its own input, and shows the program after it."
+  (opencode-test-with-server
+   (let* ((id (opencode-test-scenario "text"))
+          (buffer (opencode-test-open-empty id))
+          (target "#general")
+          (code "return await tools.slack.post({channel: \"C1\", text: \"hi\"})")
+          (call-input '((channel . "C1") (text . "hi")))
+          (opencode-tool-summary-functions
+           `(("slack_post" . ,(lambda (input) (format "Post in %s — %s" target (alist-get 'text input))))))
+          (opencode-tool-display-functions
+           `(("slack_post" . ,(lambda (input)
+                                (opencode-fontify-as (format "To  %s\nText  %s" target (alist-get 'text input))
+                                                     'verbatim)))))
+          (request `((id . "per_code") (sessionID . ,id) (action . "slack_post")
+                     (resources "*") (save "*")
+                     (source (type . "tool") (messageID . "msg_code") (id . "call_code"))
+                     (metadata (input ,@call-input))
+                     (reasons ((resource . "*") (rule (action . "slack_post") (resource . "*") (effect . "ask")))))))
+     (with-current-buffer buffer
+       ;; The request names the execute call, whose input is the program.
+       (opencode-tool-start "call_code" "execute" `((code . ,code)) "running")
+       (opencode-tool-update "call_code" :metadata `((toolCalls ((tool . "slack.post") (status . "running")
+                                                                 (input ,@call-input)))))
+       (opencode-permission-queue request)
+       (let* ((permission (car opencode-pending-permissions))
+              (block (opencode--permission-block permission))
+              (opencode--permission-transient-state (list :buffer buffer :permission permission)))
+         (should (equal (plist-get permission :title) "Post in #general — hi"))
+         (should (equal (plist-get permission :input) call-input))
+         (should (equal (opencode--permission-description) "Post in #general — hi"))
+         (should (string-search "Post in #general — hi" (overlay-get block 'opencode-summary)))
+         (let ((text (substring-no-properties (opencode--expanded-content block))))
+           (should (string-prefix-p "To  #general\nText  hi\n\nApproval required\n  slack_post rule \"*\"" text))
+           (should (string-suffix-p (concat "\n\nProgram\n```javascript\n" code "\n```") text))
+           (should-not (string-search "Directory" text)))
+         (setq target "#general thread")
+         (opencode-refresh-tool-blocks "slack_post")
+         (should (equal (plist-get permission :title) "Post in #general thread — hi"))
+         (should (string-prefix-p "To  #general thread" (opencode--expanded-content block)))
+         (opencode-permission-reply permission 'once)
+         (should-not (plist-get (opencode-block-data block) :permission-display))
+         (should (string-search "Post in #general thread — hi" (overlay-get block 'opencode-summary))))))))
+
+(ert-deftest opencode-test-permission-code-mode-call-input ()
+  "A code mode call is described by its listed input when the request carries none, else by what it asks."
+  (should (equal (opencode-permission-call-input
+                  "opencode_read_mcp_resource" '((server . "s") (uri . "u"))
+                  '(:tool "execute" :input ((code . "x"))
+                          :metadata ((toolCalls ((tool . "opencode.read_mcp_resource") (status . "completed")
+                                                 (input (server . "old")))
+                                                ((tool . "opencode.read_mcp_resource") (status . "running")
+                                                 (input (server . "s") (uri . "u")))))))
+                 '((server . "s") (uri . "u"))))
+  (should-not (opencode-permission-call-input "edit" nil '(:tool "execute" :input ((code . "x")))))
+  ;; A direct call's input is its block's; without a block, only an MCP tool's request has it.
+  (should (equal (opencode-permission-call-input "slack_post" '((input (text . "a"))) '(:tool "slack_post" :input ((text . "b"))))
+                 '((text . "b"))))
+  (should (equal (opencode-permission-call-input "slack_post" '((input (text . "a"))) nil) '((text . "a"))))
+  (should (equal (substring-no-properties
+                  (opencode--permission-display '(:action "opencode_read_mcp_resource" :resources ("s:u"))
+                                                "opencode_read_mcp_resource" '((server . "s") (uri . "u"))
+                                                '((code . "x"))))
+                 (concat "opencode_read_mcp_resource\nserver: s\nuri: u\n\nApproval required\n"
+                         "  opencode_read_mcp_resource\n\nProgram\n```javascript\nx\n```"))))
+
+(ert-deftest opencode-test-permission-replied-functions ()
+  "Packages hear of an answer once the service took it, never of one it refused."
+  (opencode-test-with-server
+   (let* ((id (opencode-test-scenario "permission"))
+          (buffer (opencode-test-open-empty id))
+          (heard nil)
+          (opencode-permission-replied-functions
+           (list (lambda (permission decision message)
+                   (push (list (plist-get permission :id) decision message (current-buffer)) heard))))
+          (status nil)
+          (opencode-test-routes
+           (cons (list 'post "/permission/[^/]+/reply\\'"
+                       (lambda (_) (if status (list :error status "refused") '((ok . t)))))
+                 opencode-test-routes)))
+     (opencode-test-dispatch-until (opencode-test-events id) "permission.asked")
+     (with-current-buffer buffer
+       (let ((permission (car opencode-pending-permissions)))
+         (setq status 500)
+         (opencode-permission-reply permission 'reject "Not that one.")
+         (should-not heard)
+         (should (equal opencode-pending-permissions (list permission)))
+         (setq status nil)
+         (opencode-permission-reply permission 'reject "Not that one.")
+         (should (equal heard (list (list (plist-get permission :id) 'reject "Not that one." buffer)))))))))
+
 (ert-deftest opencode-test-permission-reply-request ()
   "Answering sends the decision to the session's reply route."
   (opencode-test-with-server

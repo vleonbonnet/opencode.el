@@ -24,7 +24,10 @@
 
 ;; A permission request names the tool call that asked, so it marks that
 ;; call's block in the attention face, with a readable action.  Expanding
-;; it shows the operation, its context and the asking rules.
+;; it shows the operation, its context and the asking rules.  A call a
+;; code mode program makes asks from the program's block, which then
+;; shows that call, as its tool would show it called directly, then the
+;; program.
 ;; The transient holds just a one-line command or action and its controls.
 ;; A request whose block has not arrived yet prints a fallback line that
 ;; the block replaces.  The transient
@@ -51,7 +54,15 @@
 (defvar-local opencode-pending-permissions nil
   "Permission requests of this session awaiting an answer, oldest first.
 Each is a plist (:id :action :resources :save :metadata :source :reasons
-:title :prompt :marker).")
+:title :prompt :input :marker), :input being that of the asking call
+once known (see `opencode-permission-call-input').")
+
+(defvar opencode-permission-replied-functions nil
+  "Functions called once the service took an answer to a permission given here.
+Each receives the request, a plist of `opencode-pending-permissions',
+the decision, `once', `always' or `reject', and the message sent with
+it, or nil.  It runs in the session's buffer.  Answers given in other
+clients are not reported.")
 
 (defvar opencode--active-permission nil
   "Plist (:buffer :id) of the permission shown or suspended in the transient.")
@@ -78,11 +89,36 @@ A remote service's path is its host's, made relative as a string."
         (concat (string-trim-right (car lines)) " …")
       (car lines))))
 
-(defun opencode--permission-tool-input (source)
-  "Return the input of the tool call named by permission SOURCE, if rendered."
-  (when-let* ((id (alist-get 'id source))
-              (overlay (opencode-block id)))
-    (plist-get (opencode-block-data overlay) :input)))
+(defun opencode--permission-nested-p (action tool)
+  "Return non-nil when a request for ACTION from a call of TOOL is for another call.
+A code mode program asks, from its execute call, for each call it makes,
+under that call's tool name."
+  (and (equal tool "execute") (not (equal action "execute"))))
+
+(defun opencode--permission-program-input (data action)
+  "Return the input of the last running call of tool ACTION in the program of block DATA."
+  (alist-get 'input (seq-find (lambda (call)
+                                (and (equal (alist-get 'status call) "running")
+                                     (equal (opencode-execute-call-name (alist-get 'tool call)) action)))
+                              (reverse (opencode-execute-calls (plist-get data :metadata))))))
+
+(defun opencode-permission-call-input (action metadata data)
+  "Return the input of the call asking for ACTION with METADATA, nil when unknown.
+DATA is that of the asking block, nil when it is not shown.  A call made
+by a code mode program has its own input, not that of the program's
+block: an MCP tool sends it in METADATA, and the program's block lists
+it among its calls."
+  (if (and data (not (opencode--permission-nested-p action (plist-get data :tool))))
+      (plist-get data :input)
+    (or (alist-get 'input metadata)
+        (and data (opencode--permission-program-input data action)))))
+
+(defun opencode--permission-input (action metadata source)
+  "Return the input of the call named by SOURCE asking for ACTION with METADATA."
+  (opencode-permission-call-input action metadata
+                                  (when-let* ((id (alist-get 'id source))
+                                              (overlay (opencode-block id)))
+                                    (opencode-block-data overlay))))
 
 (defun opencode-permission-title (action resources metadata input)
   "Return the title of a permission request for ACTION on RESOURCES.
@@ -213,19 +249,28 @@ left out.  COMMAND, when it is the only resource, is already shown."
 Their expansion names the directory and, for a remote service, the host;
 other tools, such as an MCP server's, run elsewhere.")
 
-(defun opencode--permission-display (permission tool input)
-  "Return the expanded operation and context of PERMISSION for TOOL with INPUT."
+(defun opencode--permission-display (permission tool input &optional program)
+  "Return the expanded operation and context of PERMISSION for TOOL with INPUT.
+PROGRAM, when non-nil, is the input of the code mode program making the
+call, shown after it."
   (let* ((metadata (plist-get permission :metadata))
          (command (or (alist-get 'command metadata) (alist-get 'command input)))
          (directory (or (alist-get 'cwd metadata) (alist-get 'workdir input)
                         (opencode-location) default-directory))
          (reasons (opencode-permission-reasons-text (plist-get permission :reasons) command)))
     (concat
-     (if (and (equal tool "shell") command)
-         (concat (opencode-shell-command-display command)
-                 (when-let* ((changes (opencode-shell-predicted-changes command)))
-                   (concat "\n\n" changes)))
-       (opencode-format-tool-call tool input))
+     (cond
+      ((and (equal tool "shell") command)
+       (concat (opencode-shell-command-display command)
+               (when-let* ((changes (opencode-shell-predicted-changes command)))
+                 (concat "\n\n" changes))))
+      (program
+       (or (opencode-call-tool-function opencode-tool-display-functions tool input)
+           (opencode-fontify-as
+            (concat tool (when-let* ((lines (opencode-execute-input-lines input (plist-get permission :resources))))
+                           (concat "\n" lines)))
+            'verbatim)))
+      (t (opencode-format-tool-call tool input)))
      (opencode-fontify-as
       (concat (when (member (plist-get permission :action) opencode--permission-host-actions)
                 (concat "\n\nDirectory  " (if (opencode-service-files-p)
@@ -233,11 +278,14 @@ other tools, such as an MCP server's, run elsewhere.")
                         (unless (opencode-service-files-p) (concat "\nHost       " (opencode-service-label)))))
               (when (eq (alist-get 'background input) t) "\nExecution  Background")
               (when-let* ((shell (alist-get 'shell metadata))) (concat "\nShell      " shell))
-              (when-let* ((timeout (or (alist-get 'timeout metadata) (alist-get 'timeout input))))
+              (when-let* ((timeout (or (alist-get 'timeout metadata) (alist-get 'timeout input)))
+                          ((numberp timeout)))
                 (format "\nTimeout    %s" (if (zerop timeout) "Unlimited" (format "%s ms" timeout))))
               (or reasons (concat "\n\nApproval required\n  " (plist-get permission :action)))
               (when-let* ((message (plist-get permission :message))) (concat "\n  " message)))
-      'verbatim))))
+      'verbatim)
+     (when program
+       (concat "\n\n" (opencode-fontify-as "Program" 'verbatim) "\n" (opencode-execute-program program))))))
 
 ;;;; Queue
 
@@ -253,17 +301,25 @@ other tools, such as an MCP server's, run elsewhere.")
 
 (defun opencode--permission-mark-block (permission)
   "Mark PERMISSION's tool block as waiting; return the block.
-The expanded block holds the details; the transient stays compact."
+The expanded block holds the details; the transient stays compact.  A
+call made by a code mode program shows as itself, then the program."
   (when-let* ((overlay (opencode--permission-block permission)))
     (let* ((data (opencode-block-data overlay))
-           (input (plist-get data :input)))
+           (action (plist-get permission :action))
+           (tool (plist-get data :tool))
+           (nested (opencode--permission-nested-p action tool))
+           (input (opencode-permission-call-input action (plist-get permission :metadata) data)))
+      (plist-put permission :input input)
       (plist-put permission :title
-                 (opencode-permission-title (plist-get permission :action) (plist-get permission :resources)
+                 (opencode-permission-title action (plist-get permission :resources)
                                             (plist-get permission :metadata) input))
       (plist-put permission :prompt (opencode--permission-prompt permission input))
       (opencode-block-update overlay :waiting t :waiting-kind 'permission
                              :waiting-summary (plist-get permission :title) :waiting-description nil
-                             :permission-display (opencode--permission-display permission (plist-get data :tool) input)))
+                             :permission-display (if nested
+                                                     (opencode--permission-display permission action input
+                                                                                   (plist-get data :input))
+                                                   (opencode--permission-display permission tool input))))
     (overlay-put overlay 'help-echo
                  (format "Permission pending: %s.  %s responds."
                          (plist-get permission :title) (opencode-command-keys 'opencode-respond)))
@@ -320,11 +376,11 @@ The expanded block holds the details; the transient stays compact."
   "Queue permission REQUEST, an alist from the server, in this session buffer."
   (let-alist request
     (unless (opencode--permission-find .id)
-      (let* ((input (opencode--permission-tool-input .source))
+      (let* ((input (opencode--permission-input .action .metadata .source))
              (permission (list :id .id :action .action :resources .resources :save .save
                                :metadata .metadata :source .source :reasons .reasons :message .message
                                :title (opencode-permission-title .action .resources .metadata input)
-                               :prompt nil)))
+                               :prompt nil :input input)))
         (plist-put permission :prompt (opencode--permission-prompt permission input))
         (setq opencode-pending-permissions (append opencode-pending-permissions (list permission)))
         (unless (opencode--permission-mark-block permission)
@@ -345,11 +401,6 @@ The expanded block holds the details; the transient stays compact."
                                         (equal (alist-get 'id (plist-get permission :source)) id))
                                       opencode-pending-permissions)))
       (opencode--permission-remove-fallback permission)
-      (plist-put permission :title
-                 (opencode-permission-title (plist-get permission :action)
-                                            (plist-get permission :resources)
-                                            (plist-get permission :metadata)
-                                            (plist-get (opencode-block-data overlay) :input)))
       (opencode--permission-mark-block permission))))
 
 (defvar opencode--permission-transient-state)
@@ -359,8 +410,10 @@ The expanded block holds the details; the transient stays compact."
 For a package whose descriptions of these calls, through
 `opencode-tool-summary-functions' and `opencode-tool-display-functions',
 changed since they were drawn, such as once data it looked up arrived.
-A pending permission of such a call gets its title, prompt and
-expansion anew, and an open permission menu its heading."
+A code mode program's block counts when the program calls one of TOOLS,
+or one of them asks a permission it waits on.  A pending permission of
+such a call gets its title, prompt and expansion anew, and an open
+permission menu its heading."
   (let (menu)
     (dolist (service (opencode-services))
       (opencode-with-service service
@@ -368,14 +421,16 @@ expansion anew, and an open permission menu its heading."
           (when (buffer-live-p buffer)
             (with-current-buffer buffer
               (dolist (overlay (opencode-tool-blocks))
-                (when (member (plist-get (opencode-block-data overlay) :tool) tools)
-                  (if-let* ((permission (seq-find (lambda (permission)
-                                                    (eq (opencode--permission-block permission) overlay))
-                                                  opencode-pending-permissions)))
-                      (progn (opencode--permission-mark-block permission)
-                             (when (eq permission (plist-get opencode--permission-transient-state :permission))
-                               (setq menu t)))
-                    (opencode-refresh-block overlay)))))))))
+                (let ((permission (seq-find (lambda (permission)
+                                              (eq (opencode--permission-block permission) overlay))
+                                            opencode-pending-permissions)))
+                  (when (or (opencode-block-calls-p (opencode-block-data overlay) tools)
+                            (and permission (member (plist-get permission :action) tools)))
+                    (if permission
+                        (progn (opencode--permission-mark-block permission)
+                               (when (eq permission (plist-get opencode--permission-transient-state :permission))
+                                 (setq menu t)))
+                      (opencode-refresh-block overlay))))))))))
     (when (and menu (bound-and-true-p transient--prefix)
                (eq (oref transient--prefix command) 'opencode-permission-transient)
                (fboundp 'transient--redisplay))
@@ -395,6 +450,14 @@ expansion anew, and an open permission menu its heading."
 
 ;;;; Replying
 
+(defun opencode--permission-replied-run (buffer permission decision message)
+  "Run `opencode-permission-replied-functions' in BUFFER for PERMISSION.
+DECISION and MESSAGE are the answer the service took."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (with-demoted-errors "OpenCode permission reply hook failed: %S"
+        (run-hook-with-args 'opencode-permission-replied-functions permission decision message)))))
+
 (defun opencode-permission-reply (permission decision &optional message)
   "Answer PERMISSION with DECISION, `once', `always' or `reject', and MESSAGE."
   (let ((buffer (current-buffer)))
@@ -409,6 +472,7 @@ expansion anew, and an open permission menu its heading."
     (opencode-request
      'post (format "/api/session/%s/permission/%s/reply" opencode-session-id (plist-get permission :id))
      :body `((decision . ,(symbol-name decision)) ,@(when message `((message . ,message))))
+     :then (lambda (_) (opencode--permission-replied-run buffer permission decision message))
      :else (lambda (error)
              (unless (eql (opencode-error-status error) 404)
                (with-current-buffer buffer
@@ -454,7 +518,8 @@ expansion anew, and an open permission menu its heading."
                 :then (lambda (_)
                         (opencode-request
                          'post (format "/api/session/%s/permission/%s/reply" session (plist-get permission :id))
-                         :body '((decision . "once")))
+                         :body '((decision . "once"))
+                         :then (lambda (_) (opencode--permission-replied-run buffer permission 'once nil)))
                         (message "Handed off to %s; the current tool continues" agent))))))))
 
 ;;;; Transient

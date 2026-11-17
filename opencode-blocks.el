@@ -36,6 +36,8 @@
 ;;   by status: blue while running, orange while waiting on the user,
 ;;   the error face on failure.  Formatting a diff or a patch waits for
 ;;   expansion.
+;; - A code mode program's block describes the tool calls the program
+;;   makes, which its metadata lists, rather than its JavaScript.
 ;;
 ;; The arrow is an overlay `before-string', never buffer text: text on an
 ;; overlay boundary drifts out from under it when edited.  Summaries are
@@ -337,14 +339,15 @@ See `opencode-session-status-icons'."
       ('interrupted "Interrupted")
       (_ (format "Failed: %s" message)))))
 
-(defun opencode-tool-error-summary (tool input error &optional note)
-  "Return TOOL's summary for INPUT with a status icon for ERROR, then NOTE."
+(defun opencode-tool-error-summary (tool input error &optional note description)
+  "Return TOOL's summary for INPUT with a status icon for ERROR, then NOTE.
+DESCRIPTION, when non-nil, replaces the description of INPUT."
   (let ((icon (propertize (if (memq (car (opencode-tool-error-info error))
                                     '(blocked rejected dismissed))
                               "\uf05e"          ; nf-fa-ban
                             "\uf057")           ; nf-fa-times_circle
                           'face 'error 'font-lock-face 'error)))
-    (opencode-tool-summary tool input 'error icon nil note)))
+    (opencode-tool-summary tool input 'error icon description note)))
 
 (defun opencode-tool-background-outcome (data)
   "Return how the background job of block DATA ended, or nil while running.
@@ -373,6 +376,160 @@ launch and completion blocks say how it ended.  Other blocks get nil."
          (equal (plist-get data :status) "completed")
          (equal (alist-get 'status (plist-get data :metadata)) "running")
          "in the background")))
+
+;;;; Code mode programs
+
+;; In code mode, the model calls one tool, execute, whose input is a
+;; JavaScript program, and the program calls the other tools.  The
+;; call's metadata lists those calls in `toolCalls' as they start and
+;; end, each with its path in the program, such as slack.send_message,
+;; its status and its input.  Its block describes them, through the
+;; functions of `opencode-tool-summary-functions' and
+;; `opencode-tool-display-functions' for their tools, as it would
+;; describe them called directly; the program comes after them.  A
+;; permission one of them asks names it as the service does,
+;; slack_send_message, and comes from the execute call.
+
+(defun opencode-execute-call-name (path)
+  "Return the tool name of PATH, a tool's path in a code mode program.
+Permissions and `opencode-tool-summary-functions' name it so: the
+service joins a tool's namespace and name with \"_\" where a program
+joins them with \".\"."
+  (string-replace "." "_" path))
+
+(defun opencode-execute-calls (metadata)
+  "Return the tool calls listed in METADATA of a code mode program, in start order.
+Each is an alist with the call's `tool' path, `status' and `input'."
+  (let ((calls (alist-get 'toolCalls metadata)))
+    (and (proper-list-p calls)
+         (seq-filter (lambda (call) (and (consp call) (stringp (alist-get 'tool call)))) calls))))
+
+(defun opencode-execute-failed-p (data)
+  "Return non-nil when tool block DATA is a code mode program that failed.
+A program that throws still ends its call as a success, its metadata
+saying it failed."
+  (and (equal (plist-get data :tool) "execute")
+       (eq (alist-get 'error (plist-get data :metadata)) t)))
+
+(defun opencode-execute-call-description (call)
+  "Return the one-line description of CALL, a tool call of a code mode program.
+The function of `opencode-tool-summary-functions' for its tool gives it,
+else its path followed by its input's generic description."
+  (let-alist call
+    (or (opencode-call-tool-function opencode-tool-summary-functions (opencode-execute-call-name .tool) .input)
+        (if .input (concat .tool " " (opencode--generic-tool-description .input)) .tool))))
+
+(defun opencode-execute-description (input metadata)
+  "Return the description of the code mode program INPUT whose call has METADATA.
+A program that made one call is described as that call, one that made
+several by their tools, each with how many times it was called.  Before
+its first call, it is described by its first line."
+  (let ((calls (opencode-execute-calls metadata)))
+    (cond
+     ((null calls) (opencode-tool-description "execute" input))
+     ((null (cdr calls)) (opencode-execute-call-description (car calls)))
+     (t (let (counts)
+          (dolist (call calls)
+            (let ((entry (assoc (alist-get 'tool call) counts)))
+              (if entry
+                  (cl-incf (cdr entry))
+                (push (cons (alist-get 'tool call) 1) counts))))
+          (mapconcat (lambda (entry)
+                       (if (> (cdr entry) 1) (format "%s ×%d" (car entry) (cdr entry)) (car entry)))
+                     (nreverse counts) " · "))))))
+
+(defun opencode--execute-summary (data)
+  "Return the description of tool block DATA when it runs a code mode program, else nil.
+A failing description gives nil, so the block keeps the default one."
+  (when (equal (plist-get data :tool) "execute")
+    (condition-case err
+        (opencode-execute-description (plist-get data :input) (plist-get data :metadata))
+      (error
+       (message "OpenCode execute summary failed: %s"
+                (truncate-string-to-width (error-message-string err) 200 nil nil "…"))
+       nil))))
+
+(defun opencode-execute-failures-note (metadata)
+  "Return the note counting the failed calls listed in code mode METADATA, or nil."
+  (let ((failed (seq-count (lambda (call) (equal (alist-get 'status call) "error"))
+                           (opencode-execute-calls metadata))))
+    (when (> failed 0)
+      (opencode-face-string (format "%d %s failed" failed (if (= failed 1) "call" "calls")) 'error))))
+
+(defun opencode-execute-status-icon (status)
+  "Return the icon of a code mode program's tool call whose status is STATUS."
+  (opencode-session-status-glyph (pcase status ("completed" 'done) ("error" 'failed) (_ 'working))))
+
+(defun opencode--json-value (value)
+  "Return VALUE, read from the service's JSON, ready for `json-serialize'.
+The service's arrays are read as lists, its null and false as nil."
+  (cond ((null value) :null)
+        ((and (consp value) (consp (car value)) (symbolp (caar value)))
+         (mapcar (lambda (pair) (cons (car pair) (opencode--json-value (cdr pair)))) value))
+        ((consp value) (vconcat (mapcar #'opencode--json-value value)))
+        (t value)))
+
+(defun opencode--input-value-text (value)
+  "Return VALUE, an argument of a tool call, as text: a string as it is, else JSON."
+  (if (stringp value)
+      value
+    (condition-case nil
+        (decode-coding-string (json-serialize (opencode--json-value value)) 'utf-8)
+      (error (format "%S" value)))))
+
+(defun opencode-execute-input-lines (input &optional resources)
+  "Return INPUT, the arguments of a tool call, as verbatim lines.
+Each argument is a line of its name and value, a multi-line value going
+indented under its name.  Without arguments, RESOURCES other than \"*\"
+are listed.  Nil when there is nothing to show."
+  (let ((lines (if input
+                   (mapcar (lambda (pair)
+                             (let ((value (opencode--input-value-text (cdr-safe pair))))
+                               (if (string-search "\n" value)
+                                   (concat (format "%s:\n" (car-safe pair))
+                                           (mapconcat (lambda (line) (concat "  " line))
+                                                      (split-string (string-trim-right value) "\n") "\n"))
+                                 (format "%s: %s" (car-safe pair) value))))
+                           input)
+                 (when-let* ((shown (remove "*" resources)))
+                   (list (concat "resources: " (string-join shown ", ")))))))
+    (when lines
+      (opencode-fontify-as (string-join lines "\n") 'verbatim))))
+
+(defun opencode-execute-call-display (name input &optional resources)
+  "Return the full display of a code mode program's call of tool NAME with INPUT.
+The function of `opencode-tool-display-functions' for NAME gives it,
+else the arguments, one per line, or RESOURCES without arguments; nil
+when there is nothing to show."
+  (or (opencode-call-tool-function opencode-tool-display-functions name input)
+      (opencode-execute-input-lines input resources)))
+
+(defun opencode-execute-program (input)
+  "Return the program of code mode INPUT as a JavaScript code block."
+  (opencode-fenced-block (or (alist-get 'code input) (format "%S" input)) "javascript"))
+
+(defun opencode-execute-display (input metadata)
+  "Return the full display of the code mode program INPUT whose call has METADATA.
+Each tool call the program made comes first, under its status and path,
+then the program."
+  (string-join
+   (append (mapcar (lambda (call)
+                     (let-alist call
+                       (concat (opencode-fontify-as (concat (opencode-execute-status-icon .status) " " .tool)
+                                                    'verbatim)
+                               (when-let* ((display (opencode-execute-call-display
+                                                     (opencode-execute-call-name .tool) .input)))
+                                 (concat "\n" display)))))
+                   (opencode-execute-calls metadata))
+           (list (opencode-execute-program input)))
+   "\n\n"))
+
+(defun opencode-block-calls-p (data tools)
+  "Return non-nil when tool block DATA calls one of TOOLS, itself or from its program."
+  (or (member (plist-get data :tool) tools)
+      (and (equal (plist-get data :tool) "execute")
+           (seq-some (lambda (call) (member (opencode-execute-call-name (alist-get 'tool call)) tools))
+                     (opencode-execute-calls (plist-get data :metadata))))))
 
 ;;;; Reasoning summaries
 
@@ -533,7 +690,8 @@ in another color."
 (defun opencode-block-face (data)
   "Return the display face of block DATA."
   (cond
-   ((or (plist-get data :error) (cdr (opencode-tool-background-outcome data))) 'error)
+   ((or (plist-get data :error) (opencode-execute-failed-p data)
+        (cdr (opencode-tool-background-outcome data))) 'error)
    ((plist-get data :waiting) 'opencode-attention)
    ((or (equal (plist-get data :job-state) "running")
         (member (plist-get data :status) '("streaming" "running"))) 'opencode-tool-running-margin)
@@ -552,17 +710,24 @@ in another color."
                              (plist-get data :waiting-summary)
                              (plist-get data :waiting-description)))
      ((plist-get data :error)
-      (opencode-tool-error-summary tool input (plist-get data :error) (opencode-tool-background-note data)))
+      (opencode-tool-error-summary tool input (plist-get data :error) (opencode-tool-background-note data)
+                                   (opencode--execute-summary data)))
      ((and (equal tool "question") (plist-get data :answers))
       (opencode-tool-summary tool input face nil
                              (opencode-question-answer-description input (plist-get data :answers))))
      ((equal (plist-get data :status) "streaming")
       (opencode-tool-summary tool input face nil "…"))
-     (t (opencode-tool-summary tool input face nil nil
+     (t (opencode-tool-summary tool input face
+                               (when (opencode-execute-failed-p data)
+                                 (opencode-face-string "\uf057" 'error)) ; nf-fa-times_circle
+                               (opencode--execute-summary data)
                                (let ((notes (delq nil (list (opencode-tool-background-note data)
                                                             (and (member tool '("shell" "write"))
                                                                  (opencode-changes-note (plist-get data :metadata)
-                                                                                        (equal tool "write")))))))
+                                                                                        (equal tool "write")))
+                                                            (and (equal tool "execute")
+                                                                 (opencode-execute-failures-note
+                                                                  (plist-get data :metadata)))))))
                                  (and notes (string-join notes " · "))))))))
 
 (defun opencode-block-summary (overlay)
@@ -628,8 +793,8 @@ METADATA is what the finished call reported, nil before."
 (defun opencode--default-tool-call (tool input &optional metadata)
   "Return the built-in full display of TOOL called with INPUT.
 METADATA is what the call reported: a shell command shows the file
-changes reported once it ran, or those predicted before, and a write
-the diff it reports."
+changes reported once it ran, or those predicted before, a write the
+diff it reports, and a code mode program the tool calls it made."
   (let-alist input
     (pcase tool
       ("edit" (concat "edit " (opencode-relative-path-for-display (or .path "")) ":\n"
@@ -665,7 +830,7 @@ the diff it reports."
                                   (when .include (format " (%s)" .include))))
       ("websearch" (format "websearch %S" .query))
       ("webfetch" (format "webfetch %s" .url))
-      ("execute" (opencode-fenced-block (or .code (format "%S" input)) "javascript"))
+      ("execute" (opencode-execute-display input metadata))
       (_ (if (= 1 (length input))
              (let ((value (format "%s" (cdar input))))
                (format "%s%s%s" tool (if (string-search "\n" value) "\n" " ") value))
@@ -1112,7 +1277,8 @@ order they first appear, and of the failed ones, in the error face."
           (if entry
               (cl-incf (cdr entry))
             (push (cons kind 1) counts))
-          (when (or (plist-get data :error) (cdr (opencode-tool-background-outcome data)))
+          (when (or (plist-get data :error) (opencode-execute-failed-p data)
+                    (cdr (opencode-tool-background-outcome data)))
             (cl-incf failed)))))
     (concat (opencode-boxed-label opencode-group-icon (format "%d blocks" total)
                                   'opencode-tool-margin-highlight)
