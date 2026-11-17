@@ -121,17 +121,22 @@ The fake service answers preflights with `opencode-test-reports'."
       (should (string-match-p "up to ~150k context tokens could be re-sent" (car opencode-test-questions))))))
 
 (ert-deftest opencode-test-cache-stale-thinking-consent ()
-  "Stale thinking asks for consent, which travels on that prompt only."
+  "Stale thinking asks for consent, wording text replay vs omission per report."
   (let ((opencode-test-reports
          '(((status . "partial") (lostTokens . 142000)
-            (staleThinking (count . 12) (reason . "the system prompt changed")))
+            (staleThinking (count . 12) (reason . "the system prompt changed") (asText . t)))
+           ((status . "partial") (lostTokens . 50000)
+            (staleThinking (count . 3) (reason . "the tool list changed") (asText)))
            ((status . "hit")))))
     (opencode-test-with-guard t
       (opencode-test-type-and-send "go on")
       (should (string-match-p "12 thinking blocks from earlier turns no longer match the conversation"
                               (car opencode-test-questions)))
       (should (string-match-p "also re-sends ~142k cached tokens" (car opencode-test-questions)))
+      (should (string-suffix-p "Replace them with their text and send? " (car opencode-test-questions)))
       (should (equal (alist-get 'metadata (opencode-test-sent-body "/prompt")) '((thinkingLoss . "accept"))))
+      (opencode-test-type-and-send "claude turn")
+      (should (string-suffix-p "Drop them and send? " (car opencode-test-questions)))
       ;; Later prompts ask the server to refuse stale thinking again.
       (opencode-test-type-and-send "next")
       (should (equal (alist-get 'metadata (opencode-test-sent-body "/prompt")) '((thinkingLoss . "ask")))))))

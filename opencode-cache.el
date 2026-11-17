@@ -45,7 +45,8 @@
 ;; and command `thinkingLoss: "ask"', so the server refuses such a turn
 ;; instead, and when the report counts stale thinking Emacs asks whether
 ;; to send with `thinkingLoss: "accept"', replacing those blocks with
-;; their text, tagged as earlier reasoning.  Blocks without a binding,
+;; their text (or dropping them on Claude, where Anthropic blocks
+;; replayed reasoning text).  Blocks without a binding,
 ;; from before the server's ledger, are sent as they are.  Blocks
 ;; replaced or dropped are relabelled in the transcript, with one notice
 ;; per batch.
@@ -186,6 +187,7 @@ it can; else LOSS, the turn as it stands, is the closest estimate."
   "Return the question for REPORT's stale thinking, mentioning a LOSS of cache."
   (let-alist report
     (let ((count .staleThinking.count)
+          (as-text (alist-get 'asText .staleThinking t))
           (loss (opencode-cache-consent-loss report loss)))
       (concat
        (format "OpenCode: %d thinking block%s from earlier turns no longer match%s the conversation:\n"
@@ -196,7 +198,9 @@ it can; else LOSS, the turn as it stands, is the closest estimate."
              (format "The turn could also re-send up to ~%s context tokens%s uncached.\n"
                      (opencode-cache--tokens loss) (opencode-cache--estimate-note report loss))
            (format "The turn also re-sends ~%s cached tokens uncached.\n" (opencode-cache--tokens loss))))
-       "Replace them with their text and send? "))))
+       (if as-text
+           "Replace them with their text and send? "
+         (format "Drop %s and send? " (if (= count 1) "it" "them")))))))
 
 (defun opencode-cache-stale-thinking-p (report)
   "Return non-nil when REPORT counts thinking the turn would be refused for."
