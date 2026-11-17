@@ -998,6 +998,32 @@ in `opencode-test-answered' instead."
                                (opencode-test-sends))
                        '((prompt "queue") (shell "ls") (prompt "steer") (prompt "queue"))))))))
 
+(ert-deftest opencode-test-queued-behind-request-hands-nothing-back ()
+  "Input queued while a request waits hands no turn back; with none waiting, it does.
+The session still waits on the user: queueing it, unasked, waits on the
+request as the queue choice of the question does."
+  (opencode-test-with-server
+   (with-current-buffer (opencode-test-open-waiting "question" "form.created")
+     (let* ((handed nil)
+            (opencode-handed-back-functions (list (lambda (kind) (push kind handed)))))
+       (opencode-test-choosing nil
+         (opencode-test-type "after this turn")
+         (opencode-queue-input)
+         (let ((opencode-prompt-delivery 'queue))
+           (opencode-test-type "queued by default")
+           (opencode-send-input)))
+       (should (equal (mapcar (lambda (send) (alist-get 'text (cdr send))) (opencode-test-sends))
+                      '("after this turn" "queued by default")))
+       (should-not handed))))
+  (opencode-test-with-server
+   (with-current-buffer (opencode-test-open-empty (opencode-test-scenario "text"))
+     (let* ((handed nil)
+            (opencode-handed-back-functions (list (lambda (kind) (push kind handed)))))
+       (opencode-test-choosing nil
+         (opencode-test-type "after this turn")
+         (opencode-queue-input))
+       (should (equal handed '(prompt)))))))
+
 (ert-deftest opencode-test-send-without-request-unasked ()
   "With nothing waiting, sending never asks."
   (opencode-test-with-server

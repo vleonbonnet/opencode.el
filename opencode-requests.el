@@ -480,29 +480,32 @@ sends it; queueing sends it to wait, setting `opencode-send-waits';
 answering opens the request and keeps the input, as cancelling does;
 discarding deletes the input.  Queued input
 \(`opencode-queue-input', or `opencode-prompt-delivery' set to `queue')
-waits for the end of the turn anyway, and shell commands run at once,
-so neither asks.  Sends that run no check, such as scheduled ones
-through `opencode-session-send', wait the same way."
+waits for the end of the turn anyway, so it does not ask, but it too
+waits on the requests, which sets `opencode-send-waits'; shell commands
+run at once, and neither ask nor wait.  Sends that run no check, such
+as scheduled ones through `opencode-session-send', wait the same way."
   (when-let* (((memq (plist-get request :kind) '(prompt command)))
-              ((not (eq opencode-prompt-delivery 'queue)))
               (requests (opencode-awaited-requests)))
-    (pcase (car (read-multiple-choice
-                 (opencode--describe-awaited requests)
-                 '((?s "send" "Dismiss the requests and send now; the agents asking go on, told why")
-                   (?q "queue" "Send now; this session reads it once the requests are settled")
-                   (?a "answer" "Answer it now; the input stays at the prompt")
-                   (?c "cancel" "Keep the input at the prompt")
-                   (?d "discard" "Delete the input; it goes to the kill ring"))))
-      (?s (push (lambda () (opencode-dismiss-awaited requests)) opencode-send-commit-functions)
-          nil)
-      (?q (setq opencode-send-waits t)
-          nil)
-      (?a (opencode--answer-awaited requests)
-          ;; The request it opens says enough.
-          (setq opencode--send-cancel-quietly t)
-          'cancel)
-      (?d 'discard)
-      (_ 'cancel))))
+    (if (eq opencode-prompt-delivery 'queue)
+        (progn (setq opencode-send-waits t)
+               nil)
+      (pcase (car (read-multiple-choice
+                   (opencode--describe-awaited requests)
+                   '((?s "send" "Dismiss the requests and send now; the agents asking go on, told why")
+                     (?q "queue" "Send now; this session reads it once the requests are settled")
+                     (?a "answer" "Answer it now; the input stays at the prompt")
+                     (?c "cancel" "Keep the input at the prompt")
+                     (?d "discard" "Delete the input; it goes to the kill ring"))))
+        (?s (push (lambda () (opencode-dismiss-awaited requests)) opencode-send-commit-functions)
+            nil)
+        (?q (setq opencode-send-waits t)
+            nil)
+        (?a (opencode--answer-awaited requests)
+            ;; The request it opens says enough.
+            (setq opencode--send-cancel-quietly t)
+            'cancel)
+        (?d 'discard)
+        (_ 'cancel)))))
 
 ;; First, so that no other check asks before this one.
 (add-hook 'opencode-send-checks #'opencode-check-pending-requests -50)
