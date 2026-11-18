@@ -413,7 +413,7 @@ shows; `rest' is bound to the events left."
         (should (opencode-test-recap-waiting-p))
         (should (equal (opencode-test-recap) "※ Cleaning up: removing junk.txt needs approval.\n\n"))
         ;; After the call asking, a blank line before it, read-only, the input empty after it.
-        (should (string-match-p "Run rm junk.txt.*\n\n※ Cleaning up"
+        (should (string-match-p "rule \"rm \\*\": rm junk.txt.*\n\n※ Cleaning up"
                                 (buffer-substring-no-properties (point-min) (opencode-pmark))))
         (should (get-text-property (opencode-test-find "Cleaning up") 'read-only))
         (should (eq (get-text-property (opencode-test-find "Cleaning up") 'font-lock-face)

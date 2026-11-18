@@ -12,7 +12,7 @@
 (require 'opencode-test-helpers)
 
 (ert-deftest opencode-test-permission-marks-its-tool ()
-  "A permission marks its tool with an action; expansion holds the asking rule."
+  "A permission marks its tool with why it asks; its expansion starts with the asking rule."
   (opencode-test-with-server
     (let* ((id (opencode-test-scenario "permission"))
            (buffer (opencode-test-open-empty id))
@@ -24,11 +24,12 @@
           (should (equal (plist-get permission :title) "Run rm junk.txt"))
           (should overlay)
           (should (eq (plist-get (opencode-block-data overlay) :waiting-kind) 'permission))
-          (should (string-match-p "Run rm junk.txt"
-                                  (buffer-substring (overlay-start overlay) (overlay-end overlay))))
-          (should-not (string-search "rule" (overlay-get overlay 'opencode-summary)))
+          (should (equal (plist-get permission :why) "rule \"rm *\": rm junk.txt"))
+          (should (string-search "rule \"rm *\": rm junk.txt"
+                                 (buffer-substring (overlay-start overlay) (overlay-end overlay))))
           (opencode-expand-block overlay)
-          (should (string-search "Approval required\n  shell rule \"rm *\"" (opencode-test-text buffer)))
+          (should (string-prefix-p "Approval required\n  shell rule \"rm *\"\n\n$ rm junk.txt"
+                                   (substring-no-properties (opencode--expanded-content overlay))))
           (should (opencode-pending-request-p))
           ;; Answered in another client.
           (opencode-test-dispatch-until rest "permission.replied")
@@ -44,7 +45,7 @@
                                    :waiting-summary "Run rm junk.txt")))))
 
 (ert-deftest opencode-test-permission-details ()
-  "The command comes from the service; the expansion has context and the form only its command."
+  "The command comes from the service; the expansion has why and context, the form the command and why."
   (opencode-test-with-server
     (let* ((id (opencode-test-scenario "text"))
            (buffer (opencode-test-open-empty id))
@@ -61,15 +62,15 @@
                (block (opencode--permission-block permission))
                (opencode--permission-transient-state (list :buffer buffer :permission permission)))
           (should (equal (plist-get permission :title) (concat "Run " command)))
-          (should (equal (opencode--permission-description) command))
+          (should (equal (substring-no-properties (opencode--permission-description))
+                         (concat command "\nWhy: rule \"rm *\": " command)))
           (opencode-expand-block block)
-          (let ((text (opencode--expanded-content block)))
-            (should (string-prefix-p (concat "$ " command) text))
+          (let ((text (substring-no-properties (opencode--expanded-content block))))
+            (should (string-prefix-p (concat "Approval required\n  shell rule \"rm *\"\n\n$ " command) text))
             (should (string-search "Directory  " text))
             (should (string-search "Execution  Background" text))
             (should (string-search "Shell      bash" text))
-            (should (string-search "Timeout    Unlimited" text))
-            (should (string-suffix-p "Approval required\n  shell rule \"rm *\"" text))
+            (should (string-suffix-p "Timeout    Unlimited" text))
             (should (= 2 (length (split-string text (regexp-quote command))))))
           (opencode-permission-reply permission 'once)
           (should-not (plist-get (opencode-block-data block) :waiting-summary))
@@ -127,20 +128,22 @@
               (block (opencode--permission-block permission))
               (opencode--permission-transient-state (list :buffer buffer :permission permission)))
          (should (equal (plist-get permission :title) "Post in #general — hi $5"))
-         (should (equal (opencode--permission-description) "Post in #general — hi $5"))
-         (should (string-search "Post in #general" (overlay-get block 'opencode-summary)))
-         (let ((text (opencode--expanded-content block)))
-           (should (string-prefix-p "To  #general\nText  hi $5" text))
+         (should (equal (opencode-test-heading-line (opencode--permission-description)) "Post in #general — hi $5"))
+         ;; A rule's "*" resource stands for the title.
+         (should (equal (plist-get permission :why) "rule \"*\": Post in #general — hi $5"))
+         (should (string-search "rule \"*\": Post in #general" (overlay-get block 'opencode-summary)))
+         (let ((text (substring-no-properties (opencode--expanded-content block))))
+           (should (string-prefix-p "Approval required\n  slack_post rule \"*\"\n\nTo  #general\nText  hi $5" text))
            (should-not (string-search "Directory" text))
-           (should-not (string-search "Host" text))
-           (should (string-search "Approval required\n  slack_post rule \"*\"" text)))
+           (should-not (string-search "Host" text)))
          ;; The data the descriptions read arrives later.
          (setq target "#general thread")
          (opencode-refresh-tool-blocks "slack_post")
          (should (equal (plist-get permission :title) "Post in #general thread — hi $5"))
-         (should (equal (opencode--permission-description) "Post in #general thread — hi $5"))
+         (should (equal (substring-no-properties (opencode--permission-description))
+                        "Post in #general thread — hi $5\nWhy: rule \"*\": Post in #general thread — hi $5"))
          (should (string-search "Post in #general thread" (overlay-get block 'opencode-summary)))
-         (should (string-prefix-p "To  #general thread" (opencode--expanded-content block)))
+         (should (string-search "\n\nTo  #general thread" (opencode--expanded-content block)))
          (opencode-permission-reply permission 'once)
          (setq target "#random")
          (opencode-refresh-tool-blocks "slack_post")
@@ -177,22 +180,22 @@
          (cl-flet ((call () (car (overlay-get block 'opencode-children))))
            (should (equal (plist-get permission :title) "Post in #general — hi"))
            (should (equal (plist-get permission :input) call-input))
-           (should (equal (opencode--permission-description) "Post in #general — hi"))
+           (should (equal (opencode-test-heading-line (opencode--permission-description)) "Post in #general — hi"))
            (should (string-search "Post in #general — hi" (overlay-get block 'opencode-summary)))
            ;; The call's child waits, and shows the request under it.
            (should (eq (opencode-block-face (opencode-block-data (call))) 'opencode-attention))
            (should (string-suffix-p (concat (substring-no-properties (opencode-pending-prompt-icon))
-                                            " Post in #general — hi")
+                                            " rule \"*\": Post in #general — hi")
                                     (opencode-test-summary-text (call))))
            (let ((text (substring-no-properties (opencode--expanded-content (call)))))
-             (should (string-prefix-p "To  #general\nText  hi\n\nApproval required\n  slack_post rule \"*\"" text))
+             (should (string-prefix-p "Approval required\n  slack_post rule \"*\"\n\nTo  #general\nText  hi" text))
              (should-not (string-search "Directory" text)))
            (goto-char (overlay-start (call)))
            (should (eq (opencode--permission-at-point) permission))
            (setq target "#general thread")
            (opencode-refresh-tool-blocks "slack_post")
            (should (equal (plist-get permission :title) "Post in #general thread — hi"))
-           (should (string-prefix-p "To  #general thread" (opencode--expanded-content (call))))
+           (should (string-search "\n\nTo  #general thread" (opencode--expanded-content (call))))
            (opencode-permission-reply permission 'once)
            (should-not (plist-get (opencode-block-data block) :permission-display))
            (should-not (plist-get (opencode-block-data (call)) :waiting))
@@ -224,7 +227,7 @@
   (should (equal (substring-no-properties
                   (opencode--permission-display '(:action "opencode_read_mcp_resource" :resources ("s:u"))
                                                 "opencode_read_mcp_resource" '((server . "s") (uri . "u")) t))
-                 "server: s\nuri: u\n\nApproval required\n  opencode_read_mcp_resource"))
+                 "Approval required\n  opencode_read_mcp_resource\n\nserver: s\nuri: u"))
   (should (equal (substring-no-properties
                   (opencode--permission-display '(:action "opencode_list_mcp_resources" :resources ("*"))
                                                 "opencode_list_mcp_resources" nil t))
@@ -310,9 +313,38 @@
                            "\n    \"$W\" status 2>&1"
                            "\n  no rule allows it:"
                            "\n    curl example.com")))
-    (should (equal (opencode-permission-reasons-summary
-                    `(((resource . "a") (rule . ,dynamic)) ((resource . "c"))))
-                   "asked by rule \"\"$*\"; no rule allows the rest"))))
+    (should (equal (opencode-permission-why
+                    (list :reasons `(((resource . "a") (rule . ,dynamic)) ((resource . "b") (rule . ,dynamic))
+                                     ((resource . "c\nd")))))
+                   "rule \"\"$*\": a (+1); no rule allows: c …"))))
+
+(ert-deftest opencode-test-permission-why ()
+  "A plugin's message says why first; a rule's \"*\" resource stands for the title; nothing says nil."
+  (let ((rule '((resource . "*") (rule (action . "slack_post") (resource . "*") (effect . "ask")))))
+    (should (equal (opencode-permission-why `(:message "  agent-cleanup: rm x deletes files\nmore" :reasons (,rule)))
+                   "agent-cleanup: rm x deletes files …"))
+    (should (equal (opencode-permission-why `(:title "Post in #general" :message "" :reasons (,rule)))
+                   "rule \"*\": Post in #general"))
+    (should-not (opencode-permission-why '(:title "Run ls" :action "shell")))))
+
+(ert-deftest opencode-test-permission-plugin-message ()
+  "A plugin's message, not the bare action, heads the expansion and makes the collapsed line."
+  (opencode-test-with-server
+    (let* ((id (opencode-test-scenario "text"))
+           (buffer (opencode-test-open-empty id))
+           (message "agent-cleanup: unlink /x deletes files this session did not create.")
+           (request `((id . "per_plugin") (sessionID . ,id) (action . "shell") (resources "unlink /x")
+                      (source (type . "tool") (messageID . "msg_plugin") (id . "call_plugin"))
+                      (message . ,message)
+                      (metadata (command . "ls; unlink /x") (cwd . ,opencode-test-workspace)))))
+      (with-current-buffer buffer
+        (opencode-tool-start "call_plugin" "shell" '((command . "ls; unlink /x")) "running")
+        (opencode-permission-queue request)
+        (let* ((permission (car opencode-pending-permissions))
+               (block (opencode--permission-block permission)))
+          (should (string-search message (overlay-get block 'opencode-summary)))
+          (should (string-prefix-p (concat "Approval required\n  " message "\n\n$ ls; unlink /x")
+                                   (substring-no-properties (opencode--expanded-content block)))))))))
 
 (ert-deftest opencode-test-permission-reject-commands ()
   "Plain rejection omits feedback; the feedback command sends its trimmed text."
@@ -693,7 +725,7 @@ transient's menu fails, and so does showing a session buffer otherwise."
   (car (split-string heading "\n")))
 
 (ert-deftest opencode-test-permission-in-place ()
-  "A permission answered from a list has only its command above the controls."
+  "A permission answered from a list has only its command and why above the controls."
   (opencode-test-with-server
     (let* ((id (opencode-test-scenario "permission"))
            (buffer (opencode-test-open-empty id)))
@@ -706,7 +738,8 @@ transient's menu fails, and so does showing a session buffer otherwise."
             (opencode-test-keys "A"))
           (should (opencode-transient-displayed-p 'opencode-permission-transient))
           (should (window-live-p transient--window))
-          (should (equal (opencode--permission-description) "rm junk.txt"))
+          (should (equal (substring-no-properties (opencode--permission-description))
+                         "rm junk.txt\nWhy: rule \"rm *\": rm junk.txt"))
           (opencode-test-keys "o"))
         (should (equal (car (opencode-test-requests-to
                              'post (format "/api/session/%s/permission/%s/reply" id (plist-get permission :id))))
@@ -890,7 +923,7 @@ transient's menu fails, and so does showing a session buffer otherwise."
         (opencode-test-in-place parent
           (opencode-respond-session parent nil t)
           (should (eq (plist-get opencode--permission-transient-state :buffer) child-buffer))
-          (should (equal (opencode--permission-description) "rm junk3.txt"))
+          (should (equal (opencode-test-heading-line (opencode--permission-description)) "rm junk3.txt"))
           (opencode-test-keys "o"))
         (should (opencode-test-requests-to
                  'post (format "/api/session/%s/permission/%s/reply" child (plist-get permission :id))))
@@ -1493,7 +1526,7 @@ BACKGROUND runs the child in the background, as for
       (with-current-buffer buffer
         (let ((permission (car opencode-pending-permissions)))
           (should (equal (overlay-get (opencode--permission-block permission) 'help-echo)
-                         "Permission pending: Run rm junk.txt.  C-' A responds."))
+                         "Permission pending: Run rm junk.txt, rule \"rm *\": rm junk.txt.  C-' A responds."))
           (should (equal (opencode-test-capturing-messages
                            (let ((opencode--active-permission (list :buffer buffer :id (plist-get permission :id))))
                              (opencode--permission-on-exit)))
