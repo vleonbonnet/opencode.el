@@ -872,21 +872,26 @@ win over the expansion's."
 (defun opencode-replace-summary (overlay summary)
   "Replace OVERLAY's summary text with SUMMARY, unless it already shows it.
 Faces count: a finished call's summary reads as its running one did,
-in another color."
+in another color.  An overlay starting with the summary and holding it,
+such as the expansion of the program whose first child OVERLAY is, still
+starts with it, though text inserted at its start goes before it."
   (let ((inhibit-read-only t)
         (start (overlay-start overlay))
         (end (overlay-end overlay)))
     (unless (and (equal-including-properties summary (overlay-get overlay 'opencode-summary))
                  (equal summary (buffer-substring-no-properties start (1- end))))
-      ;; Keep an adjacent expansion outside the summary while replacing it.
-      (overlay-put overlay 'front-advance nil)
-      (unwind-protect
-          (save-excursion
-            (goto-char start)
-            (delete-region start (1- end))
-            (insert (opencode--summary-text summary))
-            (move-overlay overlay start (1+ (point))))
-        (overlay-put overlay 'front-advance t))
+      (let ((holders (seq-filter (lambda (other)
+                                   (and (not (eq other overlay))
+                                        (= (overlay-start other) start)
+                                        (<= end (overlay-end other))))
+                                 (overlays-at start))))
+        (save-excursion
+          (goto-char start)
+          (delete-region start (1- end))
+          (insert (opencode--summary-text summary))
+          (move-overlay overlay start (1+ (point))))
+        (dolist (holder holders)
+          (move-overlay holder start (overlay-end holder))))
       (overlay-put overlay 'opencode-summary summary)
       (opencode-summary-fit-queue overlay))))
 

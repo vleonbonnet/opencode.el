@@ -407,6 +407,50 @@ Run in a graphical Emacs, with the user's font and theme when given."
             (should (equal (opencode-test-before "Question 3" (nth index live))
                            (opencode-test-before "Question 3" (nth index fresh))))))))))
 
+(defun opencode-test-program-transcript ()
+  "Return a transcript whose latest turn runs the program of `opencode-test-program-content'."
+  (append (opencode-test-group-turn 1)
+          (list (opencode-test-prompt "msg_g02u" "Question 2")
+                (opencode-test-step "msg_g02a" (opencode-test-program-content)
+                                    '((type . "text") (text . "Answer 2."))))))
+
+(ert-deftest opencode-test-program-first-child-redrawn ()
+  "Redrawing a program's first child keeps it in the program's expansion, which collapses whole."
+  (opencode-test-with-transcript (opencode-test-program-transcript)
+    (with-current-buffer (opencode-test-open (opencode-test-session))
+      (let* ((block (opencode-block "call_g02p"))
+             (content (overlay-get block 'opencode-content-overlay))
+             (child (car (overlay-get block 'opencode-children))))
+        (should (equal (opencode-test-children block) '(0 1 program)))
+        (opencode-replace-summary child "slack.get_user redrawn")
+        (should (equal (opencode-test-summary-text child) "slack.get_user redrawn"))
+        (should (= (overlay-start content) (overlay-end block)))
+        (should (= (overlay-start child) (overlay-end block)))
+        (opencode-collapse-block block)
+        (should-not (opencode-test-children block))
+        (should-not (string-search "redrawn" (buffer-substring-no-properties (point-min) (point-max))))))))
+
+(ert-deftest opencode-test-program-upgraded-closes-whole ()
+  "A program expanded when a later version loads closes whole on the next prompt, as a reload draws it."
+  (opencode-test-with-transcript (opencode-test-program-transcript)
+    (let ((id (opencode-test-session)))
+      (with-current-buffer (opencode-test-open id)
+        (let ((block (opencode-block "call_g02p")))
+          (should (overlay-get block 'opencode-expanded))
+          (opencode-blocks-upgrade)
+          (should (= (overlay-start (overlay-get block 'opencode-content-overlay)) (overlay-end block)))
+          (should (equal (opencode-test-look) (opencode-test-fresh-look id)))
+          (opencode-test-dispatch (opencode-test-inbox-events id "msg_g03u" "Question 3"))
+          (should-not (overlay-get block 'opencode-expanded)))
+        (setq opencode-test-transcript
+              (append opencode-test-transcript (list (opencode-test-prompt "msg_g03u" "Question 3"))))
+        (let ((live (opencode-test-look))
+              (fresh (opencode-test-fresh-look id)))
+          (should (equal (nth 2 live) (nth 2 fresh)))
+          (dotimes (index 2)
+            (should (equal (opencode-test-before "Question 3" (nth index live))
+                           (opencode-test-before "Question 3" (nth index fresh))))))))))
+
 (ert-deftest opencode-test-group-catch-up-as-reload ()
   "Catching up after a reconnection groups as a buffer opened afresh does."
   (opencode-test-with-transcript (opencode-test-group-turn 1)
