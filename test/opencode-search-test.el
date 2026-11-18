@@ -174,5 +174,55 @@ Return (then MATCHES INFO) or (else REASON MESSAGE)."
         (funcall cancel)
         (should (eq outcome 'then))))))
 
+(ert-deftest opencode-test-search-sessions ()
+  "Whole sessions come one per plist, their message's keys absent when they have none."
+  (opencode-test-with-service
+   (let ((opencode-search--unsupported nil)
+         (opencode-search--sessions-unsupported nil))
+     (setf (opencode-test-service-routes opencode-test-service)
+           (list (cons "/api/experimental/session/search/sessions"
+                       (lambda (_)
+                         '(200 . ((data . [((sessionID . "ses_a") (title . "Walruses")
+                                            (message (messageID . "msg_1") (role . "assistant")
+                                                     (time (created . 1500))
+                                                     (snippet (text . "The walrus\nsleeps")
+                                                              (matches . [((start . 4) (end . 10))]))))
+                                           ((sessionID . "ses_b"))])
+                                  (cursor . #s(hash-table))
+                                  (index (complete . t))))))))
+     (let (outcome)
+       (opencode-search-sessions "walrus -seal" :archived nil :limit 2
+                                 :then (lambda (matches info) (setq outcome (list matches info))))
+       (opencode-test-wait-for (lambda () outcome))
+       (pcase-let ((`(,matches ,info) outcome))
+         (should (equal (mapcar (lambda (match) (plist-get match :session-id)) matches) '("ses_a" "ses_b")))
+         (let ((first (car matches)))
+           (should (equal (plist-get first :title) "Walruses"))
+           (should (equal (plist-get first :message-id) "msg_1"))
+           (should (eq (plist-get first :role) 'assistant))
+           (should (= (plist-get first :time) 1.5))
+           (should (equal (plist-get first :snippet) "The walrus sleeps"))
+           (should (equal (plist-get first :matches) '((4 . 10)))))
+         (should (equal (cadr matches) '(:session-id "ses_b" :title nil)))
+         (should (equal info '(:next nil :complete t :processed nil :total nil)))))
+     (should (equal (opencode-test-search-query
+                     (car (opencode-test-requests-on "/api/experimental/session/search/sessions")))
+                    '(("q" . "walrus -seal") ("archived" . "false") ("limit" . "2")))))))
+
+(ert-deftest opencode-test-search-sessions-missing ()
+  "A service without the route of whole sessions is known as such, and may still search by message."
+  (opencode-test-with-service
+   (let ((opencode-search--unsupported nil)
+         (opencode-search--sessions-unsupported nil))
+     (setf (opencode-test-service-routes opencode-test-service)
+           (list (cons "/api/experimental/session/search" #'opencode-test-search-page)))
+     (let (outcome)
+       (opencode-search-sessions "walrus" :else (lambda (reason _) (setq outcome reason)))
+       (opencode-test-wait-for (lambda () outcome))
+       (should (eq outcome 'unsupported)))
+     (should (equal opencode-search--sessions-unsupported '("svc_test")))
+     (should-not opencode-search--unsupported)
+     (should (eq (car (opencode-test-search "walrus")) 'then)))))
+
 (provide 'opencode-search-test)
 ;;; opencode-search-test.el ends here

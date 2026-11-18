@@ -27,7 +27,7 @@ const rewrite = (schema: unknown): unknown => {
   return schema
 }
 
-const optional = new Set(["GET /api/experimental/session/search"])
+const optional = new Set(["GET /api/experimental/session/search", "GET /api/experimental/session/search/sessions"])
 
 type Operation = { parameters?: any[]; requestBody?: any; operationId?: string }
 const routes: { method: string; regex: RegExp; template: string; op: Operation }[] = []
