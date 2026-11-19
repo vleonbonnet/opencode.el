@@ -28,10 +28,14 @@
 ;;   code block in the language of what reads it: an interpreter's,
 ;;   that of the file `cat' or `tee' writes, a diff for `git apply'.
 ;; - Before it runs, as while it waits for permission, the literal
-;;   `.replace(OLD, NEW)' calls of its Python scripts, those of heredocs
-;;   and of `python -c', show as edits do, the diff of OLD to NEW, under
-;;   the file the script last opened.  This is a prediction from the
-;;   text alone, labelled so: other edits show once the command ran.
+;;   `.replace(OLD, NEW)' calls of its Python scripts that write a file,
+;;   those of heredocs and of `python -c', show as edits do, the diff of
+;;   OLD to NEW, under the file the script last opened.  A script writes
+;;   when it opens a file with a mode holding w, a, x or +, or calls
+;;   `write_text', `write_bytes' or `write', but on standard output or
+;;   error; one that only reads and prints predicts nothing.  This is a
+;;   prediction from the text alone, labelled so: other edits show once
+;;   the command ran.
 ;; - Once it ran, the files the service reports it changed, from the
 ;;   snapshots it takes around the call, show as edits do.  A write
 ;;   reports its change the same way.
@@ -341,12 +345,14 @@ joined, as Python joins them."
 The value is (REPLACEMENTS . SUBSTITUTIONS): REPLACEMENTS a list of
 \(FILE OLD NEW), FILE the one the script last opened or nil, OLD and
 NEW strings or :unknown when not literal; SUBSTITUTIONS the number of
-`re.sub' calls."
+`re.sub' calls.  It is nil when SOURCE writes no file: it opens none
+with a mode holding w, a, x or +, and calls neither `write_text',
+`write_bytes' nor `write', but on standard output or error."
   (let* ((tokens (opencode-changes--python-tokens source))
          (count (length tokens))
          (bindings (make-hash-table :test #'equal))
          (substitutions 0)
-         file replacements)
+         file replacements writes)
     (cl-labels ((at (index) (and (< -1 index count) (aref tokens index)))
                 (is (index type &optional value)
                   (let ((token (at index)))
@@ -363,8 +369,47 @@ NEW strings or :unknown when not literal; SUBSTITUTIONS the number of
                   (cond ((and (is index 'name "Path") (is (1+ index) 'op "(")) (+ index 2))
                         ((and (is index 'name "pathlib") (is (1+ index) 'op ".")
                               (is (+ index 2) 'name "Path") (is (+ index 3) 'op "("))
-                         (+ index 4)))))
+                         (+ index 4))))
+                (arguments (index)
+                  ;; The indices where the arguments of the call whose `(' is at INDEX start.
+                  (let ((depth 1) (position (1+ index)) (starts (list (1+ index))))
+                    (while (and (< position count) (> depth 0))
+                      (let ((token (at position)))
+                        (when (eq (car token) 'op)
+                          (pcase (cdr token)
+                            ((or "(" "[" "{") (cl-incf depth))
+                            ((or ")" "]" "}") (cl-decf depth))
+                            ("," (when (= depth 1) (push (1+ position) starts))))))
+                      (cl-incf position))
+                    (nreverse starts)))
+                (writing-mode (index)
+                  (let ((mode (value index)))
+                    (and (stringp mode)
+                         (string-match-p "\\`[rwxabtU+]+\\'" mode)
+                         (string-match-p "[wax+]" mode))))
+                (opens-for-writing (index)
+                  ;; Whether the open( call named at INDEX has a writing mode, as
+                  ;; an argument or as mode=; a bare open( takes the file first.
+                  (let ((starts (arguments (1+ index))))
+                    (unless (is (1- index) 'op ".") (setq starts (cdr starts)))
+                    (seq-some (lambda (start)
+                                (writing-mode (if (and (is start 'name "mode") (is (1+ start) 'op "="))
+                                                  (+ start 2)
+                                                start)))
+                              starts)))
+                (standard-stream (index)
+                  ;; Whether the attribute access at INDEX is on stdout or stderr.
+                  (let ((receiver (if (and (is (1- index) 'name "buffer") (is (- index 2) 'op "."))
+                                      (- index 3)
+                                    (1- index))))
+                    (or (is receiver 'name "stdout") (is receiver 'name "stderr")))))
       (dotimes (index count)
+        (when (or (and (is index 'name "open") (is (1+ index) 'op "(") (opens-for-writing index))
+                  (and (is index 'op ".") (is (1+ index) 'name)
+                       (member (cdr (at (1+ index))) '("write" "write_text" "write_bytes"))
+                       (is (+ index 2) 'op "(")
+                       (not (standard-stream index))))
+          (setq writes t))
         (cond
          ;; NAME = LITERAL, or NAME = Path(LITERAL), alone in its statement.
          ((and (boundary (1- index)) (is index 'name) (is (1+ index) 'op "="))
@@ -394,7 +439,7 @@ NEW strings or :unknown when not literal; SUBSTITUTIONS the number of
          ((and (is index 'name "re") (is (1+ index) 'op ".")
                (is (+ index 2) 'name) (member (cdr (at (+ index 2))) '("sub" "subn")))
           (cl-incf substitutions)))))
-    (cons (nreverse replacements) substitutions)))
+    (when writes (cons (nreverse replacements) substitutions))))
 
 (defun opencode-changes--python-c-scripts (command)
   "Return the scripts COMMAND passes to Python with -c, as the shell reads them."
@@ -426,13 +471,13 @@ NEW strings or :unknown when not literal; SUBSTITUTIONS the number of
 
 (defun opencode-shell-predicted-changes (command)
   "Return the display of the changes shell COMMAND is predicted to make, or nil.
-They are the literal replacements of its Python scripts, each shown as
-an edit is."
+They are the literal replacements of its Python scripts that write a
+file, each shown as an edit is."
   (let (replacements (substitutions 0))
     (dolist (script (opencode-changes--python-scripts command))
-      (pcase-let ((`(,found . ,regexps) (opencode-changes--python-replacements script)))
-        (setq replacements (append replacements found)
-              substitutions (+ substitutions regexps))))
+      (when-let* ((found (opencode-changes--python-replacements script)))
+        (setq replacements (append replacements (car found))
+              substitutions (+ substitutions (cdr found)))))
     (when replacements
       (let (shown last)
         (pcase-dolist (`(,file ,old ,new) replacements)

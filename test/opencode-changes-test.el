@@ -77,19 +77,44 @@
                   "python3 -c \"s='a\\\"b'; print(\\$x)\" && python -B -c 'x = \"y\"'")
                  '("s='a\"b'; print($x)" "x = \"y\""))))
 
+(ert-deftest opencode-test-python-writes ()
+  "Only a script that writes a file has replacements to predict."
+  (dolist (script '("open('a', 'w').write('')"
+                    "f = open(p, mode='a+')"
+                    "m = 'wb'\nwith open(os.path.join(d, 'a'), m) as f: pass"
+                    "pathlib.Path('a').open('x')"
+                    "Path('a').write_text(s)"
+                    "q.write_bytes(b)"
+                    "f.write(s)"))
+    (should (equal (opencode-changes--python-replacements script) '(nil . 0))))
+  (dolist (script '("s = open('a').read().replace('x', 'y')\nprint(s)"
+                    "open('a', 'rb').read()"
+                    "pathlib.Path('a').open().read()"
+                    "sys.stdout.write(s); sys.stderr.write(s); sys.stdout.buffer.write(b)"))
+    (should-not (opencode-changes--python-replacements script))))
+
 (ert-deftest opencode-test-predicted-changes ()
   "Predictions show each replacement as an edit, under its file, labelled as predictions."
   (let ((display (substring-no-properties
                   (opencode-shell-predicted-changes
                    (concat "python3 - <<'EOF'\np='notes.txt'\ns=open(p).read()\n"
-                           "s=s.replace('a\\nb', 'a\\nc')\ns=s.replace(x, 'y')\nEOF\n"
-                           "python3 -c \"import re; re.sub('a', 'b', '')\"")))))
+                           "s=s.replace('a\\nb', 'a\\nc')\ns=s.replace(x, 'y')\nopen(p, 'w').write(s)\nEOF\n"
+                           "python3 -c \"import re; p='n.txt'; open(p, 'w').write(re.sub('a', 'b', open(p).read()))\"\n"
+                           "python3 -c \"import re; print(re.sub('a', 'b', open('o.txt').read().replace('q', 'r')))\"")))))
     (should (equal display
                    (concat "Predicted from the script's replace calls, not its 1 regexp substitution;"
                            " what it changes shows once it ran:\nnotes.txt:\n"
                            (opencode-fenced-block "@@ -1,2 +1,2 @@\n a\n-b\n+c\n" "diff")
                            "\na replacement whose text the script computes"))))
   (should-not (opencode-shell-predicted-changes "sed -i 's/a/b/' x.txt")))
+
+(ert-deftest opencode-test-read-only-script-predicts-nothing ()
+  "A script that only reads a file and prints it changed in memory predicts nothing."
+  (should-not (opencode-shell-predicted-changes
+               (concat "expr=$(python3 -c \"import sys,json;print(open('/private/var/folders/sv/"
+                       "lynpl25j3fjflf_c_b9g25gm0000gp/T/opencode/core.el').read()"
+                       ".replace('\\\\\\\\','\\\\\\\\\\\\\\\\').replace('\\\"','\\\\\\\\\\\"')"
+                       ".replace('\\n',' '))\")"))))
 
 (defconst opencode-test-reported-metadata
   '((status . "completed") (exit . 0)
@@ -117,7 +142,7 @@
 (ert-deftest opencode-test-shell-call-shows-changes ()
   "A shell call shows what it reported changing once finished, its prediction before."
   (let* ((default-directory temporary-file-directory)
-         (command "python3 - <<'EOF'\ns=s.replace('a', 'b')\nEOF")
+         (command "python3 - <<'EOF'\nopen('a.txt', 'w').write(s.replace('a', 'b'))\nEOF")
          (input `((command . ,command)))
          (before (substring-no-properties (opencode-format-tool-call "shell" input '((shellID . "sh_1")))))
          (after (substring-no-properties
