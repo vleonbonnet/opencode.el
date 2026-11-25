@@ -33,7 +33,10 @@
 ;; punctuation closing a sentence or a bracket they do not open.  Org
 ;; link brackets are hidden so only the description shows, as in Org.
 ;; File references, Org labels and URLs get the link face over whatever
-;; Markdown gave them.
+;; Markdown gave them.  A renderer showing an Org link's description
+;; alone, as a table renderer may so that its columns fit what shows,
+;; makes it a button with `opencode-make-org-link-button', which keeps
+;; the faces the renderer gave it.
 ;;
 ;; \\[opencode-open-link-at-point] follows the link at point, else offers
 ;; the links of the exchange around point, the way `org-open-at-point'
@@ -103,6 +106,31 @@ The first returning non-nil has handled the link at point.")
   (require 'ol)
   (org-link-open-from-string (button-get button 'org-link)))
 
+;; No face of its own: the text's shows, the link face the transcript's
+;; Org links are marked with, or the faces a renderer gave them.
+(define-button-type 'opencode-org-link 'face nil)
+
+(defun opencode-make-org-link-button (start end link)
+  "Make START..END a button opening LINK, a bracketed Org link.
+The button opens LINK with Org's link dispatcher, whatever its type,
+as the Org links of the transcript do.  It has no face of its own, so
+the text between START and END keeps the faces it has, such as those
+of a table cell.  For example, a table renderer showing
+\"[[id:X][Task]]\" as \"Task\" makes \"Task\" a button with this."
+  (require 'ol)
+  (opencode-make-button
+   start end
+   'type 'opencode-org-link
+   'action #'opencode--follow-org-link
+   'org-link link
+   'org-link-target (save-match-data
+                      (if (string-match org-link-bracket-re link)
+                          (match-string 1 link)
+                        link))
+   'follow-link t
+   'help-echo (format "Open %s" link)
+   'mouse-face 'highlight))
+
 (defun opencode--buttonize-org-links (start end)
   "Turn bracketed Org links between START and END into buttons."
   (require 'ol)
@@ -118,14 +146,7 @@ The first returning non-nil has handled the link at point.")
              (link (match-string-no-properties 0)))
         (opencode--unlink-bare-urls beg finish)
         (unless (get-text-property label-beg 'opencode-button)
-          (opencode-make-button
-           label-beg label-end
-           'action #'opencode--follow-org-link
-           'org-link link
-           'org-link-target (buffer-substring-no-properties link-beg link-end)
-           'follow-link t
-           'help-echo (format "Open %s" link)
-           'mouse-face 'highlight)
+          (opencode-make-org-link-button label-beg label-end link)
           (opencode-mark-fontify label-beg label-end 'link t)
           (opencode-mark-fontify beg label-beg 'hidden)
           (opencode-mark-fontify label-end finish 'hidden))))))

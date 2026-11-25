@@ -226,6 +226,44 @@ BINDINGS is a list (SESSION) of the variable bound to the session's ID."
         (goto-char (opencode-test-find text))
         (should (eq (key-binding (kbd "RET")) 'opencode-send-input))))))
 
+;;;; Org links
+
+(ert-deftest opencode-test-org-link-is-a-link ()
+  "An Org link in the agent's text shows its description, a button opening the link."
+  (opencode-test-with-answer (session)
+    (opencode-test-answer session "msg_org_link" "Do [[id:ABC-123][the task]] next.")
+    (font-lock-ensure)
+    (let ((label (opencode-test-find "the task"))
+          opened)
+      (should (equal (opencode-test-links) '(("the task"))))
+      (should (equal (get-text-property (opencode-test-find "[[id:") 'display) ""))
+      (should (equal (get-text-property (opencode-test-find "]]") 'display) ""))
+      (should (memq 'link (ensure-list (get-text-property label 'face))))
+      (should (equal (button-get (button-at label) 'org-link-target) "id:ABC-123"))
+      (cl-letf (((symbol-function 'org-link-open-from-string) (lambda (link &rest _) (setq opened link))))
+        (push-button (1+ label)))
+      (should (equal opened "[[id:ABC-123][the task]]")))))
+
+(ert-deftest opencode-test-org-link-button-keeps-text-faces ()
+  "A rendered Org link's button keeps the faces its renderer gave it, through fontification.
+A table renderer shows the description alone, faced as the cell and the
+row it is in; a button's default face would hide those."
+  (with-temp-buffer
+    ;; As `font-lock-mode' makes `font-lock-face' a face, which batch Emacs does not turn on.
+    (setq-local char-property-alias-alist '((face font-lock-face)))
+    (insert (propertize "the task" 'font-lock-face '(bold highlight)) " next")
+    (opencode-make-org-link-button 1 9 "[[id:ABC-123][the task]]")
+    (opencode-mark-fontify (point-min) (point-max) 'verbatim)
+    (let (opened)
+      (should (equal (get-char-property 3 'face) '(bold highlight)))
+      (should (equal (button-get (button-at 3) 'org-link-target) "id:ABC-123"))
+      (should (equal (button-start (button-at 3)) 1))
+      (should (equal (button-end (button-at 3)) 9))
+      (should-not (button-at 10))
+      (cl-letf (((symbol-function 'org-link-open-from-string) (lambda (link &rest _) (setq opened link))))
+        (push-button 3))
+      (should (equal opened "[[id:ABC-123][the task]]")))))
+
 ;;;; Links in sent prompts
 
 (defconst opencode-test-prompt-with-links
