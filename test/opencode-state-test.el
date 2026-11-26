@@ -255,7 +255,8 @@ DATA are the members of its data besides `sessionID'."
         (opencode-state-ensure)
         (opencode-test-state-connect)
         (should (opencode-state-get "ses_new"))
-        (should (eq (opencode-state-status "ses_old") 'working))
+        (should (opencode-state-jobs "ses_old"))
+        (should-not (eq (opencode-state-status "ses_old") 'working))
         (should-not (plist-get (opencode-state-get "ses_old") :running))))))
 
 (ert-deftest opencode-test-identifier-time ()

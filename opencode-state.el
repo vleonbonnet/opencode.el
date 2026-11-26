@@ -387,8 +387,9 @@ children."
   "Return the statuses of the subagents of session ID in the middle of a turn.
 Subagents at any depth count, those the registry holds; the value lists
 each of `waiting', `working' and `retrying' at most once, nil when no
-subagent is in the middle of a turn.  It costs the subagents of ID, not
-every entry."
+subagent is in the middle of a turn.  A subagent whose turn ended with
+background jobs running works (see `opencode-state-jobs').  It costs the
+subagents of ID, not every entry."
   (let ((seen (make-hash-table :test #'equal))
         (queue (gethash id (opencode-sv opencode-state--children)))
         (statuses nil))
@@ -399,7 +400,9 @@ every entry."
           (puthash child t seen)
           (let ((status (opencode-state-status child)))
             (when (memq status '(waiting working retrying))
-              (cl-pushnew status statuses)))
+              (cl-pushnew status statuses))
+            (when (opencode-state-jobs child)
+              (cl-pushnew 'working statuses)))
           (setf queue (append (gethash child (opencode-sv opencode-state--children)) queue)))))
     statuses))
 
@@ -422,12 +425,13 @@ up to which it was viewed, as the service decides for every client."
 `waiting' while a request awaits the user; else while an execution runs,
 `retrying' when it waits for a retry, `working' otherwise; else when
 unread, `failed' when the last turn failed, `done' otherwise; else
-`idle'.  Running background jobs keep it `working' after the turn ends.
-Return nil for an unknown session."
+`idle'.  It is the status of the session's turn: background jobs its
+turn left running are no turn, and the session waits for them as it
+would for the user, going on with each one's report in a turn of its
+own (see `opencode-state-jobs').  Return nil for an unknown session."
   (when-let* ((entry (opencode-state--entry entry-or-id)))
     (cond ((plist-get entry :requests) 'waiting)
           ((plist-get entry :running) (if (plist-get entry :retry) 'retrying 'working))
-          ((plist-get entry :jobs) 'working)
           ((opencode-state-unread-p entry)
            (if (eq (plist-get entry :outcome) 'failed) 'failed 'done))
           (t 'idle))))
@@ -440,10 +444,16 @@ known."
   (when-let* ((entry (opencode-state--entry entry-or-id)))
     (pcase (opencode-state-status entry)
       ('waiting (plist-get (car (plist-get entry :requests)) :time))
-      ((or 'working 'retrying)
-       (or (plist-get entry :started)
-           (opencode-time-seconds (alist-get 'started (alist-get 'time (car (plist-get entry :jobs)))))))
+      ((or 'working 'retrying) (plist-get entry :started))
       ((or 'failed 'done) (plist-get entry :idle)))))
+
+(defun opencode-state-jobs (entry-or-id)
+  "Return the background jobs of ENTRY-OR-ID still running, oldest first.
+Each is a service job alist, as `opencode-jobs' returns it: its
+`title' names it, its `kind' tells a shell, a subagent or an image.
+Jobs outlive the turn that started them, whose status they leave as
+it ended (see `opencode-state-status')."
+  (plist-get (opencode-state--entry entry-or-id) :jobs))
 
 (defun opencode-state-cache (id)
   "Return the live prompt-cache expiry of session ID, or nil.

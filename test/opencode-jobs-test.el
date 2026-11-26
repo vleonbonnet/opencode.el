@@ -46,7 +46,7 @@
   (opencode-tool-update id :status "completed" :metadata metadata))
 
 (ert-deftest opencode-test-jobs-outlive-turn ()
-  "Two background jobs keep the session and its block working after its turn ends."
+  "Two background jobs outlive the turn: it ends, their block and the mode line work on."
   (let ((id (opencode-test-scenario "shell")))
     (opencode-test-with-jobs (list (opencode-test-job "sh_one" id) (opencode-test-job "sh_two" id))
       (let ((buffer (opencode-test-open-empty id)))
@@ -56,20 +56,25 @@
           (let ((block (opencode-test-job-block "call_one" "shell" '((status . "running") (shellID . "sh_one")))))
             (opencode-test-dispatch `(((type . "session.execution.succeeded") (created . 3000) (data (sessionID . ,id)))))
             (should-not (plist-get (opencode-state-get id) :running))
-            (should (eq (opencode-state-status id) 'working))
-            (should (= (opencode-state-since id) 1))
-            (should (eq (car (opencode--mode-line-registry-part)) 'working))
+            (should (eq (opencode-state-status id) 'done))
+            (should (= (opencode-state-since id) (plist-get (opencode-state-get id) :idle)))
+            (should (equal (sort (mapcar (lambda (job) (alist-get 'id job)) (opencode-state-jobs id)) #'string<)
+                           '("sh_one" "sh_two")))
+            (should (equal (seq-take (opencode--mode-line-registry-part) 2) '(done (working))))
             (should (eq (opencode-block-face (opencode-block-data block)) 'opencode-tool-running-margin))
             (should-not (opencode--groupable-p block))
             (opencode-test-dispatch '(((type . "shell.exited") (data (id . "sh_one") (status . "exited") (exit . 0)))))
-            (should (eq (opencode-state-status id) 'working))
+            (should (eq (opencode-state-status id) 'done))
+            (should (equal (mapcar (lambda (job) (alist-get 'id job)) (opencode-state-jobs id)) '("sh_two")))
             (should (eq (opencode-block-face (opencode-block-data block)) 'opencode-tool-margin-highlight))
             (should (opencode--groupable-p block))
             (opencode-test-dispatch '(((type . "shell.exited") (data (id . "sh_two") (status . "exited") (exit . 0)))))
-            (should (eq (opencode-state-status id) 'done))))))))
+            (should (eq (opencode-state-status id) 'done))
+            (should-not (opencode-state-jobs id))
+            (should (equal (seq-take (opencode--mode-line-registry-part) 2) '(done nil)))))))))
 
 (ert-deftest opencode-test-jobs-shell-starts-before-turn-ends ()
-  "Shell events keep an owner active before its first background listing answers."
+  "Shell events tell an owner's jobs before its first background listing answers."
   (opencode-test-with-jobs nil
     (opencode-test-job-owner "ses_jobs" t)
     (opencode-test-dispatch
@@ -77,9 +82,11 @@
                                              (command . "make test") (metadata (sessionID . "ses_jobs"))
                                              (time (started . 1000)))))
        ((type . "session.execution.succeeded") (created . 3000) (data (sessionID . "ses_jobs")))))
-    (should (eq (opencode-state-status "ses_jobs") 'working))
+    (should (eq (opencode-state-status "ses_jobs") 'done))
+    (should (equal (mapcar (lambda (job) (alist-get 'id job)) (opencode-state-jobs "ses_jobs")) '("sh_live")))
     (opencode-test-dispatch '(((type . "shell.deleted") (data (id . "sh_live")))))
-    (should (eq (opencode-state-status "ses_jobs") 'done))))
+    (should (eq (opencode-state-status "ses_jobs") 'done))
+    (should-not (opencode-state-jobs "ses_jobs"))))
 
 (ert-deftest opencode-test-jobs-snapshot-races-exit ()
   "A stale listing cannot revive a job that exited while the request was in flight."
@@ -149,12 +156,13 @@
             (should (eq (opencode-block-face (opencode-block-data block)) 'error))))))))
 
 (ert-deftest opencode-test-jobs-subagent-and-image ()
-  "Subagent and image jobs keep their owner active and settle from their notifications."
+  "Subagent and image jobs are their owner's and settle from their notifications."
   (opencode-test-with-jobs (list (opencode-test-job "ses_child" "ses_jobs" "subagent")
                                  (opencode-test-job "image_one" "ses_jobs" "image"))
     (opencode-test-job-owner "ses_jobs")
     (opencode-jobs--list)
-    (should (eq (opencode-state-status "ses_jobs") 'working))
+    (should (eq (opencode-state-status "ses_jobs") 'done))
+    (should (length= (opencode-state-jobs "ses_jobs") 2))
     (opencode-test-dispatch
      '(((type . "session.inbox.enqueued") (data (sessionID . "ses_jobs")
                                                 (item (type . "synthetic")
@@ -164,7 +172,19 @@
      '(((type . "session.synthetic") (data (sessionID . "ses_jobs")
                                            (metadata (source . "experimental_image_generate")
                                                      (jobID . "image_one") (state . "error"))))))
-    (should (eq (opencode-state-status "ses_jobs") 'done))))
+    (should (eq (opencode-state-status "ses_jobs") 'done))
+    (should-not (opencode-state-jobs "ses_jobs"))))
+
+(ert-deftest opencode-test-jobs-of-a-subagent ()
+  "A subagent whose turn ended with jobs running is at work for its parent."
+  (opencode-test-with-jobs (list (opencode-test-job "sh_child" "ses_child"))
+    (opencode-test-job-owner "ses_parent")
+    (opencode-state--put (opencode-state--make-entry :id "ses_child" :parent-id "ses_parent"
+                                                     :idle 2 :viewed 2 :outcome 'succeeded))
+    (should-not (opencode-state-subagent-statuses "ses_parent"))
+    (opencode-jobs--list)
+    (should (eq (opencode-state-status "ses_child") 'idle))
+    (should (equal (opencode-state-subagent-statuses "ses_parent") '(working)))))
 
 (ert-deftest opencode-test-jobs-services-are-independent ()
   "Two services may run the same job and session IDs without sharing their state."
@@ -195,7 +215,7 @@
               (metadata '((sessionID . "ses_child") (status . "running"))))
           (opencode-jobs--event event)
           (let ((old (opencode-test-job-block "call_child" "subagent" metadata)))
-            (should (eq (opencode-state-status id) 'working))
+            (should (opencode-state-jobs id))
             (should (eq (opencode-block-face (opencode-block-data old)) 'opencode-tool-running-margin))
             (opencode-jobs--event `((type . "session.synthetic")
                                     (data (sessionID . ,id) (metadata (childID . "ses_child") (state . "completed")))))
@@ -245,7 +265,7 @@
       (let ((opencode-test-routes
              (cons (list 'get "/job\\'" (lambda (_) `(:error ,status "No jobs"))) opencode-test-routes)))
         (opencode-jobs--list)
-        (should (eq (opencode-state-status "ses_jobs") 'working))
+        (should (opencode-state-jobs "ses_jobs"))
         (if (= status 500)
             (should (timerp opencode-jobs--timer))
           (should opencode-jobs--unsupported)

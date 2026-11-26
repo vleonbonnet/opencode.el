@@ -124,9 +124,11 @@ See `opencode--mode-line-registry-part'.")
 (defun opencode--mode-line-registry-part ()
   "Return what the registry tells of this session for its mode line.
 The value is (STATUS SUBAGENTS ARCHIVED): STATUS, `failed' or `done' when
-its last turn ended unseen, `working' while background jobs run, else nil;
-SUBAGENTS, the kinds of `opencode-subagent-icons' its subagents are in,
-`waiting' first; and ARCHIVED, non-nil when it is archived.
+its last turn ended unseen, else nil; SUBAGENTS, the kinds of
+`opencode-subagent-icons' its subagents are in, `waiting' first, and
+`working' too while background jobs its turn left run, as subagents of
+its at work (see `opencode-state-jobs'); and ARCHIVED, non-nil when it
+is archived.
 It is made again only when the
 registry changed."
   (let ((key (cons opencode-session-id (opencode-sv opencode-state--revision))))
@@ -135,9 +137,10 @@ registry changed."
       (let* ((entry (and opencode-session-id (opencode-state-get opencode-session-id)))
              (status (and entry (opencode-state-status entry)))
              (subagents (and opencode-session-id (opencode-state-subagent-statuses opencode-session-id)))
-             (part (list (and (or (memq status '(failed done)) (plist-get entry :jobs)) status)
+             (part (list (and (memq status '(failed done)) status)
                          (delq nil (list (and (memq 'waiting subagents) 'waiting)
-                                         (and (or (memq 'working subagents) (memq 'retrying subagents))
+                                         (and (or (memq 'working subagents) (memq 'retrying subagents)
+                                                  (and entry (opencode-state-jobs entry)))
                                               'working)))
                          (and entry (plist-get entry :archived) t))))
         (setq opencode--mode-line-registry (cons key part))
@@ -195,7 +198,7 @@ the icons of SUBAGENTS and ARCHIVED, and escaped for the mode line."
                                     (concat " " (propertize (opencode-subagent-glyph kind)
                                                             'help-echo (if (eq kind 'waiting)
                                                                            "Subagents wait for your answer"
-                                                                         "Subagents work"))))
+                                                                         "Subagents or background jobs work"))))
                                   subagents "")
                        (and archived
                             (concat " " (propertize (opencode-archived-glyph) 'help-echo "Archived"))))))
