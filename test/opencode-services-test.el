@@ -379,6 +379,61 @@ Return the two buffers, local first."
           (should (equal (alist-get 'name file) "src/app.el"))
           (should (equal (alist-get 'uri file) "file:///C:/Users/val/proj/src/app.el")))))))
 
+(ert-deftest opencode-test-remote-move ()
+  "A remote session moves to a directory of its host, read among those its service lists."
+  (opencode-test-with-remote (service fake)
+    (pcase-let ((`(,_local ,remote) (opencode-test-open-local-and-remote service fake)))
+      (let ((tree '(("C:/Users/val" "proj" "other" "notes.txt")
+                    ("C:/Users/val/proj" "src")
+                    ("C:/Users/val/other")))
+            (routes (opencode-test-service-routes fake)))
+        (setf (opencode-test-service-routes fake)
+              (append
+               (list (cons "/api/fs/list"
+                           (lambda (request)
+                             (if-let* ((path (alist-get 'path (opencode-test-query request)))
+                                       (entry (assoc (string-remove-suffix "/" path) tree)))
+                                 (cons 200 `((data . ,(vconcat
+                                                       (mapcar (lambda (name)
+                                                                 ;; Relative to the session's directory.
+                                                                 `((path . ,(concat "../" name))
+                                                                   (type . ,(if (string-search "." name)
+                                                                                "file"
+                                                                              "directory"))))
+                                                               (cdr entry))))))
+                               '(404 . ((message . "Directory not found"))))))
+                     (cons "/api/session/ses_both/move" (lambda (_) '(200 . ((data))))))
+               routes)))
+      (with-current-buffer remote
+        (should (equal (opencode--remote-expand "../other/./" opencode-session-location) "C:/Users/val/other/"))
+        (should (equal (opencode--remote-expand "D:\\work\\.." opencode-session-location) "D:/"))
+        (should (equal (opencode--remote-expand "/srv/a/../b" opencode-session-location) "/srv/b/"))
+        ;; cd reads this host's directories: it points to the command reading the session's host's.
+        (should (string-match-p "opencode-session-move"
+                                (cadr (should-error (cd temporary-file-directory) :type 'user-error))))
+        (let (offered)
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (_prompt table _predicate _require initial &rest _)
+                       (setq offered (list initial
+                                           (all-completions "C:/Users/val/" table)
+                                           (try-completion "C:/Users/val/o" table)
+                                           (completion-boundaries "C:/Users/val/pr" table nil "")))
+                       "C:/Users/val/other")))
+            (call-interactively #'opencode-session-move))
+          (should (equal offered `(,(concat opencode-test-remote-directory "/")
+                                   ("proj/" "other/") "C:/Users/val/other/" (13 . 0)))))
+        (opencode-test-wait-for (lambda () (opencode-test-remote-requests fake "/api/session/ses_both/move")))
+        (should (equal (mapcar (lambda (request) (json-parse-string (plist-get request :body) :object-type 'alist))
+                               (opencode-test-remote-requests fake "/api/session/ses_both/move"))
+                       '(((directory . "C:/Users/val/other")))))
+        ;; A name that is no directory there moves nothing.
+        (should (string-match-p "no directory on Core"
+                                (cadr (should-error (opencode-session-move "C:/Users/val/notes.txt")
+                                                    :type 'user-error))))
+        (should (length= (opencode-test-remote-requests fake "/api/session/ses_both/move") 1))
+        ;; The session's directory changes only once the service tells it moved.
+        (should (equal opencode-session-location (concat opencode-test-remote-directory "/")))))))
+
 (ert-deftest opencode-test-remote-names ()
   "A remote session names its host in its mode line and its notifications."
   (opencode-test-with-remote (service fake)

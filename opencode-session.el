@@ -922,24 +922,132 @@ buffer stays in this host's home, the directory being the other host's."
   (dolist (field '(location projectID subpath))
     (setf (alist-get field opencode-session-info nil t) (alist-get field info))))
 
+(defun opencode--request-move (directory)
+  "Ask the server to move this buffer's session to DIRECTORY, as it names it.
+The buffer follows once the move takes effect, which the stream tells
+\(see `opencode--adopt-location'); a refusal is reported."
+  (opencode-request
+   'post (format "/api/session/%s/move" opencode-session-id)
+   :body `((directory . ,directory))
+   :else (lambda (error) (opencode-report-error (opencode-error-describe error)))))
+
 (defun opencode--cd (original directory)
   "Ask the server to move this session when ORIGINAL `cd' selects DIRECTORY.
-A session of a remote service is not moved: DIRECTORY is this host's."
+A session of a remote service is not moved: DIRECTORY is this host's,
+and `opencode-session-move' reads one of that service's host."
   (when (and (derived-mode-p 'opencode-session-mode) opencode-session-id opencode--buffer-service)
-    (user-error "This session runs on %s: its directory is that host's" (opencode-service-label)))
+    (user-error (substitute-command-keys
+                 "This session runs on %s: move it with \\[opencode-session-move]")
+                (opencode-service-label)))
   (if (not (and (derived-mode-p 'opencode-session-mode) opencode-session-id))
       (funcall original directory)
-    (let ((destination
-           (let ((default-directory default-directory)
-                 (list-buffers-directory list-buffers-directory))
-             (funcall original directory)
-             (opencode-directory-name default-directory))))
-      (opencode-request
-       'post (format "/api/session/%s/move" opencode-session-id)
-       :body `((directory . ,destination))
-       :else (lambda (error) (opencode-report-error (opencode-error-describe error)))))))
+    (opencode--request-move
+     (let ((default-directory default-directory)
+           (list-buffers-directory list-buffers-directory))
+       (funcall original directory)
+       (opencode-directory-name default-directory)))))
 
 (advice-add 'cd :around #'opencode--cd)
+
+(defun opencode--remote-absolute-p (name)
+  "Return non-nil when NAME, a file name of a remote service's host, is absolute.
+It starts with a slash, or with a drive letter and a slash, as OpenCode
+spells the directories of a Windows host (see `opencode--remote-directory')."
+  (string-match-p "\\`\\(?:/\\|[A-Za-z]:/\\)" name))
+
+(defun opencode--remote-expand (name location)
+  "Return NAME, a directory of a remote service's host, absolute, as it spells it.
+A relative NAME is relative to LOCATION, the session's directory.  The
+segments \".\" and \"..\" go, without the host's file system being
+asked: Emacs would read the name as one of this host's."
+  (let* ((name (string-replace "\\" "/" name))
+         (absolute (if (opencode--remote-absolute-p name) name (concat location "/" name)))
+         (root (if (string-match "\\`[A-Za-z]:/" absolute) (match-string 0 absolute) "/"))
+         (segments nil))
+    (dolist (segment (split-string (substring absolute (length root)) "/" t))
+      (pcase segment
+        ("." nil)
+        (".." (pop segments))
+        (_ (push segment segments))))
+    (opencode--remote-directory (concat root (string-join (nreverse segments) "/")))))
+
+(defun opencode--remote-subdirectories (location parent)
+  "Return the names of the directories in PARENT, on the current service's host.
+Each name ends in a slash.  The service lists PARENT, an absolute name,
+in requests scoped to LOCATION, the session's directory.  Return nil
+when PARENT is no directory there, or the service does not answer
+quickly."
+  (condition-case nil
+      (seq-keep (lambda (entry)
+                  ;; Its host's names: Emacs's file name functions would read them as this host's.
+                  (when-let* (((equal (alist-get 'type entry) "directory"))
+                              (path (alist-get 'path entry))
+                              ((stringp path))
+                              (path (string-replace "\\" "/" path))
+                              ((string-match "\\([^/]+\\)/*\\'" path)))
+                    (concat (match-string 1 path) "/")))
+                (opencode-request-data
+                 (opencode-request-sync 'get "/api/fs/list" :directory location
+                                        :query `((path . ,parent)) :timeout 5)))
+    (error nil)))
+
+(defun opencode--remote-directory-table (service location)
+  "Return a completion table of the directories of SERVICE's host.
+It completes the last component of an absolute name, as file names
+complete, among the directories the service lists in its parent (see
+`opencode--remote-subdirectories'); LOCATION is the session's
+directory.  Each directory is listed once while the table lives."
+  (let ((listings (make-hash-table :test #'equal)))
+    (lambda (string predicate action)
+      (let* ((start (if-let* ((slash (string-match-p "/[^/]*\\'" string))) (1+ slash) 0))
+             (parent (substring string 0 start)))
+        (pcase action
+          ('metadata '(metadata (category . opencode-remote-directory)))
+          (`(boundaries . ,suffix)
+           `(boundaries ,start . ,(or (string-search "/" suffix) (length suffix))))
+          (_ (let ((names (and (opencode--remote-absolute-p parent)
+                               (car (with-memoization (gethash parent listings)
+                                      (list (opencode-with-service service
+                                              (opencode--remote-subdirectories location parent))))))))
+               (completion-table-with-context parent names (substring string start) predicate action))))))))
+
+(defun opencode--read-remote-directory (prompt)
+  "Read a directory of the host of this buffer's remote service, with PROMPT.
+The input starts with the session's directory, and completes among the
+directories the service lists.  Return the name as typed."
+  (let ((location opencode-session-location))
+    (completing-read prompt (opencode--remote-directory-table opencode--buffer-service location)
+                     nil nil location)))
+
+(defun opencode-session-move (directory)
+  "Move the session of this buffer to DIRECTORY.
+The buffer's directory follows once the server moved the session, and
+stays where it was while the request is pending or when it fails.  For
+a session of the local service, this is `cd'.  For one of another
+host's service, DIRECTORY is that host's, absolute or relative to the
+session's directory, and must be a directory the service lists.
+Interactively, DIRECTORY is read with completion, among that host's
+directories for another host's session."
+  (interactive
+   (progn
+     (unless (and (derived-mode-p 'opencode-session-mode) opencode-session-id)
+       (user-error "Not in an OpenCode session"))
+     (list (if opencode--buffer-service
+               (opencode--read-remote-directory
+                (format "Move the session on %s to: " (opencode-service-label)))
+             (read-directory-name "Move the session to: " nil nil t)))))
+  (unless (and (derived-mode-p 'opencode-session-mode) opencode-session-id)
+    (user-error "Not in an OpenCode session"))
+  (if (not opencode--buffer-service)
+      (cd directory)
+    (let* ((location opencode-session-location)
+           (name (opencode--remote-expand directory location)))
+      (opencode-request-sync 'get "/api/fs/list" :directory location :query `((path . ,name)) :timeout 5
+                             :else (lambda (error)
+                                     (if (eql (opencode-error-status error) 404)
+                                         (user-error "%s is no directory on %s" name (opencode-service-label))
+                                       (user-error "%s" (opencode-error-describe error)))))
+      (opencode--request-move (opencode-directory-name name)))))
 
 (defun opencode--display (buffer no-display other-window)
   "Show BUFFER unless NO-DISPLAY: in another window when OTHER-WINDOW."
