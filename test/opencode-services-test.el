@@ -386,6 +386,10 @@ Return the two buffers, local first."
       (let ((tree '(("C:/Users/val" "proj" "other" "notes.txt")
                     ("C:/Users/val/proj" "src")
                     ("C:/Users/val/other")))
+            ;; As a service on Windows tells entries: relative to the session's
+            ;; directory, which is ".\\" itself, with backslashes, a directory's ending in one.
+            (relative '(("C:/Users/val/proj" . ".\\") ("C:/Users/val/other" . "..\\other\\")
+                        ("C:/Users/val/notes.txt" . "..\\notes.txt") ("C:/Users/val/proj/src" . "src\\")))
             (routes (opencode-test-service-routes fake)))
         (setf (opencode-test-service-routes fake)
               (append
@@ -395,11 +399,11 @@ Return the two buffers, local first."
                                        (entry (assoc (string-remove-suffix "/" path) tree)))
                                  (cons 200 `((data . ,(vconcat
                                                        (mapcar (lambda (name)
-                                                                 ;; Relative to the session's directory.
-                                                                 `((path . ,(concat "../" name))
-                                                                   (type . ,(if (string-search "." name)
-                                                                                "file"
-                                                                              "directory"))))
+                                                                 (let ((file (concat (car entry) "/" name)))
+                                                                   `((path . ,(alist-get file relative nil nil #'equal))
+                                                                     (type . ,(if (string-search "." name)
+                                                                                  "file"
+                                                                                "directory")))))
                                                                (cdr entry))))))
                                '(404 . ((message . "Directory not found"))))))
                      (cons "/api/session/ses_both/move" (lambda (_) '(200 . ((data))))))

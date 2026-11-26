@@ -979,13 +979,16 @@ when PARENT is no directory there, or the service does not answer
 quickly."
   (condition-case nil
       (seq-keep (lambda (entry)
-                  ;; Its host's names: Emacs's file name functions would read them as this host's.
+                  ;; Entries are relative to LOCATION, which itself is \"./\": its name
+                  ;; is that of the directory the entry expands to.  Its host's names:
+                  ;; Emacs's file name functions would read them as this host's.
                   (when-let* (((equal (alist-get 'type entry) "directory"))
                               (path (alist-get 'path entry))
                               ((stringp path))
-                              (path (string-replace "\\" "/" path))
-                              ((string-match "\\([^/]+\\)/*\\'" path)))
-                    (concat (match-string 1 path) "/")))
+                              (absolute (opencode--remote-expand path location))
+                              ((string-match "\\([^/]+\\)/\\'" absolute))
+                              ((not (string-suffix-p ":" (match-string 1 absolute)))))
+                    (concat (match-string 1 absolute) "/")))
                 (opencode-request-data
                  (opencode-request-sync 'get "/api/fs/list" :directory location
                                         :query `((path . ,parent)) :timeout 5)))
