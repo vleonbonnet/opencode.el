@@ -117,7 +117,8 @@ with nil instead: clients then read the registry again."
 
 (defconst opencode-state--keys
   '(:id :title :directory :project-id :parent-id :agent :model :context :context-estimated
-        :running :jobs :retry :requests :outcome :error :idle :viewed :archived :created :updated :started)
+        :running :jobs :retry :requests :outcome :error :idle :viewed :archived :created :updated :started
+        :activity)
   "Keys of a registry entry, in order.")
 
 (opencode-defvar-service opencode-state--sessions (make-hash-table :test #'equal)
@@ -338,6 +339,8 @@ An entry is a plist with the keys :id, :title, :directory (normalized),
 context size in tokens, or nil; see `opencode-state-context'),
 :context-estimated (non-nil when :context is the service's estimate; see
 `opencode-state-context-estimated-p'), :running (the foreground turn),
+:activity (the time of a turn's latest step or prompt queued, or nil;
+see `opencode-state-activity'),
 :jobs (running background jobs, as `opencode-jobs' returns them),
 :retry (a plist :attempt :at :message, or nil), :requests (plists :kind
 :id :summary :time, oldest first), :outcome (`succeeded', `failed' or
@@ -437,6 +440,17 @@ the user, going on with each one's report in a turn of its own (see
                 (not (eq (plist-get entry :outcome) 'interrupted)))
            (if (eq (plist-get entry :outcome) 'failed) 'failed 'done))
           (t 'idle))))
+
+(defun opencode-state-activity (entry-or-id)
+  "Return when ENTRY-OR-ID last did something of a turn, a float time, or nil.
+The newest of its turns' starts, steps, prompts queued and ends, or
+its creation: not what changes the session without a turn, renaming,
+moving or archiving it, or choosing its agent or model, which its
+:updated follows too.  Nil for an unknown session."
+  (when-let* ((entry (opencode-state--entry entry-or-id)))
+    (let ((times (delq nil (list (plist-get entry :activity) (plist-get entry :started)
+                                 (plist-get entry :idle) (plist-get entry :created)))))
+      (and times (apply #'max times)))))
 
 (defun opencode-state-since (entry-or-id)
   "Return the time the current status of ENTRY-OR-ID began, or nil.
@@ -555,6 +569,9 @@ A stale entry's context size is kept while the service has not updated
 the session since."
   (let ((id (plist-get entry :id)))
     (setq entry (plist-put entry :jobs (opencode-jobs id)))
+    ;; The service does not tell a turn's latest step: what this stream saw stays.
+    (unless (plist-get entry :activity)
+      (setq entry (plist-put entry :activity (plist-get (opencode-state-get id) :activity))))
     (puthash id t (opencode-sv opencode-state--current))
     (opencode-state--store id (opencode-state--context-carry entry))))
 
@@ -603,7 +620,7 @@ execution whose idle time ENTRY already has is then not counted again."
            (when (and (numberp idle) (or (null viewed) (> idle viewed)))
              (assign :viewed (opencode-time-seconds idle)))))
         ((or "session.step.ended" "session.step.failed")
-         (assign :updated created)
+         (assign :updated created :activity created)
          ;; A step failing after the provider answered reports that usage too.
          (when-let* ((size (opencode-context-size (alist-get 'tokens data))))
            (assign :context size :context-estimated nil)))
@@ -616,11 +633,11 @@ execution whose idle time ENTRY already has is then not counted again."
          (let ((context (alist-get 'context data)))
            (assign :context (and (numberp context) context)
                    :context-estimated (numberp context))))
-        ("session.inbox.enqueued" (assign :updated created))
+        ("session.inbox.enqueued" (assign :updated created :activity created))
         ;; The messages after the boundary are gone, and with them maybe
         ;; the newest usage; the size is fetched again when asked for.
         ("session.revert.committed" (assign :context nil :context-estimated nil :updated created))
-        ("session.step.started" (assign :retry nil :updated created))
+        ("session.step.started" (assign :retry nil :updated created :activity created))
         ("session.execution.started"
          (assign :running t :started created :retry nil :requests nil))
         ("session.retry.scheduled"

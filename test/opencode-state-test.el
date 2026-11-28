@@ -853,6 +853,26 @@ until it is fetched again, rather than drop it and fetch it anew."
                          ("ses_s" failed working) ("ses_s" working idle)
                          ("ses_s" idle working))))))))
 
+(ert-deftest opencode-test-state-activity ()
+  "A session's activity is its turns', not what changes it without a turn."
+  (opencode-test-with-state-server (list :sessions (list (opencode-test-state-info "ses_a" :updated 1)))
+    (opencode-test-state-connect)
+    (let ((created (opencode-state-activity "ses_a")))
+      (should created)
+      (opencode-test-dispatch (list (opencode-test-state-event "session.renamed" "ses_a" 100 '(title . "New"))))
+      (should (equal (opencode-state-activity "ses_a") created))
+      (opencode-test-dispatch (list (opencode-test-state-event "session.model.selected" "ses_a" 110
+                                                               '(model (id . "m")))))
+      (should (equal (opencode-state-activity "ses_a") created))
+      (opencode-test-dispatch (list (opencode-test-state-event "session.execution.started" "ses_a" 200)))
+      (should (equal (opencode-state-activity "ses_a") (opencode-test-state-time 200)))
+      (opencode-test-dispatch (list (opencode-test-state-event "session.step.ended" "ses_a" 250)))
+      (should (equal (opencode-state-activity "ses_a") (opencode-test-state-time 250)))
+      (opencode-test-dispatch (list (opencode-test-state-event "session.execution.succeeded" "ses_a" 300)))
+      (should (equal (opencode-state-activity "ses_a") (opencode-test-state-time 300)))
+      (opencode-test-dispatch (list (opencode-test-state-event "session.archived" "ses_a" 400)))
+      (should (equal (opencode-state-activity "ses_a") (opencode-test-state-time 300))))))
+
 (ert-deftest opencode-test-state-idle-watermark ()
   "Every end of execution advances the idle time, even within one millisecond."
   (opencode-test-with-state-server nil
