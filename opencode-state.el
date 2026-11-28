@@ -424,15 +424,17 @@ up to which it was viewed, as the service decides for every client."
   "Return the derived status of ENTRY-OR-ID, an entry or a session ID.
 `waiting' while a request awaits the user; else while an execution runs,
 `retrying' when it waits for a retry, `working' otherwise; else when
-unread, `failed' when the last turn failed, `done' otherwise; else
-`idle'.  It is the status of the session's turn: background jobs its
-turn left running are no turn, and the session waits for them as it
-would for the user, going on with each one's report in a turn of its
-own (see `opencode-state-jobs').  Return nil for an unknown session."
+unread, `failed' when the last turn failed, `done' when it ended,
+`idle' when it was interrupted, which the user did; else `idle'.  It
+is the status of the session's turn: background jobs its turn left
+running are no turn, and the session waits for them as it would for
+the user, going on with each one's report in a turn of its own (see
+`opencode-state-jobs').  Return nil for an unknown session."
   (when-let* ((entry (opencode-state--entry entry-or-id)))
     (cond ((plist-get entry :requests) 'waiting)
           ((plist-get entry :running) (if (plist-get entry :retry) 'retrying 'working))
-          ((opencode-state-unread-p entry)
+          ((and (opencode-state-unread-p entry)
+                (not (eq (plist-get entry :outcome) 'interrupted)))
            (if (eq (plist-get entry :outcome) 'failed) 'failed 'done))
           (t 'idle))))
 

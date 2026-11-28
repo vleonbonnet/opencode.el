@@ -829,7 +829,8 @@ until it is fetched again, rather than drop it and fetch it anew."
                   (should (equal (plist-get entry :error) "Boom"))
                   (should (eq (plist-get entry :outcome) 'failed))))
           (step (opencode-test-state-event "session.execution.started" "ses_s" 350) 'working)
-          (step (opencode-test-state-event "session.execution.interrupted" "ses_s" 400 '(reason . "user")) 'done
+          ;; Interrupted, by the user: no news.
+          (step (opencode-test-state-event "session.execution.interrupted" "ses_s" 400 '(reason . "user")) 'idle
                 (lambda (entry)
                   (should (eq (plist-get entry :outcome) 'interrupted))
                   (should-not (plist-get entry :error))
@@ -849,8 +850,8 @@ until it is fetched again, rather than drop it and fetch it anew."
                          ("ses_s" working waiting) ("ses_s" waiting working)
                          ("ses_s" working done) ("ses_s" done idle)
                          ("ses_s" idle working) ("ses_s" working failed)
-                         ("ses_s" failed working) ("ses_s" working done)
-                         ("ses_s" done working))))))))
+                         ("ses_s" failed working) ("ses_s" working idle)
+                         ("ses_s" idle working))))))))
 
 (ert-deftest opencode-test-state-idle-watermark ()
   "Every end of execution advances the idle time, even within one millisecond."
